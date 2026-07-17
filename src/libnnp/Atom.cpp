@@ -40,7 +40,8 @@ Atom::Atom() : hasNeighborList               (false),
                dEelecdQ                      (0.0  ),
                chi                           (0.0  ),
                charge                        (0.0  ),
-               chargeRef                     (0.0  )
+               chargeRef                     (0.0  ),
+               chargeIsFixed                 (false)
 {
 }
 

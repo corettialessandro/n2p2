@@ -220,6 +220,22 @@ void Structure::readFromLines(vector<string> const& lines)
             atoms.back().fRef[0]        = atof(splitLine.at(7).c_str());
             atoms.back().fRef[1]        = atof(splitLine.at(8).c_str());
             atoms.back().fRef[2]        = atof(splitLine.at(9).c_str());
+            // Optional trailing marker (11th field): if the literal word
+            // "fixed" follows the usual 10 fields, this atom's charge is
+            // externally prescribed at #chargeRef (just read above) and is
+            // excluded from the unknowns of the charge equilibration (Qeq)
+            // linear system used by 4G-HDNNPs, instead entering as a
+            // constant/external field. Intended e.g. for electrode atoms in
+            // a constant-charge ensemble simulation of an electrochemical
+            // cell, where the electrode charge stays fixed while the
+            // remaining (free) atoms equilibrate self-consistently. Absent
+            // by default, i.e. normal self-consistent behavior is
+            // unchanged.
+            if (splitLine.size() > 10 && splitLine.at(10) == "fixed")
+            {
+                atoms.back().chargeIsFixed = true;
+                atoms.back().charge        = atoms.back().chargeRef;
+            }
             atoms.back().numNeighborsPerElement.resize(numElements, 0);
             numAtoms++;
             numAtomsPerElement[elementMap[splitLine.at(4)]]++;
@@ -596,6 +612,7 @@ double Structure::calculateElectrostaticEnergy(
     A.resize(numAtoms + 1, numAtoms + 1);
     A.setZero();
     VectorXd b(numAtoms + 1);
+    VectorXd bConstrained(numAtoms + 1);
     VectorXd hardnessJ(numAtoms);
     VectorXd Q;
     erfcBuf.reset(atoms, 2);
@@ -710,18 +727,55 @@ double Structure::calculateElectrostaticEnergy(
     A(numAtoms, numAtoms) = 0.0;
     hasAMatrix = true;
     b(numAtoms) = chargeRef;
+
+    // Eliminate atoms with an externally prescribed (fixed) charge from the
+    // Qeq unknowns: their known contribution is moved into the right-hand
+    // side of every other equation (including the total-charge Lagrange
+    // row), and their own row/column is replaced by a trivial identity
+    // constraint so that the solve below reproduces exactly their
+    // prescribed value. The *physical* matrix #A above (with e.g. the
+    // correct diagonal hardness terms) is left untouched since it is still
+    // needed unmodified for the electrostatic energy expression further
+    // down, as well as for the screening energy and force/adjoint
+    // calculations that use each atom's actual (possibly fixed) charge.
+    AConstrained = A;
+    bConstrained = b;
+    size_t numFixed = 0;
+    for (size_t k = 0; k < numAtoms; ++k)
+    {
+        if (!atoms.at(k).chargeIsFixed) continue;
+        numFixed++;
+        double const Qk = atoms.at(k).charge;
+        for (size_t i = 0; i <= numAtoms; ++i)
+        {
+            if (i == k) continue;
+            bConstrained(i) -= AConstrained(i, k) * Qk;
+            AConstrained(i, k) = 0.0;
+            AConstrained(k, i) = 0.0;
+        }
+        AConstrained(k, k) = 1.0;
+        bConstrained(k) = Qk;
+    }
+    if (numFixed > 0 && numFixed == numAtoms)
+    {
+        throw runtime_error("ERROR: All atoms in structure with index "
+                            + to_string(index) + " have a fixed charge; "
+                            "at least one atom must remain free for charge "
+                            "equilibration.\n");
+    }
+
+    //TODO: sometimes only recalculation of A matrix is needed, because
+    //      Qs are stored.
+    Q = AConstrained.colPivHouseholderQr().solve(bConstrained);
 #ifdef _OPENMP
     }
 #endif
-    //TODO: sometimes only recalculation of A matrix is needed, because
-    //      Qs are stored.
-    Q = A.colPivHouseholderQr().solve(b);
 #ifdef _OPENMP
     #pragma omp for nowait
 #endif
     for (size_t i = 0; i < numAtoms; ++i)
     {
-        atoms.at(i).charge = Q(i);
+        if (!atoms.at(i).chargeIsFixed) atoms.at(i).charge = Q(i);
     }
 #ifdef _OPENMP
     } // end of parallel region
@@ -729,7 +783,8 @@ double Structure::calculateElectrostaticEnergy(
 
     lambda = Q(numAtoms);
     hasCharges = true;
-    double error = (A * Q - b).norm() / b.norm();
+    double error = (AConstrained * Q - bConstrained).norm()
+                 / bConstrained.norm();
 
     // We need matrix E not A, which only differ by the hardness terms along the diagonal
     energyElec = 0.5 * Q.head(numAtoms).transpose()
@@ -1007,8 +1062,12 @@ void Structure::calculateDQdChi(vector<Eigen::VectorXd> &dQdChi)
         // Including Lagrange multiplier equation.
         VectorXd b(numAtoms+1);
         b.setZero();
-        b(i) = -1.;
-        dQdChi.push_back(A.colPivHouseholderQr().solve(b).head(numAtoms));
+        // If atom i's charge is externally fixed it does not depend on its
+        // own (or any) electronegativity, so its perturbation is zero and
+        // AConstrained (identity at row/column i) will correctly propagate
+        // dQ_i/dchi_i = 0.
+        if (!atoms.at(i).chargeIsFixed) b(i) = -1.;
+        dQdChi.push_back(AConstrained.colPivHouseholderQr().solve(b).head(numAtoms));
     }
     return;
 }
@@ -1025,9 +1084,12 @@ void Structure::calculateDQdJ(vector<Eigen::VectorXd> &dQdJ)
         for (size_t j = 0; j < numAtoms; ++j)
         {
             Atom const &aj = atoms.at(j);
+            // A fixed atom's charge does not depend on any element's
+            // hardness, so its row of the perturbation stays zero.
+            if (aj.chargeIsFixed) continue;
             if (i == aj.element) b(j) = -aj.charge;
         }
-        dQdJ.push_back(A.colPivHouseholderQr().solve(b).head(numAtoms));
+        dQdJ.push_back(AConstrained.colPivHouseholderQr().solve(b).head(numAtoms));
     }
     return;
 }
@@ -1055,6 +1117,12 @@ void Structure::calculateDQdr(  vector<size_t> const&   atomIndices,
         {
             Atom const& aj = atoms.at(j);
 
+            // A fixed atom's charge is constant by construction, so
+            // dQ_j/dr = 0 regardless of dChi_j/dr or dA_j*/dr; leave its
+            // row of the perturbation at zero and let AConstrained's
+            // identity row/column propagate the zero derivative.
+            if (aj.chargeIsFixed) continue;
+
 #ifndef N2P2_FULL_SFD_MEMORY
             vector<vector<size_t> > const *const tableFull
                     = &(elements.at(aj.element).getSymmetryFunctionTable());
@@ -1066,7 +1134,7 @@ void Structure::calculateDQdr(  vector<size_t> const&   atomIndices,
                                        tableFull)[compIndices[i]];
             b(j) -= a.dAdrQ.at(j)[compIndices[i]];
         }
-        VectorXd dQdr = A.colPivHouseholderQr().solve(b).head(numAtoms);
+        VectorXd dQdr = AConstrained.colPivHouseholderQr().solve(b).head(numAtoms);
         for (size_t j = 0; j < numAtoms; ++j)
         {
             a.dQdr.at(j)[compIndices[i]] = dQdr(j);
@@ -1187,10 +1255,14 @@ VectorXd const Structure::calculateForceLambdaTotal() const
     for (size_t i = 0; i < numAtoms; ++i)
     {
         Atom const& ai = atoms.at(i);
-        dEdQ(i) = ai.dEelecdQ + ai.dEdG.back();
+        // A fixed atom's charge does not respond to atomic positions, so it
+        // must not receive any adjoint sensitivity; AConstrained's identity
+        // row/column at i then forces lambdaTotal(i) = 0, which correctly
+        // zeroes its contribution to forces via dAdrQ/dChidr terms.
+        dEdQ(i) = ai.chargeIsFixed ? 0.0 : (ai.dEelecdQ + ai.dEdG.back());
     }
     dEdQ(numAtoms) = 0;
-    VectorXd const lambdaTotal = A.colPivHouseholderQr().solve(-dEdQ);
+    VectorXd const lambdaTotal = AConstrained.colPivHouseholderQr().solve(-dEdQ);
     return lambdaTotal;
 }
 
@@ -1200,10 +1272,11 @@ VectorXd const Structure::calculateForceLambdaElec() const
     for (size_t i = 0; i < numAtoms; ++i)
     {
         Atom const& ai = atoms.at(i);
-        dEelecdQ(i) = ai.dEelecdQ;
+        // See calculateForceLambdaTotal() for why fixed atoms are zeroed.
+        dEelecdQ(i) = ai.chargeIsFixed ? 0.0 : ai.dEelecdQ;
     }
     dEelecdQ(numAtoms) = 0;
-    VectorXd const lambdaElec = A.colPivHouseholderQr().solve(-dEelecdQ);
+    VectorXd const lambdaElec = AConstrained.colPivHouseholderQr().solve(-dEelecdQ);
     return lambdaElec;
 }
 
@@ -1368,6 +1441,7 @@ void Structure::clearNeighborList()
 void Structure::clearElectrostatics(bool clearDQdr)
 {
     A.resize(0,0);
+    AConstrained.resize(0,0);
     hasAMatrix = false;
     for (auto& a : atoms)
     {
@@ -1489,32 +1563,37 @@ void Structure::writeToFile(ofstream* const& file, bool const ref) const
     {
         if (ref)
         {
-            (*file) << strpr("atom %24.16E %24.16E %24.16E %2s %24.16E %24.16E"
-                             " %24.16E %24.16E %24.16E\n",
-                             it->r[0],
-                             it->r[1],
-                             it->r[2],
-                             elementMap[it->element].c_str(),
-                             it->chargeRef,
-                             0.0,
-                             it->fRef[0],
-                             it->fRef[1],
-                             it->fRef[2]);
+            string line = strpr("atom %24.16E %24.16E %24.16E %2s %24.16E "
+                                "%24.16E %24.16E %24.16E %24.16E",
+                                it->r[0],
+                                it->r[1],
+                                it->r[2],
+                                elementMap[it->element].c_str(),
+                                it->chargeRef,
+                                0.0,
+                                it->fRef[0],
+                                it->fRef[1],
+                                it->fRef[2]);
+            // Round-trip the "fixed" marker (see readFromLines()) so that
+            // externally prescribed charges survive a write/read cycle.
+            if (it->chargeIsFixed) line += " fixed";
+            (*file) << line << "\n";
         }
         else
         {
-            (*file) << strpr("atom %24.16E %24.16E %24.16E %2s %24.16E %24.16E"
-                             " %24.16E %24.16E %24.16E\n",
-                             it->r[0],
-                             it->r[1],
-                             it->r[2],
-                             elementMap[it->element].c_str(),
-                             it->charge,
-                             0.0,
-                             it->f[0],
-                             it->f[1],
-                             it->f[2]);
-
+            string line = strpr("atom %24.16E %24.16E %24.16E %2s %24.16E "
+                                "%24.16E %24.16E %24.16E %24.16E",
+                                it->r[0],
+                                it->r[1],
+                                it->r[2],
+                                elementMap[it->element].c_str(),
+                                it->charge,
+                                0.0,
+                                it->f[0],
+                                it->f[1],
+                                it->f[2]);
+            if (it->chargeIsFixed) line += " fixed";
+            (*file) << line << "\n";
         }
     }
     if (ref) (*file) << strpr("energy %24.16E\n", energyRef);

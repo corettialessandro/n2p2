@@ -121,6 +121,15 @@ struct Atom
     double                   charge;
     /// Atomic reference charge.
     double                   chargeRef;
+    /// If `true`, #charge is externally prescribed (fixed at #chargeRef via
+    /// the optional trailing "fixed" marker on an "atom" line in
+    /// input.data, see Structure::readFromLines()) and excluded from the
+    /// unknowns of the global charge equilibration (Qeq) linear system in
+    /// Structure::calculateElectrostaticEnergy(). Used to model electrodes
+    /// held at constant charge ("constant-charge ensemble") in 4G-HDNNP
+    /// simulations, where a subset of atoms acts as an external field while
+    /// the remaining (free) atoms equilibrate self-consistently.
+    bool                     chargeIsFixed;
     /// Cartesian coordinates
     Vec3D                    r;
     /// Force vector calculated by neural network.

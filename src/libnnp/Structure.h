@@ -114,6 +114,16 @@ struct Structure
     Vec3D                    invbox[3];
     /// Global charge equilibration matrix A'.
     Eigen::MatrixXd          A;
+    /// Copy of #A with rows/columns belonging to atoms with
+    /// Atom::chargeIsFixed == true eliminated (their known charge moved to
+    /// the right-hand side, row/column replaced by an identity constraint).
+    /// Used for the actual Qeq linear solve and for all associated
+    /// sensitivity/adjoint solves (calculateDQdChi(), calculateDQdJ(),
+    /// calculateDQdr(), calculateForceLambdaTotal(),
+    /// calculateForceLambdaElec()) so that fixed charges are treated as
+    /// constants (external field) instead of unknowns. Identical to #A if
+    /// no atom in this structure has a fixed charge.
+    Eigen::MatrixXd          AConstrained;
     /// If A matrix of this structure is currently stored.
     bool                     hasAMatrix;
     /// Number of atoms of each element in this structure.
