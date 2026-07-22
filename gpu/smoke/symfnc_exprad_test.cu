@@ -26,6 +26,9 @@
 #include <vector>
 #include <random>
 #include <algorithm>
+#include <fstream>
+#include <sstream>
+#include <string>
 #include <cuda_runtime.h>
 
 // TANHU cutoff (n2p2 CutoffType::CT_TANHU = 2):
@@ -159,6 +162,80 @@ TestSystem makeTestSystem(int numAtoms, double rc, unsigned seed)
     return sys;
 }
 
+// Loads real H-H neighbor pairs dumped by dump_real_neighbors.cpp (which
+// uses n2p2's own Structure::calculateNeighborList() on the actual
+// temp/H2O_2G/input.data system) -- format: lines of
+// "centralAtomLocalIndex r dx dy dz", grouped by (already-sorted, since the
+// dumper writes them in atom order) central atom index. Real neighbor
+// geometry, not synthetic. Assumes the last H atom in the structure has at
+// least one H neighbor within rc (true for this dense liquid-water system,
+// ~420 H atoms in a ~35A box) so numAtoms can be derived from the highest
+// index seen in the file.
+TestSystem loadRealTestSystem(const std::string& filename)
+{
+    std::ifstream in(filename);
+    if (!in)
+    {
+        fprintf(stderr, "Could not open %s\n", filename.c_str());
+        exit(1);
+    }
+
+    std::vector<int> centralIdx;
+    std::vector<double> dist, dx, dy, dz;
+    std::string line;
+    while (std::getline(in, line))
+    {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream iss(line);
+        int idx; double r, x, y, z;
+        iss >> idx >> r >> x >> y >> z;
+        centralIdx.push_back(idx);
+        dist.push_back(r);
+        dx.push_back(x);
+        dy.push_back(y);
+        dz.push_back(z);
+    }
+
+    if (centralIdx.empty())
+    {
+        fprintf(stderr, "No neighbor pairs found in %s\n", filename.c_str());
+        exit(1);
+    }
+
+    int numAtoms = centralIdx.back() + 1;
+
+    TestSystem sys;
+    sys.numAtoms = numAtoms;
+    sys.neighCount.assign(numAtoms, 0);
+    sys.neighOffset.assign(numAtoms, 0);
+    for (int idx : centralIdx) sys.neighCount[idx]++;
+
+    int total = 0;
+    for (int i = 0; i < numAtoms; ++i)
+    {
+        sys.neighOffset[i] = total;
+        total += sys.neighCount[i];
+    }
+
+    sys.neighDist.resize(total);
+    sys.neighDx.resize(total);
+    sys.neighDy.resize(total);
+    sys.neighDz.resize(total);
+
+    std::vector<int> cursor = sys.neighOffset;
+    for (size_t k = 0; k < centralIdx.size(); ++k)
+    {
+        int idx = centralIdx[k];
+        int pos = cursor[idx]++;
+        sys.neighDist[pos] = dist[k];
+        sys.neighDx[pos] = dx[k];
+        sys.neighDy[pos] = dy[k];
+        sys.neighDz[pos] = dz[k];
+    }
+
+    return sys;
+}
+
 void cpuReference(const TestSystem& sys, double eta, double rs, double rc,
                    std::vector<double>& G, std::vector<double>& dGdx,
                    std::vector<double>& dGdy, std::vector<double>& dGdz)
@@ -263,7 +340,7 @@ bool runCase(const char* label, double eta, double rs, double rc,
     return pass;
 }
 
-int main()
+int main(int argc, char** argv)
 {
     int devCount = 0;
     CUDA_CHECK(cudaGetDeviceCount(&devCount));
@@ -278,13 +355,30 @@ int main()
     printf("Device 0: %s (SM %d.%d)\n\n", prop.name, prop.major, prop.minor);
 
     const double rc = 12.00; // common cutoff for all H-H radial functions in input.nn
-    TestSystem sys = makeTestSystem(630, rc, /*seed=*/12345);
 
     bool ok = true;
+
+    printf("=== Synthetic random test system ===\n");
+    TestSystem synth = makeTestSystem(630, rc, /*seed=*/12345);
     // symfunction_short H 2 H 0.001  0.0    12.00  (input.nn line 116)
-    ok &= runCase("H-H rs=0", 0.001, 0.0, rc, sys);
+    ok &= runCase("synthetic, H-H rs=0", 0.001, 0.0, rc, synth);
     // symfunction_short H 2 H 0.15   1.9124 12.00  (input.nn line 120)
-    ok &= runCase("H-H rs!=0", 0.15, 1.9124, rc, sys);
+    ok &= runCase("synthetic, H-H rs!=0", 0.15, 1.9124, rc, synth);
+
+    // Real neighbor geometry, from an actual H2O_2G structure, dumped by
+    // dump_real_neighbors.cpp (n2p2's own Structure::calculateNeighborList()
+    // on temp/H2O_2G/input.data) -- pass its output path as argv[1].
+    if (argc > 1)
+    {
+        printf("\n=== Real H2O_2G neighbor data (%s) ===\n", argv[1]);
+        TestSystem real = loadRealTestSystem(argv[1]);
+        ok &= runCase("real data, H-H rs=0", 0.001, 0.0, rc, real);
+        ok &= runCase("real data, H-H rs!=0", 0.15, 1.9124, rc, real);
+    }
+    else
+    {
+        printf("\n(no real-data file given as argv[1] -- skipping real-data cases)\n");
+    }
 
     printf("\n%s\n", ok ? "ALL CASES PASSED" : "SOME CASES FAILED");
     return ok ? 0 : 1;
