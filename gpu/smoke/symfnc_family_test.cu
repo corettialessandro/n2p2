@@ -1,20 +1,22 @@
-// GPU smoke test, radial + Exp-angular symmetry function families.
+// GPU smoke test, all 11 of n2p2's leaf symmetry function types.
 //
-// Covers 7 of n2p2's 11 leaf symmetry function types (see
-// src/libnnp/SymFnc*.cpp), each as a from-scratch CUDA device function
-// mirroring the exact CPU math, one thread per (selected) central atom:
+// Each type is a from-scratch CUDA device function mirroring the exact CPU
+// math in the corresponding src/libnnp/SymFnc*.cpp, one thread per
+// (selected) central atom:
+//   Radial family:
 //   - SymFncExpRad          (type 2,  radial, TANHU cutoff)
 //   - SymFncExpRadWeighted  (type 12, radial, no element filter, Z-weighted)
 //   - SymFncCompRad         (type 20, radial, compact-support core POLY2)
-//   - SymFncCompRadWeighted (type 21, radial, compact core, Z-weighted)
+//   - SymFncCompRadWeighted (type 23, radial, compact core, Z-weighted)
+//   Exp-angular family (classic (1+lambda*cos theta)^zeta form):
 //   - SymFncExpAngn         (type 3,  narrow angular, 3-distance dependent)
 //   - SymFncExpAngnWeighted (type 13, narrow angular, no filter, Z-weighted)
 //   - SymFncExpAngw         (type 9,  wide angular, 2-distance dependent)
-//
-// Not yet covered: the 4 "Compact angular" types (SymFncCompAngn/Angw and
-// their Weighted variants), which use a fundamentally different angle-space
-// parameterization (a CompactFunction of acos(cos theta) directly, not the
-// classic (1+lambda*cos)^zeta form) -- left for a follow-up.
+//   Compact-angular family (angle-space CompactFunction of acos(cos theta)):
+//   - SymFncCompAngn         (type 21, narrow angular, 3-distance dependent)
+//   - SymFncCompAngnWeighted (type 24, narrow angular, no filter, Z-weighted)
+//   - SymFncCompAngw         (type 22, wide angular, 2-distance dependent)
+//   - SymFncCompAngwWeighted (type 25, wide angular, no filter, Z-weighted)
 //
 // Scope, consistent with symfnc_exprad_test.cu: validates the unscaled
 // energy accumulator ("result" in the CPU source, before the final scale()
@@ -403,6 +405,231 @@ __host__ __device__ inline void symFncExpAngw(
 }
 
 ///////////////////////////////////////////////////////////////////////////
+// Compact-angular family (SymFncCompAng{n,w}{,Weighted}.cpp)
+//
+// A completely different parameterization from the Exp-angular family
+// above: the angular part is a CompactFunction (same POLY2 core as the
+// radial part) evaluated at acos(cos theta) directly -- compact support in
+// angle-space (angleLeftRadians/angleRightRadians), not (1+lambda*cos)^zeta.
+// weighted=true folds Z(nej)*Z(nek) into ang/dang (SymFncCompAngnWeighted.cpp
+// multiplies "ang *=" and "dang *=" by the atomic-number product, not pexp
+// as in the Exp-angular weighted case) -- verified this still satisfies the
+// product rule correctly (both the rad*phi and ang*chi force terms end up
+// weighted, since dang/ang carry the weight into every term they appear in).
+///////////////////////////////////////////////////////////////////////////
+
+__host__ __device__ inline void symFncCompAngnCore(
+    int numNeighbors, const int* neighElem,
+    const double* neighDist, const double* neighDx, const double* neighDy,
+    const double* neighDz, int e1, int e2, bool weighted,
+    double rl, double rc, double angleLeftRad, double angleRightRad,
+    double& G, double& dGdx, double& dGdy, double& dGdz)
+{
+    double const r2l = (rl > 0.0) ? rl * rl : 0.0;
+    double const r2c = rc * rc;
+    double result = 0.0, fx = 0.0, fy = 0.0, fz = 0.0;
+
+    for (int j = 0; j < numNeighbors - 1; ++j)
+    {
+        int nej = neighElem[j];
+        double rij = neighDist[j];
+        if (!weighted && !(nej == e1 || nej == e2)) continue;
+        if (!(rij < rc && rij > rl)) continue;
+
+        double radij, dradij;
+        compactPoly2(rij, rl, rc, radij, dradij);
+
+        for (int k = j + 1; k < numNeighbors; ++k)
+        {
+            int nek = neighElem[k];
+            if (!weighted)
+            {
+                if (!((nej == e1 && nek == e2) || (nej == e2 && nek == e1)))
+                    continue;
+            }
+            double rik = neighDist[k];
+            if (!(rik < rc && rik > rl)) continue;
+
+            double djkx = neighDx[k] - neighDx[j];
+            double djky = neighDy[k] - neighDy[j];
+            double djkz = neighDz[k] - neighDz[j];
+            double rjk2 = djkx * djkx + djky * djky + djkz * djkz;
+            if (!(rjk2 < r2c && rjk2 > r2l)) continue;
+            double rjk = sqrt(rjk2);
+
+            double radik, dradik;
+            compactPoly2(rik, rl, rc, radik, dradik);
+            double radjk, dradjk;
+            compactPoly2(rjk, rl, rc, radjk, dradjk);
+
+            double dijx = neighDx[j], dijy = neighDy[j], dijz = neighDz[j];
+            double dikx = neighDx[k], diky = neighDy[k], dikz = neighDz[k];
+            double costijk = dijx * dikx + dijy * diky + dijz * dikz;
+            double rinvijik = 1.0 / rij / rik;
+            costijk *= rinvijik;
+
+            if (costijk <= -1.0 || costijk >= 1.0) continue;
+            double acostijk = acos(costijk);
+            if (acostijk < angleLeftRad || acostijk > angleRightRad) continue;
+
+            double ang, dang;
+            compactPoly2(acostijk, angleLeftRad, angleRightRad, ang, dang);
+
+            double weight = weighted ? atomicNumberOf(nej) * atomicNumberOf(nek) : 1.0;
+            double angW = ang * weight;
+            double rad = radij * radik * radjk;
+            result += rad * angW;
+
+            double dacostijk = -1.0 / sqrt(1.0 - costijk * costijk);
+            double dangW = dang * dacostijk * weight;
+
+            double rinvij = rinvijik * rik;
+            double rinvik = rinvijik * rij;
+            double phiijik = rinvij * (rinvik - rinvij * costijk);
+            double phiikij = rinvik * (rinvij - rinvik * costijk);
+            phiijik *= dangW;
+            phiikij *= dangW;
+
+            double chiij = rinvij * dradij * radik * radjk;
+            double chiik = rinvik * radij * dradik * radjk;
+
+            double p1 = rad * phiijik + angW * chiij;
+            double p2 = rad * phiikij + angW * chiik;
+
+            fx += p1 * dijx + p2 * dikx;
+            fy += p1 * dijy + p2 * diky;
+            fz += p1 * dijz + p2 * dikz;
+        }
+    }
+    G = result; dGdx = fx; dGdy = fy; dGdz = fz;
+}
+
+__host__ __device__ inline void symFncCompAngn(
+    int numNeighbors, const int* neighElem,
+    const double* neighDist, const double* neighDx, const double* neighDy,
+    const double* neighDz, int e1, int e2, double rl, double rc,
+    double angleLeftRad, double angleRightRad,
+    double& G, double& dGdx, double& dGdy, double& dGdz)
+{
+    symFncCompAngnCore(numNeighbors, neighElem, neighDist, neighDx, neighDy,
+                        neighDz, e1, e2, /*weighted=*/false, rl, rc,
+                        angleLeftRad, angleRightRad, G, dGdx, dGdy, dGdz);
+}
+
+__host__ __device__ inline void symFncCompAngnWeighted(
+    int numNeighbors, const int* neighElem,
+    const double* neighDist, const double* neighDx, const double* neighDy,
+    const double* neighDz, double rl, double rc,
+    double angleLeftRad, double angleRightRad,
+    double& G, double& dGdx, double& dGdy, double& dGdz)
+{
+    symFncCompAngnCore(numNeighbors, neighElem, neighDist, neighDx, neighDy,
+                        neighDz, -1, -1, /*weighted=*/true, rl, rc,
+                        angleLeftRad, angleRightRad, G, dGdx, dGdy, dGdz);
+}
+
+// Wide compact angular: only rij, rik (no rjk/radjk term -- mirrors how
+// ExpAngw drops rjk relative to ExpAngn).
+__host__ __device__ inline void symFncCompAngwCore(
+    int numNeighbors, const int* neighElem,
+    const double* neighDist, const double* neighDx, const double* neighDy,
+    const double* neighDz, int e1, int e2, bool weighted,
+    double rl, double rc, double angleLeftRad, double angleRightRad,
+    double& G, double& dGdx, double& dGdy, double& dGdz)
+{
+    double result = 0.0, fx = 0.0, fy = 0.0, fz = 0.0;
+
+    for (int j = 0; j < numNeighbors - 1; ++j)
+    {
+        int nej = neighElem[j];
+        double rij = neighDist[j];
+        if (!weighted && !(nej == e1 || nej == e2)) continue;
+        if (!(rij < rc && rij > rl)) continue;
+
+        double radij, dradij;
+        compactPoly2(rij, rl, rc, radij, dradij);
+
+        for (int k = j + 1; k < numNeighbors; ++k)
+        {
+            int nek = neighElem[k];
+            if (!weighted)
+            {
+                if (!((nej == e1 && nek == e2) || (nej == e2 && nek == e1)))
+                    continue;
+            }
+            double rik = neighDist[k];
+            if (!(rik < rc && rik > rl)) continue;
+
+            double radik, dradik;
+            compactPoly2(rik, rl, rc, radik, dradik);
+
+            double dijx = neighDx[j], dijy = neighDy[j], dijz = neighDz[j];
+            double dikx = neighDx[k], diky = neighDy[k], dikz = neighDz[k];
+            double costijk = dijx * dikx + dijy * diky + dijz * dikz;
+            double rinvijik = 1.0 / rij / rik;
+            costijk *= rinvijik;
+
+            if (costijk <= -1.0 || costijk >= 1.0) continue;
+            double acostijk = acos(costijk);
+            if (acostijk < angleLeftRad || acostijk > angleRightRad) continue;
+
+            double ang, dang;
+            compactPoly2(acostijk, angleLeftRad, angleRightRad, ang, dang);
+
+            double weight = weighted ? atomicNumberOf(nej) * atomicNumberOf(nek) : 1.0;
+            double angW = ang * weight;
+            double rad = radij * radik;
+            result += rad * angW;
+
+            double dacostijk = -1.0 / sqrt(1.0 - costijk * costijk);
+            double dangW = dang * dacostijk * weight;
+
+            double rinvij = rinvijik * rik;
+            double rinvik = rinvijik * rij;
+            double phiijik = rinvij * (rinvik - rinvij * costijk);
+            double phiikij = rinvik * (rinvij - rinvik * costijk);
+            phiijik *= dangW;
+            phiikij *= dangW;
+
+            double chiij = rinvij * radik * dradij;
+            double chiik = rinvik * radij * dradik;
+
+            double p1 = rad * phiijik + angW * chiij;
+            double p2 = rad * phiikij + angW * chiik;
+
+            fx += p1 * dijx + p2 * dikx;
+            fy += p1 * dijy + p2 * diky;
+            fz += p1 * dijz + p2 * dikz;
+        }
+    }
+    G = result; dGdx = fx; dGdy = fy; dGdz = fz;
+}
+
+__host__ __device__ inline void symFncCompAngw(
+    int numNeighbors, const int* neighElem,
+    const double* neighDist, const double* neighDx, const double* neighDy,
+    const double* neighDz, int e1, int e2, double rl, double rc,
+    double angleLeftRad, double angleRightRad,
+    double& G, double& dGdx, double& dGdy, double& dGdz)
+{
+    symFncCompAngwCore(numNeighbors, neighElem, neighDist, neighDx, neighDy,
+                        neighDz, e1, e2, /*weighted=*/false, rl, rc,
+                        angleLeftRad, angleRightRad, G, dGdx, dGdy, dGdz);
+}
+
+__host__ __device__ inline void symFncCompAngwWeighted(
+    int numNeighbors, const int* neighElem,
+    const double* neighDist, const double* neighDx, const double* neighDy,
+    const double* neighDz, double rl, double rc,
+    double angleLeftRad, double angleRightRad,
+    double& G, double& dGdx, double& dGdy, double& dGdz)
+{
+    symFncCompAngwCore(numNeighbors, neighElem, neighDist, neighDx, neighDy,
+                        neighDz, -1, -1, /*weighted=*/true, rl, rc,
+                        angleLeftRad, angleRightRad, G, dGdx, dGdy, dGdz);
+}
+
+///////////////////////////////////////////////////////////////////////////
 // Real data loading (dump_real_neighbors.cpp's output)
 ///////////////////////////////////////////////////////////////////////////
 
@@ -474,7 +701,8 @@ RealSystem loadRealSystem(const std::string& filename)
 ///////////////////////////////////////////////////////////////////////////
 
 enum class SfKind { ExpRad, ExpRadWeighted, CompRad, CompRadWeighted,
-                     ExpAngn, ExpAngnWeighted, ExpAngw };
+                     ExpAngn, ExpAngnWeighted, ExpAngw,
+                     CompAngn, CompAngnWeighted, CompAngw, CompAngwWeighted };
 
 struct SfParams
 {
@@ -482,6 +710,7 @@ struct SfParams
     int centralElement;   // ec: which atoms to treat as central
     int e1 = -1, e2 = -1; // neighbor element filter (unused if weighted)
     double eta = 0, rs = 0, rl = 0, lambda = 0, zeta = 0, rc = 12.0;
+    double angleLeftRad = 0.0, angleRightRad = M_PI; // compact-angular only
 };
 
 __host__ __device__ inline void evalSf(
@@ -523,6 +752,26 @@ __host__ __device__ inline void evalSf(
             symFncExpAngw(numNeighbors, neighElem, neighDist, neighDx, neighDy,
                          neighDz, p.e1, p.e2, p.eta, p.rs, p.lambda, p.zeta,
                          p.rc, G, dGdx, dGdy, dGdz);
+            break;
+        case SfKind::CompAngn:
+            symFncCompAngn(numNeighbors, neighElem, neighDist, neighDx, neighDy,
+                         neighDz, p.e1, p.e2, p.rl, p.rc, p.angleLeftRad,
+                         p.angleRightRad, G, dGdx, dGdy, dGdz);
+            break;
+        case SfKind::CompAngnWeighted:
+            symFncCompAngnWeighted(numNeighbors, neighElem, neighDist, neighDx,
+                         neighDy, neighDz, p.rl, p.rc, p.angleLeftRad,
+                         p.angleRightRad, G, dGdx, dGdy, dGdz);
+            break;
+        case SfKind::CompAngw:
+            symFncCompAngw(numNeighbors, neighElem, neighDist, neighDx, neighDy,
+                         neighDz, p.e1, p.e2, p.rl, p.rc, p.angleLeftRad,
+                         p.angleRightRad, G, dGdx, dGdy, dGdz);
+            break;
+        case SfKind::CompAngwWeighted:
+            symFncCompAngwWeighted(numNeighbors, neighElem, neighDist, neighDx,
+                         neighDy, neighDz, p.rl, p.rc, p.angleLeftRad,
+                         p.angleRightRad, G, dGdx, dGdy, dGdz);
             break;
     }
 }
@@ -693,6 +942,29 @@ int main(int argc, char** argv)
         SfParams p{SfKind::ExpAngw, O}; p.e1 = H; p.e2 = H;
         p.eta = 0.01; p.lambda = -1.0; p.zeta = 2.0; p.rc = 12.0;
         ok &= runCase("ExpAngw, representative params", p, sys);
+    }
+
+    // --- Compact-angular family, representative params (not in real
+    // input.nn; angleLeft/Right span the full [0,180] degree range) ---
+    {
+        SfParams p{SfKind::CompAngn, O}; p.e1 = H; p.e2 = H;
+        p.rl = 0.5; p.rc = 12.0; p.angleLeftRad = 0.0; p.angleRightRad = M_PI;
+        ok &= runCase("CompAngn, representative params", p, sys);
+    }
+    {
+        SfParams p{SfKind::CompAngnWeighted, O};
+        p.rl = 0.5; p.rc = 12.0; p.angleLeftRad = 0.0; p.angleRightRad = M_PI;
+        ok &= runCase("CompAngnWeighted, representative params", p, sys);
+    }
+    {
+        SfParams p{SfKind::CompAngw, O}; p.e1 = H; p.e2 = H;
+        p.rl = 0.5; p.rc = 12.0; p.angleLeftRad = 0.0; p.angleRightRad = M_PI;
+        ok &= runCase("CompAngw, representative params", p, sys);
+    }
+    {
+        SfParams p{SfKind::CompAngwWeighted, O};
+        p.rl = 0.5; p.rc = 12.0; p.angleLeftRad = 0.0; p.angleRightRad = M_PI;
+        ok &= runCase("CompAngwWeighted, representative params", p, sys);
     }
 
     printf("\n%s\n", ok ? "ALL CASES PASSED" : "SOME CASES FAILED");
