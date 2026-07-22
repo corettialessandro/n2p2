@@ -26,12 +26,18 @@ g++ -O3 -std=c++11 -I"$N2P2_DEVEL/include" -I"$EIGEN" -DEIGEN_DONT_PARALLELIZE \
     -o dump_real_neighbors dump_real_neighbors.cpp \
     "$N2P2_DEVEL/lib/libnnp.a"
 
-echo "Dumping real H-H neighbor data from H2O_2G/input.data..."
-./dump_real_neighbors "$N2P2_DEVEL/temp/H2O_2G/input.data" real_neighbors_HH.txt
+echo "Dumping real (full, unfiltered) neighbor data from H2O_2G/input.data..."
+./dump_real_neighbors "$N2P2_DEVEL/temp/H2O_2G/input.data" real_neighbors_full.txt
 
-echo "Compiling CUDA smoke test..."
+echo "Compiling CUDA smoke tests..."
 nvcc -O3 -std=c++14 -arch=sm_80 -o symfnc_exprad_test symfnc_exprad_test.cu
+nvcc -O3 -std=c++14 -arch=sm_80 -o symfnc_family_test symfnc_family_test.cu
 
-echo "Running..."
-./symfnc_exprad_test real_neighbors_HH.txt
+echo "=== ExpRad only (synthetic system regression check) ==="
+./symfnc_exprad_test
+
+echo ""
+echo "=== Full symmetry function family (real H2O_2G neighbor data) ==="
+./symfnc_family_test real_neighbors_full.txt
+
 echo "Done"
