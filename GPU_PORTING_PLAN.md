@@ -1,6 +1,6 @@
 # GPU Porting Plan: `nnp-train` on LEONARDO Booster
 
-Branch: `gpu-portability` | Status: design/brainstorm, no code changes yet | Author: drafted with Claude, 2026-07-17
+Branch: `gpu-portability` | Status: design/brainstorm + Phase 0 profiling done, no GPU code changes yet | Author: drafted with Claude, 2026-07-17 | Updated: 2026-07-22 (Phase 0 profiling, see §3a)
 
 ## 1. Goal
 
@@ -71,6 +71,83 @@ not within one.
 5. **Weight update** (`GradientDescent.cpp`, 223 lines vs `KalmanFilter.cpp`, 353 lines, uses
    `Eigen/LU`) — see §5.3, this is the trickiest piece, not the easiest.
 
+### 3a. Phase 0 results (2026-07-22): real profiling, and a correction to §3
+
+§3 above was a structural argument, written before any real measurement — it predicted symmetry
+function evaluation would be "the single best GPU target." Real profiling **contradicts the
+ranking**, though not the overall list of cost centers. This matters because it changes which phase
+should be implemented first.
+
+**Setup**: `temp/H2O_2G` dataset (1254 structures, 630 atoms/structure, water), CPU build (this
+branch's baseline, no GPU code), 32 MPI ranks on one `boost_usr_prod` node, 2 training epochs,
+`updater_type=1` (Kalman) with `update_strategy=0` (Combined/global — the harder case per §5.4).
+Two independent measurements, both from the same run:
+
+1. **Coarse, exact wall-clock split** (`timing.out`, built-in per-property Stopwatch instrumentation
+   already in `Training.cpp` — `sw[k+"_err"]`/`"_com"`/`"_upd"`, no code changes needed): force updates
+   dominate (275/epoch vs. 35 energy updates), and within force updates: **~79% of total epoch time**
+   in the combined "compute" bucket (`_err`: symmetry functions + NN forward + NN backward + Jacobian
+   assembly, PARTS 1–2 of `Training::update()`), **~9%** in MPI communication (`_com`, PART 3), **~8%**
+   in the weight updater (`_upd`).
+2. **Fine split within that 79% bucket** (`perf record -g --call-graph=dwarf` on MPI rank 0 only —
+   representative since all ranks run the same per-atom code on different structures; 1.3M samples,
+   `cycles` event, 0 lost samples): resolves the `_err` bucket by symbol:
+
+   | Bucket | Function(s) | % of **total** wall time |
+   |---|---|---|
+   | **Force assembly** (dE/dG · dG/dx scatter-reduce over neighbors) | `Mode::calculateForces` (+`Atom::calculatePairForceShort`) | **~46.5%** |
+   | **NN backward / Jacobian** (dE/dG, d²E/dGdc, dF/dc) | `NeuralNetwork::calculateDFdc` (+`calculateD2EdGdc`, `calculateDxdG`) + `calculateDEdG` | **~30.8%** |
+   | NN forward pass | `Mode::calculateAtomicNeuralNetworks` (+`propagate`/`propagateLayer`) | ~7.7% |
+   | Symmetry function evaluation | `Mode::calculateSymmetryFunctionGroups` (+`SymGrpExpAngn::calculate` etc.) | ~4.1% |
+
+**The correction**: symmetry function evaluation is cheap (~4%), not the dominant cost §3 assumed.
+NN forward pass is also modest (~8%). The two real dominant costs are **force assembly** (the
+dE/dG · dG/dx scatter-reduce, §5 Phase 3's "force assembly" bullet — previously an implementation
+footnote, not flagged as a priority) and the **NN backward/Jacobian pass** (§5 Phase 3's main
+content) — together **~78% of total wall time**. Practical consequence: **Phase 3 (NN
+forward/backward + force assembly) should be prioritized over Phase 2 (symmetry functions)** for
+this dataset/config — Phase 2 is still worth doing (it's still embarrassingly parallel, still a clean
+first GPU kernel for the reasons §7 gives), but it is not where the wall-clock time is.
+
+**Kalman filter attribution — resolved (2026-07-22, follow-up pass):** re-profiled with a much larger
+DWARF unwind buffer (`--call-graph=dwarf,65528` vs. the default 8KB) to test whether the unattributed
+Eigen GEMM/LU kernel samples (`gebp_kernel`, `product_selfadjoint_matrix`, etc.) were mis-nested under
+`KalmanFilter::update` due to unwind truncation. The larger buffer changed nothing (`KalmanFilter::
+update`'s reported Children went 5.2% → 7.8%, consistent with run-to-run noise, not a fix), so we
+inspected raw call chains directly with `perf script`. They resolve cleanly and completely:
+`gebp_kernel → product_selfadjoint_matrix::run → KalmanFilter::update → Training::update →
+Training::loop → main` — a 6-frame chain, trivially within even the original 8KB buffer. **The Eigen
+kernels are confirmed children of `KalmanFilter::update`**; `Structure.cpp`'s only other dense-Eigen
+usage in this codebase is the 4G charge-equilibration path, inactive for this 2G/H2O config, so there
+is no other candidate origin. The mismatch was `perf report`'s flat `--sort=overhead,symbol -g none`
+summary view under/over-counting `Children` in a way that doesn't reflect the real call tree (a report
+accounting quirk, not a data problem) — combined with `perf`'s `cycles` event being sensitive to
+per-region CPU frequency scaling (e.g. AVX-512 downclocking differs between the SF/force-assembly-
+dominated majority of the run and Kalman's more bursty calls), which makes a cycles-based percentage
+an unreliable stand-in for a wall-clock-time percentage when comparing across code regions with
+different vectorization profiles. **Conclusion: the original `timing.out` wall-clock measurement
+(~9% total, `_upd` Stopwatch bracket) was correct all along** — a wall-clock timer wrapped tightly
+around `Updater::update()` cannot under-measure what happens inside it, Eigen internals included, by
+construction. Phase 4 (Kalman) should be sized against **~9% of current wall time**, not the ~21%
+floated as a possibility in the first pass of this doc; that concern is retracted.
+
+**MPI communication, unresolved**: *its active-CPU share (~2%) is much lower than its wall-clock share (~9%,
+  `timing.out`'s `_com`)*: a blocked/waiting rank doesn't burn CPU cycles, so cycle-sampling is blind
+  to time lost waiting on stragglers in the Allgatherv. That gap is most likely rank load imbalance,
+  not communication throughput — a different problem than what NCCL/CUDA-aware MPI (§5 Phase 5) fixes
+  on its own; worth checking per-rank structure/atom-count balance before assuming Phase 5's plan
+  addresses it.
+
+**Note for future profiling runs on this cluster**: `perf record --call-graph=dwarf` at default
+sampling frequency produced an **11GB** `perf.data` file for a single rank over 2 epochs (~330s). The
+home filesystem quota here is only 50GB and filled to 100% mid-run; point `perf record -o` directly
+at `/leonardo_work/L-AUT_Giane_26/acoretti/NEURALCPM/porting/` (997GB free at time of writing), not
+the home directory. `-F 200` (200Hz, vs. the ~4000Hz adaptive default) plus a larger unwind buffer
+(`--call-graph=dwarf,65528`) brought a comparable 2-epoch capture down to ~4.3GB with still-ample
+statistics (66K samples) — a reasonable default for future runs on this codebase. Also useful:
+`perf script -i <file>` dumps raw per-sample call chains, which is the reliable way to confirm a
+symbol's true caller when `perf report`'s flat summary view looks inconsistent with the source.
+
 ## 4. Existing groundwork already in this repo: `libnnpif/CabanaMD`
 
 `src/libnnpif/CabanaMD/{ModeCabana,ElementCabana}*.h` already implement a **Kokkos-based**,
@@ -120,6 +197,10 @@ This is fine on CPU, hostile to GPU (pointer-chasing, no coalescing, no batching
   makefile — worth reading closely, it may be the closest existing analog to what a GPU layout needs).
 
 ### Phase 2 — Symmetry functions on GPU
+- **Update (§3a, 2026-07-22 profiling)**: real profiling puts this at only ~4% of wall time on the
+  test dataset — lower priority than Phase 3 below, which accounts for ~78%. Still worth doing first
+  as a *proof-of-concept* (lowest-risk, cleanest kernel, see §7's suggested first PR), but don't expect
+  it to move the needle on end-to-end training time by itself.
 - Highest-value, lowest-risk target: purely local per-atom(-pair/-triple) math, no cross-atom
   dependencies except within a fixed neighbor list.
 - Keep neighbor list construction on CPU initially (`Training::calculateNeighborLists()`) — it's
@@ -134,6 +215,12 @@ This is fine on CPU, hostile to GPU (pointer-chasing, no coalescing, no batching
   function type before moving on — this is the highest-value regression test to write first.
 
 ### Phase 3 — Neural network forward/backward on GPU
+- **Update (§3a, 2026-07-22 profiling)**: this is the actual priority, not Phase 2. Real profiling
+  attributes ~78% of total wall time to this phase's two pieces combined — force assembly
+  (`Mode::calculateForces`/`calculatePairForceShort`, ~46.5% alone) and the NN backward/Jacobian pass
+  (`calculateDFdc`/`calculateD2EdGdc`/`calculateDEdG`, ~30.8%). NN forward pass itself is cheap (~8%).
+  Recommend implementing/validating force assembly and the backward pass before or alongside the
+  forward-pass batching described below, not after it.
 - Group atoms by element (weights differ per element type but are shared across all atoms of that
   type in the batch) → this turns "many tiny per-atom MLPs" into a handful of batched GEMMs, one set
   per element, per layer. cuBLAS `gemmBatched`/`gemmStridedBatched` or cuDNN's dense/RNN-adjacent
@@ -147,6 +234,14 @@ This is fine on CPU, hostile to GPU (pointer-chasing, no coalescing, no batching
   results run-to-run non-deterministic, which matters for regression testing against CPU results).
 
 ### Phase 4 — Weight updaters: the actually-hard part
+- **Update (§3a, resolved 2026-07-22)**: Kalman's real cost is confirmed at **~9% of total wall
+  time** (`timing.out`, exact wall-clock). A first profiling pass suggested it might be as high as
+  ~21% due to unattributed Eigen GEMM/LU kernel samples, but raw call-chain inspection (`perf script`)
+  confirmed those Eigen kernels genuinely are `KalmanFilter::update`'s children — the discrepancy was
+  a `perf report` flat-summary accounting quirk plus cycles-vs-wall-clock frequency-scaling
+  sensitivity, not a real hidden cost. Size Phase 4 against ~9%, not ~21% — it's real and worth doing
+  (still the highest-*risk* phase per the numerical-stability concerns below), but it is not competing
+  with Phase 3 for priority the way symmetry functions turned out not to.
 - **`GradientDescent`** (Adam-style, `GradientDescent.cpp`): trivially GPU-friendly — elementwise
   vector ops over the full weight vector. Straightforward cuBLAS axpy/elementwise kernel, or even
   just keep weights resident on GPU and do the update there without a round trip.
@@ -164,6 +259,10 @@ This is fine on CPU, hostile to GPU (pointer-chasing, no coalescing, no batching
   GPU" doesn't obviously mean "faster."
 
 ### Phase 5 — Multi-GPU / multi-node scaling
+- **Update (§3a, 2026-07-22 profiling)**: measured MPI communication's *active* CPU cost is small
+  (~2%, `perf`), far below its ~9% wall-clock share (`timing.out`'s `_com`). That gap looks like
+  rank load imbalance (idle time waiting on stragglers), not communication throughput — check
+  per-rank structure/atom-count balance before assuming NCCL/CUDA-aware MPI alone fixes it.
 - 1 MPI rank ↔ 1 GPU ↔ 1/4 node, matching Booster's 4×A100 layout (`srun --ntasks-per-node=4
   --gpus-per-task=1`).
 - Replace today's `MPI_Gatherv`/`MPI_Allgatherv` Jacobian collection (`Training.cpp:2906`, "PART 3")
