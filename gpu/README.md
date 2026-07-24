@@ -139,7 +139,32 @@ storage (`AtomBatch::G`) written by a "grouped" kernel — the first kernel to
   (840 stored values, H block = 420 atoms x 2 SFs), to ~1e-15, and
   cross-checked against `gIndex()`'s own index arithmetic inline.
 
-Next steps (not yet done): `dGdx` neighbor-derivative storage (same
-per-element-block idea, one extra dimension for which neighbor), and/or
-wire more symmetry-function types through the grouped-kernel + `G`-storage
-pattern this step established.
+**Step 4 (done, folded into `symfnc_exprad_group_test.cu`)**: both
+derivative storages `SymFncExpRad.cpp` actually produces per matching
+neighbor (`Vec3D dij = p1 * n.dr; atom.dGdr[index] += dij; n.dGdr[...] -=
+dij;`) — closing the gap `smoke/`'s original per-type tests explicitly left
+out of scope ("Neighbor-side derivative bookkeeping is out of scope"):
+
+- `AtomBatch::dGdx`/`dGdy`/`dGdz` — the owner atom's own derivative, summed
+  over its matching neighbors. Same per-element block layout/indexing as
+  `G` (`gIndex()`).
+- `AtomBatch::neighborSfOffset` + `neighborDGdx`/`Dy`/`Dz` — one entry **per
+  neighbor slot**, not summed, addressed via `neighborSfIndex(s,
+  neighborSlot, sfIndex)`: a CSR-of-blocks mirroring `neighborOffset`, but
+  each atom's block width is `sfCountPerElement[that atom's element]`
+  instead of 1. This is the exact quantity Phase 3's force assembly will
+  scatter-add onto each neighbor atom's own force
+  (`Training::collectDGdxia`/`calculatePairForceShort`) — the ~46.5%-of-
+  wall-time cost center §3a's profiling identified.
+- Both allocated together by `allocateSfStorage()`, zero-initialized (a
+  non-matching neighbor slot's derivative is exactly zero — the CPU source
+  agrees, since that neighbor doesn't contribute to the sum at all).
+- Validated: 840 owner-derivative values and 89346 individual neighbor-slot
+  derivative values, all GPU vs. CPU to ~1e-16, plus `neighborSfIndex()`'s
+  index arithmetic cross-checked inline (mirroring step 3's `gIndex()`
+  check).
+
+Next steps (not yet done): wire more symmetry-function types through this
+same grouped-kernel + `G`/`dGdx`/`neighborDGdx`-storage pattern, and/or start
+on the actual force-assembly scatter-add that consumes `neighborDGdx,Dy,Dz`
+(Phase 3).

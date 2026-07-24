@@ -97,4 +97,18 @@ void allocateSfStorage(AtomBatch& b, vector<size_t> const& sfCountPerElement)
                               + atomsInElement * sfCountPerElement[e];
     }
     b.G.assign(b.gBlockOffset[b.numElements], 0.0);
+    b.dGdx.assign(b.G.size(), 0.0);
+    b.dGdy.assign(b.G.size(), 0.0);
+    b.dGdz.assign(b.G.size(), 0.0);
+
+    b.neighborSfOffset.assign(b.numAtoms + 1, 0);
+    for (size_t s = 0; s < b.numAtoms; ++s)
+    {
+        size_t neighCount = b.neighborOffset[s + 1] - b.neighborOffset[s];
+        b.neighborSfOffset[s + 1] = b.neighborSfOffset[s]
+                                   + neighCount * sfCountPerElement[b.element[s]];
+    }
+    b.neighborDGdx.assign(b.neighborSfOffset[b.numAtoms], 0.0);
+    b.neighborDGdy.assign(b.neighborSfOffset[b.numAtoms], 0.0);
+    b.neighborDGdz.assign(b.neighborSfOffset[b.numAtoms], 0.0);
 }

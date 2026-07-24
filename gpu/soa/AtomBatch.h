@@ -79,6 +79,38 @@ struct AtomBatch
         std::size_t localRow = s - elementOffset[e];
         return gBlockOffset[e] + localRow * sfCountPerElement[e] + sfIndex;
     }
+
+    // --- Own-atom SF derivative storage (step 4a) -------------------------
+    // Same block layout/indexing as #G (use gIndex()): derivative of sorted
+    // atom s's sfIndex-th symmetry function with respect to s's OWN
+    // coordinates, i.e. the sum over all of s's matching neighbors of that
+    // neighbor's contribution -- Atom::dGdr[index] in SymFnc*.cpp.
+    std::vector<double> dGdx, dGdy, dGdz; // size == G.size()
+
+    // --- Neighbor-side SF derivative storage (step 4b) ---------------------
+    // Mirrors Atom::Neighbor::dGdr: for sorted atom s's neighborSlot-th
+    // neighbor (local to s, i.e. flat CSR index neighborOffset[s]+neighborSlot)
+    // and s's sfIndex-th symmetry function, the derivative of that symmetry
+    // function with respect to THAT NEIGHBOR's coordinates -- one entry per
+    // neighbor slot, not summed across neighbors (opposite sign convention
+    // to dGdx/dGdy/dGdz by construction: SymFncExpRad.cpp does
+    // `atom.dGdr[index] += dij; n.dGdr[...] -= dij;` for the same dij). This
+    // is the piece gpu/smoke's original per-type tests explicitly left out
+    // of scope ("Neighbor-side derivative bookkeeping is out of scope") --
+    // it's what Phase 3's force assembly scatter-adds onto each neighbor
+    // atom's own force (Training::collectDGdxia / calculatePairForceShort).
+    std::vector<std::size_t> neighborSfOffset; // size numAtoms+1
+    std::vector<double> neighborDGdx, neighborDGdy, neighborDGdz; // size neighborSfOffset[numAtoms]
+
+    // Flat index into #neighborDGdx/Dy/Dz for sorted atom s's neighborSlot-th
+    // neighbor (local index, i.e. in [0, neighborOffset[s+1]-neighborOffset[s]))
+    // and s's sfIndex-th symmetry function.
+    std::size_t neighborSfIndex(std::size_t s, std::size_t neighborSlot,
+                                 std::size_t sfIndex) const
+    {
+        return neighborSfOffset[s]
+             + neighborSlot * sfCountPerElement[element[s]] + sfIndex;
+    }
 };
 
 // Build an AtomBatch from a Structure whose neighbor list has already been
@@ -88,8 +120,10 @@ struct AtomBatch
 // cutoff bookkeeping.
 AtomBatch buildAtomBatch(nnp::Structure const& structure, double rc);
 
-// Size and zero-initialize an AtomBatch's #G storage, one block per element
-// sized (atoms of that element) x (sfCountPerElement[e]). Must be called
-// after buildAtomBatch() has already set elementOffset/numElements.
+// Size and zero-initialize an AtomBatch's #G/#dGdx,Dy,Dz (one block per
+// element, atoms-of-that-element x sfCountPerElement[e]) and
+// #neighborDGdx,Dy,Dz (one block per atom, that atom's-neighbor-count x
+// sfCountPerElement[that atom's element]) storage. Must be called after
+// buildAtomBatch() has already set elementOffset/neighborOffset/numElements.
 void allocateSfStorage(AtomBatch& batch,
                        std::vector<std::size_t> const& sfCountPerElement);
