@@ -85,3 +85,16 @@ AtomBatch buildAtomBatch(Structure const& structure, double rc)
 
     return b;
 }
+
+void allocateSfStorage(AtomBatch& b, vector<size_t> const& sfCountPerElement)
+{
+    b.sfCountPerElement = sfCountPerElement;
+    b.gBlockOffset.assign(b.numElements + 1, 0);
+    for (size_t e = 0; e < b.numElements; ++e)
+    {
+        size_t atomsInElement = b.elementOffset[e + 1] - b.elementOffset[e];
+        b.gBlockOffset[e + 1] = b.gBlockOffset[e]
+                              + atomsInElement * sfCountPerElement[e];
+    }
+    b.G.assign(b.gBlockOffset[b.numElements], 0.0);
+}

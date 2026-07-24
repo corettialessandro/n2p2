@@ -41,4 +41,12 @@ nvcc -O3 -std=c++14 -arch=sm_80 -I"$N2P2_DEVEL/include" -I"$EIGEN" \
     "$N2P2_DEVEL/lib/libnnp.a"
 ./symfnc_exprad_soa_test "$N2P2_DEVEL/temp/H2O_2G/input.data"
 
+echo ""
+echo "=== Step 3: grouped ExpRad kernel writing into AtomBatch::G ==="
+nvcc -O3 -std=c++14 -arch=sm_80 -I"$N2P2_DEVEL/include" -I"$EIGEN" \
+    -DEIGEN_DONT_PARALLELIZE \
+    -o symfnc_exprad_group_test AtomBatch.o symfnc_exprad_group_test.cu \
+    "$N2P2_DEVEL/lib/libnnp.a"
+./symfnc_exprad_group_test "$N2P2_DEVEL/temp/H2O_2G/input.data"
+
 echo "Done"

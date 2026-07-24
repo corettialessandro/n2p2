@@ -93,6 +93,7 @@ cache/`std::vector<Vec3D>` dGdr — pointer-chasing, non-coalesced on GPU):
   exact position/neighbor values). 630 atoms, 66868 neighbor entries,
   405621 checks, all passing — confirms the new layout before any kernel
   depends on it.
+
 **Step 2 (done): `symfnc_exprad_soa_test.cu`**, wiring `SymFncExpRad`'s CUDA
 kernel (math copied verbatim from `smoke/symfnc_family_test.cu`, already
 validated there) directly to a real `AtomBatch`, replacing `smoke/`'s
@@ -112,11 +113,33 @@ pairs `input.nn` actually uses) pass to ~1e-15 (420 selected H atoms each).
 Together with step 1's build_batch_test.cpp, this chains
 GPU-kernel-vs-`AtomBatch`-vs-`Structure` correctness end to end.
 
-`run.slurm` now builds `AtomBatch.o` once (g++, `-std=c++14` to link cleanly
-against nvcc's host objects) and reuses it for both the host-only step 1
-test and step 2's `nvcc`-built kernel test; needs `--gres=gpu:1` now.
+`run.slurm` builds `AtomBatch.o` once (g++, `-std=c++14` to link cleanly
+against nvcc's host objects) and reuses it for every step's binary; needs
+`--gres=gpu:1` from step 2 onward.
 
-Next steps (not yet done): extend the layout with `G`/`dGdx` storage arrays
-once a kernel needs to write persistent output into it (rather than just
-read neighbor geometry), and/or wire more symmetry-function kernels through
-the same `AtomBatch` path.
+**Step 3 (done): `symfnc_exprad_group_test.cu`**, persistent per-atom SF
+storage (`AtomBatch::G`) written by a "grouped" kernel — the first kernel to
+*write into* `AtomBatch` rather than only read it. Adds:
+
+- `AtomBatch::sfCountPerElement`/`gBlockOffset`/`G` and `allocateSfStorage()`
+  — one flat array with one contiguous block per element (block size =
+  atoms-of-that-element x sfCountPerElement[e], row-major so one atom's SF
+  values are contiguous), since each central element has its own
+  independently-sized symmetry function list in `input.nn`. `gIndex(s, k)`
+  gives the flat offset for sorted atom `s`'s `k`-th symmetry function.
+- The kernel mirrors `src/libnnp/SymGrpExpRad.cpp::calculate()`'s actual
+  optimization: multiple symmetry functions sharing the same element
+  filter/cutoff radius evaluate the cutoff function **once per neighbor**
+  and reuse it across all group members, instead of each one re-walking the
+  neighbor list independently (what step 2's single-SF kernel did). Two
+  ExpRad instances (H central/e1=H, the same two real `eta`/`rs` pairs used
+  in step 2) are evaluated together per H atom and written straight into
+  `AtomBatch::G`'s device mirror.
+- Validated against a CPU reference built with the same grouped structure
+  (840 stored values, H block = 420 atoms x 2 SFs), to ~1e-15, and
+  cross-checked against `gIndex()`'s own index arithmetic inline.
+
+Next steps (not yet done): `dGdx` neighbor-derivative storage (same
+per-element-block idea, one extra dimension for which neighbor), and/or
+wire more symmetry-function types through the grouped-kernel + `G`-storage
+pattern this step established.

@@ -57,6 +57,28 @@ struct AtomBatch
     std::vector<double>      neighborDz;          // size totalNeighbors
 
     std::size_t totalNeighbors() const { return neighborD.size(); }
+
+    // --- Symmetry function output storage (step 3) -----------------------
+    // Persistent per-atom storage for symmetry function values, added once a
+    // kernel needs to write results somewhere durable instead of returning
+    // them through throwaway per-call buffers (as step 2's kernel did). Each
+    // element has its own fixed symmetry function count (mirroring how
+    // input.nn defines a separate list of symmetry functions per central
+    // element), so the storage is one flat array with one contiguous block
+    // per element: block e holds (atoms of element e) x (sfCountPerElement[e])
+    // values, row-major (all of one atom's SF values are contiguous). Call
+    // allocateSfStorage() to size this after buildAtomBatch().
+    std::vector<std::size_t> sfCountPerElement; // size numElements
+    std::vector<std::size_t> gBlockOffset;      // size numElements+1
+    std::vector<double>      G;                 // size gBlockOffset[numElements]
+
+    // Flat index into #G for sorted atom s's sfIndex-th symmetry function.
+    std::size_t gIndex(std::size_t s, std::size_t sfIndex) const
+    {
+        std::size_t e = element[s];
+        std::size_t localRow = s - elementOffset[e];
+        return gBlockOffset[e] + localRow * sfCountPerElement[e] + sfIndex;
+    }
 };
 
 // Build an AtomBatch from a Structure whose neighbor list has already been
@@ -65,3 +87,9 @@ struct AtomBatch
 // the filter SymFnc::calculate() implementations apply via the neighbor
 // cutoff bookkeeping.
 AtomBatch buildAtomBatch(nnp::Structure const& structure, double rc);
+
+// Size and zero-initialize an AtomBatch's #G storage, one block per element
+// sized (atoms of that element) x (sfCountPerElement[e]). Must be called
+// after buildAtomBatch() has already set elementOffset/numElements.
+void allocateSfStorage(AtomBatch& batch,
+                       std::vector<std::size_t> const& sfCountPerElement);
