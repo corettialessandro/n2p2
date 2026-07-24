@@ -64,3 +64,38 @@ Symmetry function coverage: **all 11 of n2p2's leaf types** in
   linking needed for the dumper (confirmed `libnnp.a` has no undefined
   `gsl_*` symbols for this usage) — convenient, since the system linker
   can't parse `libgsl.so`'s compressed debug sections anyway.
+
+## `soa/`
+
+Phase 1 (`../GPU_PORTING_PLAN.md` §5) — data layout redesign, done step by
+step starting with the layout itself, validated in isolation before any
+kernel is rewritten to consume it.
+
+**Step 1 (done): `AtomBatch`**, a struct-of-arrays / CSR flattening of a real
+n2p2 `Structure`'s atoms and neighbor lists, replacing the current
+array-of-structs `std::vector<Atom>` (each owning its own
+`std::vector<Atom::Neighbor>`, each with its own `std::vector<double>`
+cache/`std::vector<Vec3D>` dGdr — pointer-chasing, non-coalesced on GPU):
+
+- `AtomBatch.h`/`.cpp` — atoms reordered element-major (all element-0 atoms
+  first, then element-1, ...; `elementOffset` gives the block boundaries —
+  this is the layout Phase 3's per-element batched NN GEMMs need), positions
+  as separate contiguous `x`/`y`/`z` arrays, and neighbor lists flattened
+  into CSR (`neighborOffset` prefix-sum + flat `neighborElement`/`neighborD`/
+  `neighborDx,Dy,Dz`/`neighborAtomSorted` arrays). Same shape as
+  `smoke/`'s `real_neighbors_full.txt` dump, generalized: built directly
+  from `Structure` in memory (no text round-trip), element-sorted, with
+  explicit offsets instead of a linear scan.
+- `build_batch_test.cpp` — host-side-only validation (no CUDA yet): builds
+  an `AtomBatch` from the real H2O_2G structure and checks, atom by atom and
+  neighbor by neighbor, that it's a lossless re-encoding of
+  `Structure`/`Atom::neighbors` (permutation bijectivity, element grouping,
+  exact position/neighbor values). 630 atoms, 66868 neighbor entries,
+  405621 checks, all passing — confirms the new layout before any kernel
+  depends on it.
+- `run.slurm` — CPU-only (no `--gres=gpu`, this step has no CUDA in it yet).
+
+Next steps (not yet done): rewrite one of `smoke/`'s symmetry-function
+kernels to consume an `AtomBatch` (H2D copy of the flat arrays) instead of
+its own ad hoc parsing, then extend the layout with `G`/`dGdx` storage
+arrays once a kernel actually needs to write into it.
