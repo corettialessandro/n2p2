@@ -93,9 +93,30 @@ cache/`std::vector<Vec3D>` dGdr — pointer-chasing, non-coalesced on GPU):
   exact position/neighbor values). 630 atoms, 66868 neighbor entries,
   405621 checks, all passing — confirms the new layout before any kernel
   depends on it.
-- `run.slurm` — CPU-only (no `--gres=gpu`, this step has no CUDA in it yet).
+**Step 2 (done): `symfnc_exprad_soa_test.cu`**, wiring `SymFncExpRad`'s CUDA
+kernel (math copied verbatim from `smoke/symfnc_family_test.cu`, already
+validated there) directly to a real `AtomBatch`, replacing `smoke/`'s
+`loadRealSystem()` text-file parsing entirely — this binary loads
+`temp/H2O_2G/input.data` via `ElementMap`/`Structure` itself, builds one
+`AtomBatch`, copies its CSR arrays to the device, and runs the kernel. Two
+things the layout buys for free, demonstrated here:
 
-Next steps (not yet done): rewrite one of `smoke/`'s symmetry-function
-kernels to consume an `AtomBatch` (H2D copy of the flat arrays) instead of
-its own ad hoc parsing, then extend the layout with `G`/`dGdx` storage
-arrays once a kernel actually needs to write into it.
+- Central-atom selection for a given element is the contiguous slice
+  `[elementOffset[ec], elementOffset[ec+1])` of already-sorted atoms — no
+  scan, no `selectedAtoms` gather array, unlike `smoke/`'s `runCase()`.
+- The kernel launch operates directly on that sorted range; thread `t` maps
+  to sorted atom index `begin + t`.
+
+Both real-parameter `ExpRad` cases (H central, e1=H, the two `eta`/`rs`
+pairs `input.nn` actually uses) pass to ~1e-15 (420 selected H atoms each).
+Together with step 1's build_batch_test.cpp, this chains
+GPU-kernel-vs-`AtomBatch`-vs-`Structure` correctness end to end.
+
+`run.slurm` now builds `AtomBatch.o` once (g++, `-std=c++14` to link cleanly
+against nvcc's host objects) and reuses it for both the host-only step 1
+test and step 2's `nvcc`-built kernel test; needs `--gres=gpu:1` now.
+
+Next steps (not yet done): extend the layout with `G`/`dGdx` storage arrays
+once a kernel needs to write persistent output into it (rather than just
+read neighbor geometry), and/or wire more symmetry-function kernels through
+the same `AtomBatch` path.
