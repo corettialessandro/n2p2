@@ -210,10 +210,37 @@ shared set of weights per element, propagated independently per atom.
 - Validated both element architectures (H: 420 atoms, O: 210 atoms) to
   ~1e-15 against `NeuralNetwork::propagate()`.
 
-Next steps (not yet done): batch the forward pass properly with
+**Step 2 (done, folded into `nn_forward_test.cu`)**: the NN backward pass,
+`dEdG` — the derivative of an atom's NN energy output with respect to each
+of its own symmetry-function inputs (`Atom::dEdG` in
+`Mode::calculateAtomicNeuralNetworks()`; not to be confused with Phase 1's
+`dGdx`/`neighborDGdx`, the derivative of a symmetry function with respect
+to atom *coordinates* — `dEdG` is the other half of the force chain rule,
+`dE/dx = dE/dG * dG/dx`).
+
+- `AtomBatch::dEdG` — new storage, same per-element block layout/indexing
+  as `G` (`gIndex()`), added alongside the existing arrays in
+  `allocateSfStorage()`.
+- The kernel ports `NeuralNetwork::calculateDEdG()`'s **exact algorithm**
+  (`src/libnnp/NeuralNetwork.cpp:396`): for each input `k`, forward-propagate
+  a unit sensitivity through the layers (multiply by weights and `dfdx` at
+  each stage) — not a from-scratch reverse-mode backprop, which would reach
+  the same numbers through a differently-ordered computation; this ports
+  the CPU's specific algorithm, the same "exact port" approach used for the
+  symmetry functions. Since both hidden layers are tanh, `dfdx = 1 -
+  value^2` is recovered directly from the forward pass's already-computed
+  activations (no separate pre-activation storage needed); the output
+  layer is identity, so its `dfdx` is exactly 1.
+- Computed in the same kernel launch as the forward pass (one thread per
+  atom does both), mirroring how `Mode.cpp` calls `propagate()` then
+  `calculateDEdG()` using the neuron state `propagate()` just left behind.
+- Validated against the real `NeuralNetwork::calculateDEdG()`: both element
+  architectures match to ~5e-15.
+
+Next steps (not yet done): batch the forward+backward pass properly with
 `cuBLAS gemmStridedBatched` instead of one-thread-per-atom sequential math
-(this step's version, matching Phase 2's kernels' style, proves correctness
-first); the NN backward pass (`calculateDEdG`/`calculateDFdc`/
-`calculateD2EdGdc`, ~30.8% of wall time); and the force-assembly
-scatter-add consuming `AtomBatch::neighborDGdx,Dy,Dz` (~46.5%, the single
-biggest cost center).
+(these steps' version, matching Phase 2's kernels' style, proves
+correctness first); `calculateDFdc`/`calculateD2EdGdc` (the weight-Jacobian
+half of the ~30.8% NN backward cost, needed for the Kalman/gradient-descent
+updaters, not yet ported); and the force-assembly scatter-add consuming
+`AtomBatch::neighborDGdx,Dy,Dz` (~46.5%, the single biggest cost center).

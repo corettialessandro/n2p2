@@ -101,6 +101,7 @@ void allocateSfStorage(AtomBatch& b, vector<size_t> const& sfCountPerElement)
     b.dGdx.assign(b.G.size(), 0.0);
     b.dGdy.assign(b.G.size(), 0.0);
     b.dGdz.assign(b.G.size(), 0.0);
+    b.dEdG.assign(b.G.size(), 0.0);
 
     b.neighborSfOffset.assign(b.numAtoms + 1, 0);
     for (size_t s = 0; s < b.numAtoms; ++s)

@@ -85,6 +85,16 @@ struct AtomBatch
         return gBlockOffset[e] + localRow * sfCountPerElement[e] + sfIndex;
     }
 
+    // --- NN backward pass output storage (Phase 3 step 2) -----------------
+    // Same block layout/indexing as #G (use gIndex()): derivative of sorted
+    // atom s's NN energy output with respect to s's sfIndex-th symmetry
+    // function INPUT -- Atom::dEdG in Mode::calculateAtomicNeuralNetworks()/
+    // NeuralNetwork::calculateDEdG(). Not to be confused with #dGdx,Dy,Dz
+    // (derivative of a symmetry function with respect to atom coordinates,
+    // Phase 1/2's concern) -- this is the OTHER half of the force chain
+    // rule (dE/dx = dE/dG * dG/dx), the NN's contribution.
+    std::vector<double> dEdG; // size == G.size()
+
     // --- Own-atom SF derivative storage (step 4a) -------------------------
     // Same block layout/indexing as #G (use gIndex()): derivative of sorted
     // atom s's sfIndex-th symmetry function with respect to s's OWN
