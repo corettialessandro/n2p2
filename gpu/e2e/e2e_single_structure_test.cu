@@ -1,46 +1,39 @@
 // End-to-end integration test: chain every piece validated so far (Phase 2's
-// radial symmetry function kernel, Phase 3's NN forward/backward, and force
-// assembly) into one real GPU pipeline for the real H2O_2G structure, using
-// REAL geometry and REAL symmetry-function parameters parsed straight out of
-// temp/H2O_2G/input.nn -- not synthetic data at each stage, unlike every
-// previous step. This is the natural next move recommended after Phase 3
-// closed out: every piece so far was validated in isolation (dEdG used
-// random G; force assembly used random dEdG/derivatives), so nothing had
-// exercised the WIRING between phases with real, physically-connected
-// numbers. This test is where integration bugs (element/index mismatches,
-// wrong cutoffs, parsing mistakes) would actually surface.
+// radial AND narrow-angular symmetry function kernels, Phase 3's NN
+// forward/backward, and force assembly) into one real GPU pipeline for the
+// real H2O_2G structure, using REAL geometry and REAL symmetry-function
+// parameters parsed straight out of temp/H2O_2G/input.nn -- not synthetic
+// data at each stage, unlike every step before this file first existed.
 //
-// Scope: only the type-2 (SymFncExpRad, radial) instances from input.nn are
-// used (16 for H, 16 for O -- see the two `awk`/`grep` counts against that
-// file), not the real production 35/42-wide network (which also includes
-// type-3/angular instances). Reason: Phase 1 step 4's neighbor-side
-// derivative storage (AtomBatch::neighborDGdx,Dy,Dz) was only ever
-// exercised for the radial family; gpu/smoke's angular kernels explicitly
-// left neighbor-side derivatives (and the "rjk" term) out of scope. Adding
-// full angular neighbor derivatives (two neighbors per term, not one, plus
-// that extra rjk contribution) is a real, separate derivation -- a natural
-// follow-up to THIS step, not bundled into it. What's tested here is
-// therefore a smaller, self-consistent 16-input network per element (real
-// geometry, real eta/rs/e1/rc values, real neighbor lists, real
-// NeuralNetwork class with random weights since no trained weights exist)
-// rather than the full production architecture -- but every number in it is
-// real, not synthetic, all the way through symmetry functions -> NN
-// forward -> dEdG -> force assembly.
+// This now covers the FULL real 35/42-wide production network (16 radial +
+// 19 angular = 35 for H, 16 radial + 26 angular = 42 for O), not just the
+// 16-wide radial subset this file started with -- the angular family's
+// neighbor-side derivatives (../soa/symfnc_expangn_group_test.cu) were the
+// missing piece, ported and validated separately first, then wired in here.
+// Symmetry function INDEX ORDER matters and is NOT arbitrary: input.nn
+// defines, for a given central element, all of that element's type-2
+// (radial) instances contiguously, followed by all of its type-3 (angular)
+// instances (verified directly against the file, no interleaving) -- so
+// concatenating [radial members][angular members] in parse order reproduces
+// the real production G-vector layout exactly, not just "a" 35/42-wide
+// network.
 //
-// GPU pipeline: all data stays resident on device across the three kernel
-// launches (symmetry functions -> NN forward+dEdG -> force assembly) --
-// only the initial geometry/weights upload and the final energy/force
-// download cross the host/device boundary, mirroring what a real batched
-// training step would do.
+// GPU pipeline: all data stays resident on device across the four kernel
+// launches (radial symmetry functions -> angular symmetry functions -> NN
+// forward+dEdG -> force assembly) -- only the initial geometry/weights
+// upload and the final energy/force download cross the host/device
+// boundary, mirroring what a real batched training step would do.
 //
 // CPU reference: fully independent computation using the SAME real
 // nnp::NeuralNetwork class (linked from lib/libnnp.a) and the same
-// symFncExpRadGroupReal() host/device function (called directly on the
-// host, since it's __host__ __device__ -- this specifically re-checks the
-// WIRING/indexing, not the core per-neighbor math again, which earlier
-// phases already validated bit-exact against SymFncExpRad::calculate()).
-// Force assembly's CPU side reuses the same independent "gather" traversal
-// ../force/force_assembly_test.cu introduced.
+// symFncExpRadGroupReal()/symFncExpAngnGroupReal() host/device functions
+// called directly on the host -- this specifically re-checks the
+// WIRING/indexing (including the two symmetry-function families sharing
+// one G vector via sfIndexOffset), not the core per-neighbor math again,
+// which earlier phases already validated bit-exact against
+// SymFnc{ExpRad,ExpAngn}::calculate(). Force assembly's CPU side reuses
+// the same independent "gather" traversal ../force/force_assembly_test.cu
+// introduced.
 
 #include "../soa/AtomBatch.h"
 #include "ElementMap.h"
@@ -70,11 +63,7 @@ using namespace std;
 } while (0)
 
 ///////////////////////////////////////////////////////////////////////////
-// Stage 1: real radial (ExpRad) symmetry functions, per-member e1 (a group
-// can mix e1=H and e1=O members here, unlike SymGrpExpRad's real grouping
-// rule of "same e1" -- harmless generalization since the cutoff computation
-// doesn't depend on e1 at all, only which members' sums a given neighbor
-// contributes to).
+// Shared math building blocks
 ///////////////////////////////////////////////////////////////////////////
 
 __host__ __device__ inline void cutoffTANHU(double r, double rcinv,
@@ -86,13 +75,44 @@ __host__ __device__ inline void cutoffTANHU(double r, double rcinv,
     dfc = 3.0 * t2 * (t2 - 1.0) * rcinv;
 }
 
+__host__ __device__ inline double pow_int(double x, int n)
+{
+    unsigned int m;
+    if (n < 0) { x = 1.0 / x; m = (unsigned int)(-n); }
+    else m = (unsigned int)n;
+    double result = 1.0;
+    do
+    {
+        if (m & 1) result *= x;
+        m >>= 1;
+        x *= x;
+    } while (m);
+    return result;
+}
+
+///////////////////////////////////////////////////////////////////////////
+// Stage 1: real radial (ExpRad) symmetry functions, per-member e1 filter
+// (../soa/symfnc_exprad_group_test.cu's pattern). sfIndexOffset lets this
+// family write into a sub-range of a wider, shared G block (radial members
+// occupy [0, numRadMembers), matching input.nn's real ordering).
+///////////////////////////////////////////////////////////////////////////
+
+// neighDGdx,Dy,Dz here is the GLOBAL per-atom neighbor-derivative block
+// (already offset to this central atom's own neighborSfOffset), addressed
+// with the atom's FULL symmetry-function stride (sfStride, e.g. 35/42) and
+// this family's sfIndexOffset within that stride -- NOT numMembers, since
+// several families (radial, angular) share one wider per-atom block here.
+// Written directly, no local per-neighbor-slot staging buffer (that would
+// need sizing by the largest possible neighbor count, which isn't a
+// compile-time constant).
 __host__ __device__ inline void symFncExpRadGroupReal(
     int numNeighbors, const int* neighElem,
     const double* neighDist, const double* neighDx, const double* neighDy,
     const double* neighDz, double rc,
     int numMembers, const int* e1, const double* eta, const double* rs,
     double* result, double* dResultX, double* dResultY, double* dResultZ,
-    double* neighDGdx, double* neighDGdy, double* neighDGdz)
+    double* neighDGdx, double* neighDGdy, double* neighDGdz,
+    size_t sfStride, size_t sfIndexOffset)
 {
     double rcinv = 1.0 / rc;
     for (int j = 0; j < numNeighbors; ++j)
@@ -112,7 +132,7 @@ __host__ __device__ inline void symFncExpRadGroupReal(
             double dijy = p1 * neighDy[j];
             double dijz = p1 * neighDz[j];
             dResultX[k] += dijx; dResultY[k] += dijy; dResultZ[k] += dijz;
-            int idx = j * numMembers + k;
+            size_t idx = (size_t)j * sfStride + sfIndexOffset + k;
             neighDGdx[idx] = -dijx;
             neighDGdy[idx] = -dijy;
             neighDGdz[idx] = -dijz;
@@ -121,7 +141,7 @@ __host__ __device__ inline void symFncExpRadGroupReal(
 }
 
 __global__ void sfGroupKernelReal(
-    int begin, int numSelected, double rc, int numMembers,
+    int begin, int numSelected, double rc, int numMembers, int sfIndexOffset,
     const int* e1, const double* eta, const double* rs,
     const int* neighOffsetInt, const int* neighElem, const double* neighDist,
     const double* neighDx, const double* neighDy, const double* neighDz,
@@ -142,9 +162,10 @@ __global__ void sfGroupKernelReal(
                           e1, eta, rs, result, dResultX, dResultY, dResultZ,
                           &neighborDGdx[neighborSfOffset[i]],
                           &neighborDGdy[neighborSfOffset[i]],
-                          &neighborDGdz[neighborSfOffset[i]]);
+                          &neighborDGdz[neighborSfOffset[i]],
+                          sfCountE, (size_t)sfIndexOffset);
 
-    size_t base = gBlockOffsetE + (size_t)t * sfCountE;
+    size_t base = gBlockOffsetE + (size_t)t * sfCountE + sfIndexOffset;
     for (int k = 0; k < numMembers; ++k)
     {
         G[base + k] = result[k];
@@ -155,7 +176,151 @@ __global__ void sfGroupKernelReal(
 }
 
 ///////////////////////////////////////////////////////////////////////////
-// Stage 2: NN forward + dEdG (copied from ../nn/nn_forward_test.cu, already
+// Stage 2: real narrow angular (ExpAngn) symmetry functions, per-member
+// (e1,e2) filter, WITH neighbor-side derivatives
+// (../soa/symfnc_expangn_group_test.cu, validated there). sfIndexOffset
+// places these members after the radial ones in the same shared G block.
+///////////////////////////////////////////////////////////////////////////
+
+__host__ __device__ inline void symFncExpAngnGroupReal(
+    int numNeighbors, const int* neighElem,
+    const double* neighDist, const double* neighDx, const double* neighDy,
+    const double* neighDz, double rc,
+    int numMembers, const int* e1, const int* e2, const double* eta,
+    const double* lambda, const double* zeta,
+    double* result, double* dResultX, double* dResultY, double* dResultZ,
+    double* neighDGdx, double* neighDGdy, double* neighDGdz,
+    size_t sfStride, size_t sfIndexOffset)
+{
+    double rc2 = rc * rc;
+    double rcinv = 1.0 / rc;
+
+    for (int j = 0; j < numNeighbors - 1; ++j)
+    {
+        double rij = neighDist[j];
+        if (!(rij < rc)) continue;
+        int nej = neighElem[j];
+        double pfcij, pdfcij;
+        cutoffTANHU(rij, rcinv, pfcij, pdfcij);
+
+        for (int k = j + 1; k < numNeighbors; ++k)
+        {
+            double rik = neighDist[k];
+            if (!(rik < rc)) continue;
+            int nek = neighElem[k];
+
+            double djkx = neighDx[k] - neighDx[j];
+            double djky = neighDy[k] - neighDy[j];
+            double djkz = neighDz[k] - neighDz[j];
+            double rjk2 = djkx * djkx + djky * djky + djkz * djkz;
+            if (!(rjk2 < rc2)) continue;
+            double rjk = sqrt(rjk2);
+
+            double pfcik, pdfcik; cutoffTANHU(rik, rcinv, pfcik, pdfcik);
+            double pfcjk, pdfcjk; cutoffTANHU(rjk, rcinv, pfcjk, pdfcjk);
+
+            double dijx = neighDx[j], dijy = neighDy[j], dijz = neighDz[j];
+            double dikx = neighDx[k], diky = neighDy[k], dikz = neighDz[k];
+            double costijk0 = (dijx * dikx + dijy * diky + dijz * dikz) / (rij * rik);
+
+            double pfc = pfcij * pfcik * pfcjk;
+            double r2ij = rij * rij, r2ik = rik * rik;
+
+            for (int m = 0; m < numMembers; ++m)
+            {
+                bool matches = (nej == e1[m] && nek == e2[m]) ||
+                               (nej == e2[m] && nek == e1[m]);
+                if (!matches) continue;
+
+                double rijs = rij, riks = rik, rjks = rjk; // rs == 0
+                double pexp = exp(-eta[m] * (rijs * rijs + riks * riks + rjks * rjks));
+                double plambda = 1.0 + lambda[m] * costijk0;
+
+                double pnorm = pow(2.0, 1.0 - zeta[m]);
+                int zetaInt = (int)llround(zeta[m]);
+                bool useIntegerPow = (fabs(zeta[m] - zetaInt) <= 1e-12);
+
+                double fg = pexp;
+                if (plambda <= 0.0) fg = 0.0;
+                else fg *= useIntegerPow ? pow_int(plambda, zetaInt - 1)
+                                         : pow(plambda, zeta[m] - 1.0);
+
+                result[m] += fg * plambda * pfc;
+
+                double fgF = fg * pnorm;
+                double pzl = zeta[m] * lambda[m];
+                double rinvijikF = pzl / (rij * rik);
+                double costijkF  = costijk0 * pzl;
+                double p2etapl   = 2.0 * eta[m] * plambda;
+
+                double p1 = fgF * (pfc * (rinvijikF - costijkF / r2ij - p2etapl * rijs / rij)
+                                   + pfcik * pfcjk * pdfcij * plambda / rij);
+                double p2 = fgF * (pfc * (rinvijikF - costijkF / r2ik - p2etapl * riks / rik)
+                                   + pfcij * pfcjk * pdfcik * plambda / rik);
+                double p3 = fgF * (pfc * (rinvijikF + p2etapl * rjks / rjk)
+                                   - pfcij * pfcik * pdfcjk * plambda / rjk);
+
+                double drijx = p1 * dijx, drijy = p1 * dijy, drijz = p1 * dijz;
+                double drikx = p2 * dikx, driky = p2 * diky, drikz = p2 * dikz;
+                double drjkx = p3 * djkx, drjky = p3 * djky, drjkz = p3 * djkz;
+
+                dResultX[m] += drijx + drikx;
+                dResultY[m] += drijy + driky;
+                dResultZ[m] += drijz + drikz;
+
+                size_t idxJ = (size_t)j * sfStride + sfIndexOffset + m;
+                size_t idxK = (size_t)k * sfStride + sfIndexOffset + m;
+                neighDGdx[idxJ] -= drijx + drjkx;
+                neighDGdy[idxJ] -= drijy + drjky;
+                neighDGdz[idxJ] -= drijz + drjkz;
+                neighDGdx[idxK] -= drikx - drjkx;
+                neighDGdy[idxK] -= driky - drjky;
+                neighDGdz[idxK] -= drikz - drjkz;
+            }
+        }
+    }
+    for (int m = 0; m < numMembers; ++m) result[m] *= pow(2.0, 1.0 - zeta[m]);
+}
+
+__global__ void sfAngnGroupKernel(
+    int begin, int numSelected, double rc, int numMembers, int sfIndexOffset,
+    const int* e1, const int* e2, const double* eta, const double* lambda,
+    const double* zeta,
+    const int* neighOffsetInt, const int* neighElem, const double* neighDist,
+    const double* neighDx, const double* neighDy, const double* neighDz,
+    double* G, double* dGdx, double* dGdy, double* dGdz,
+    size_t gBlockOffsetE, size_t sfCountE,
+    const size_t* neighborSfOffset,
+    double* neighborDGdx, double* neighborDGdy, double* neighborDGdz)
+{
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= numSelected) return;
+    int i = begin + t;
+    int off = neighOffsetInt[i], n = neighOffsetInt[i + 1] - off;
+
+    double result[32] = {0}, dResultX[32] = {0}, dResultY[32] = {0}, dResultZ[32] = {0};
+
+    symFncExpAngnGroupReal(n, &neighElem[off], &neighDist[off], &neighDx[off],
+                           &neighDy[off], &neighDz[off], rc, numMembers,
+                           e1, e2, eta, lambda, zeta,
+                           result, dResultX, dResultY, dResultZ,
+                           &neighborDGdx[neighborSfOffset[i]],
+                           &neighborDGdy[neighborSfOffset[i]],
+                           &neighborDGdz[neighborSfOffset[i]],
+                           sfCountE, (size_t)sfIndexOffset);
+
+    size_t base = gBlockOffsetE + (size_t)t * sfCountE + sfIndexOffset;
+    for (int k = 0; k < numMembers; ++k)
+    {
+        G[base + k] = result[k];
+        dGdx[base + k] = dResultX[k];
+        dGdy[base + k] = dResultY[k];
+        dGdz[base + k] = dResultZ[k];
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////
+// Stage 3: NN forward + dEdG (copied from ../nn/nn_forward_test.cu, already
 // validated there against the real NeuralNetwork class).
 ///////////////////////////////////////////////////////////////////////////
 
@@ -223,7 +388,7 @@ __global__ void nnForwardKernel(
 }
 
 ///////////////////////////////////////////////////////////////////////////
-// Stage 3: force assembly (copied verbatim from
+// Stage 4: force assembly (copied verbatim from
 // ../force/force_assembly_test.cu, already validated there).
 ///////////////////////////////////////////////////////////////////////////
 
@@ -275,11 +440,11 @@ __global__ void forceAssemblyKernel(
 }
 
 ///////////////////////////////////////////////////////////////////////////
-// input.nn parsing: real "symfunction_short <ec> 2 <e1> <eta> <rs> <rc>"
-// lines only, in file order.
+// input.nn parsing: real "symfunction_short" lines only, in file order.
 ///////////////////////////////////////////////////////////////////////////
 
 struct RadMember { int e1; double eta, rs, rc; };
+struct AngMember { int e1, e2; double eta, lambda, zeta, rc; };
 
 vector<RadMember> parseExpRadMembers(string const& path, string const& ec,
                                       ElementMap const& elementMap)
@@ -298,8 +463,31 @@ vector<RadMember> parseExpRadMembers(string const& path, string const& ec,
         string e1Str; double eta, rs, rc;
         iss >> e1Str >> eta >> rs >> rc;
         RadMember m;
-        m.e1 = (int)elementMap[e1Str];
-        m.eta = eta; m.rs = rs; m.rc = rc;
+        m.e1 = (int)elementMap[e1Str]; m.eta = eta; m.rs = rs; m.rc = rc;
+        members.push_back(m);
+    }
+    return members;
+}
+
+vector<AngMember> parseExpAngnMembers(string const& path, string const& ec,
+                                       ElementMap const& elementMap)
+{
+    vector<AngMember> members;
+    ifstream in(path);
+    string line;
+    while (getline(in, line))
+    {
+        istringstream iss(line);
+        string tag;
+        if (!(iss >> tag) || tag != "symfunction_short") continue;
+        string ecStr; int type;
+        if (!(iss >> ecStr >> type)) continue;
+        if (ecStr != ec || type != 3) continue;
+        string e1Str, e2Str; double eta, lambda, zeta, rc;
+        iss >> e1Str >> e2Str >> eta >> lambda >> zeta >> rc;
+        AngMember m;
+        m.e1 = (int)elementMap[e1Str]; m.e2 = (int)elementMap[e2Str];
+        m.eta = eta; m.lambda = lambda; m.zeta = zeta; m.rc = rc;
         members.push_back(m);
     }
     return members;
@@ -329,11 +517,15 @@ int main(int argc, char** argv)
     AtomBatch batch = buildAtomBatch(structure, rc);
     int const H = 0, O = 1;
 
-    vector<RadMember> membersH = parseExpRadMembers(inputNn, "H", elementMap);
-    vector<RadMember> membersO = parseExpRadMembers(inputNn, "O", elementMap);
-    int numH = (int)membersH.size(), numO = (int)membersO.size();
-    printf("Parsed %d real ExpRad instances for H, %d for O (from %s)\n",
-           numH, numO, inputNn.c_str());
+    vector<RadMember> radH = parseExpRadMembers(inputNn, "H", elementMap);
+    vector<RadMember> radO = parseExpRadMembers(inputNn, "O", elementMap);
+    vector<AngMember> angH = parseExpAngnMembers(inputNn, "H", elementMap);
+    vector<AngMember> angO = parseExpAngnMembers(inputNn, "O", elementMap);
+    int numRadH = (int)radH.size(), numAngH = (int)angH.size();
+    int numRadO = (int)radO.size(), numAngO = (int)angO.size();
+    int numH = numRadH + numAngH, numO = numRadO + numAngO;
+    printf("Parsed real instances -- H: %d radial + %d angular = %d; O: %d radial + %d angular = %d\n",
+           numRadH, numAngH, numH, numRadO, numAngO, numO);
 
     allocateSfStorage(batch, {(size_t)numH, (size_t)numO});
     printf("AtomBatch: %zu atoms (%zu H, %zu O), %zu neighbor entries\n\n",
@@ -344,9 +536,9 @@ int main(int argc, char** argv)
     vector<int> neighOffsetInt(batch.neighborOffset.begin(), batch.neighborOffset.end());
     vector<int> neighElemInt(batch.neighborElement.begin(), batch.neighborElement.end());
 
-    // Two real NeuralNetworks, one per element, architecture sized to this
-    // reduced real instance count (16 -> 25 -> 25 -> 1), random weights
-    // (no trained weights available).
+    // Two real NeuralNetworks, one per element, architecture sized to the
+    // FULL real instance count (35/42 -> 25 -> 25 -> 1), random weights (no
+    // trained weights available).
     int const numHidden1 = 25, numHidden2 = 25, numOut = 1, numLayers = 4;
     NeuralNetwork::ActivationFunction af[4] = {
         NeuralNetwork::AF_IDENTITY, NeuralNetwork::AF_TANH,
@@ -392,7 +584,7 @@ int main(int argc, char** argv)
     }
 
     ///////////////////////////////////////////////////////////////////////
-    // GPU pipeline: everything stays on device across the three stages.
+    // GPU pipeline: everything stays on device across the four stages.
     ///////////////////////////////////////////////////////////////////////
     int total = (int)batch.neighborD.size();
 
@@ -457,9 +649,9 @@ int main(int argc, char** argv)
     CUDA_CHECK(cudaMalloc(&d_neighborOffsetSizeT, batch.neighborOffset.size() * sizeof(size_t)));
     CUDA_CHECK(cudaMemcpy(d_neighborOffsetSizeT, batch.neighborOffset.data(), batch.neighborOffset.size() * sizeof(size_t), cudaMemcpyHostToDevice));
 
-    // Per-element member arrays for stage 1.
-    auto uploadMembers = [](vector<RadMember> const& members,
-                             int** d_e1, double** d_eta, double** d_rs)
+    // Per-element member arrays.
+    auto uploadRad = [](vector<RadMember> const& members,
+                         int** d_e1, double** d_eta, double** d_rs)
     {
         int n = (int)members.size();
         vector<int> e1(n); vector<double> eta(n), rs(n);
@@ -471,32 +663,70 @@ int main(int argc, char** argv)
         CUDA_CHECK(cudaMemcpy(*d_eta, eta.data(), n * sizeof(double), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(*d_rs, rs.data(), n * sizeof(double), cudaMemcpyHostToDevice));
     };
-    int *d_e1H, *d_e1O; double *d_etaH, *d_rsH, *d_etaO, *d_rsO;
-    uploadMembers(membersH, &d_e1H, &d_etaH, &d_rsH);
-    uploadMembers(membersO, &d_e1O, &d_etaO, &d_rsO);
+    auto uploadAng = [](vector<AngMember> const& members,
+                         int** d_e1, int** d_e2, double** d_eta, double** d_lambda, double** d_zeta)
+    {
+        int n = (int)members.size();
+        vector<int> e1(n), e2(n); vector<double> eta(n), lambda(n), zeta(n);
+        for (int k = 0; k < n; ++k)
+        {
+            e1[k] = members[k].e1; e2[k] = members[k].e2;
+            eta[k] = members[k].eta; lambda[k] = members[k].lambda; zeta[k] = members[k].zeta;
+        }
+        CUDA_CHECK(cudaMalloc(d_e1, n * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(d_e2, n * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(d_eta, n * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(d_lambda, n * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(d_zeta, n * sizeof(double)));
+        CUDA_CHECK(cudaMemcpy(*d_e1, e1.data(), n * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(*d_e2, e2.data(), n * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(*d_eta, eta.data(), n * sizeof(double), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(*d_lambda, lambda.data(), n * sizeof(double), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(*d_zeta, zeta.data(), n * sizeof(double), cudaMemcpyHostToDevice));
+    };
+    int *d_e1RadH, *d_e1RadO; double *d_etaRadH, *d_rsRadH, *d_etaRadO, *d_rsRadO;
+    uploadRad(radH, &d_e1RadH, &d_etaRadH, &d_rsRadH);
+    uploadRad(radO, &d_e1RadO, &d_etaRadO, &d_rsRadO);
+    int *d_e1AngH, *d_e2AngH; double *d_etaAngH, *d_lambdaAngH, *d_zetaAngH;
+    int *d_e1AngO, *d_e2AngO; double *d_etaAngO, *d_lambdaAngO, *d_zetaAngO;
+    uploadAng(angH, &d_e1AngH, &d_e2AngH, &d_etaAngH, &d_lambdaAngH, &d_zetaAngH);
+    uploadAng(angO, &d_e1AngO, &d_e2AngO, &d_etaAngO, &d_lambdaAngO, &d_zetaAngO);
 
-    // --- Stage 1: symmetry functions -----------------------------------------
     int blockSize = 128;
     int beginH = (int)batch.elementOffset[H], endH = (int)batch.elementOffset[H + 1];
     int beginO = (int)batch.elementOffset[O], endO = (int)batch.elementOffset[O + 1];
     int numSelH = endH - beginH, numSelO = endO - beginO;
 
+    // --- Stage 1: radial symmetry functions ----------------------------------
     sfGroupKernelReal<<<(numSelH + blockSize - 1) / blockSize, blockSize>>>(
-        beginH, numSelH, rc, numH, d_e1H, d_etaH, d_rsH,
+        beginH, numSelH, rc, numRadH, 0, d_e1RadH, d_etaRadH, d_rsRadH,
         d_neighOffset, d_neighElem, d_neighDist, d_neighDx, d_neighDy, d_neighDz,
         d_G, d_dGdx, d_dGdy, d_dGdz, batch.gBlockOffset[H], batch.sfCountPerElement[H],
         d_neighborSfOffset, d_nDGdx, d_nDGdy, d_nDGdz);
     CUDA_CHECK(cudaGetLastError());
-
     sfGroupKernelReal<<<(numSelO + blockSize - 1) / blockSize, blockSize>>>(
-        beginO, numSelO, rc, numO, d_e1O, d_etaO, d_rsO,
+        beginO, numSelO, rc, numRadO, 0, d_e1RadO, d_etaRadO, d_rsRadO,
+        d_neighOffset, d_neighElem, d_neighDist, d_neighDx, d_neighDy, d_neighDz,
+        d_G, d_dGdx, d_dGdy, d_dGdz, batch.gBlockOffset[O], batch.sfCountPerElement[O],
+        d_neighborSfOffset, d_nDGdx, d_nDGdy, d_nDGdz);
+    CUDA_CHECK(cudaGetLastError());
+
+    // --- Stage 2: angular symmetry functions ---------------------------------
+    sfAngnGroupKernel<<<(numSelH + blockSize - 1) / blockSize, blockSize>>>(
+        beginH, numSelH, rc, numAngH, numRadH, d_e1AngH, d_e2AngH, d_etaAngH, d_lambdaAngH, d_zetaAngH,
+        d_neighOffset, d_neighElem, d_neighDist, d_neighDx, d_neighDy, d_neighDz,
+        d_G, d_dGdx, d_dGdy, d_dGdz, batch.gBlockOffset[H], batch.sfCountPerElement[H],
+        d_neighborSfOffset, d_nDGdx, d_nDGdy, d_nDGdz);
+    CUDA_CHECK(cudaGetLastError());
+    sfAngnGroupKernel<<<(numSelO + blockSize - 1) / blockSize, blockSize>>>(
+        beginO, numSelO, rc, numAngO, numRadO, d_e1AngO, d_e2AngO, d_etaAngO, d_lambdaAngO, d_zetaAngO,
         d_neighOffset, d_neighElem, d_neighDist, d_neighDx, d_neighDy, d_neighDz,
         d_G, d_dGdx, d_dGdy, d_dGdz, batch.gBlockOffset[O], batch.sfCountPerElement[O],
         d_neighborSfOffset, d_nDGdx, d_nDGdy, d_nDGdz);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // --- Stage 2: NN forward + dEdG ------------------------------------------
+    // --- Stage 3: NN forward + dEdG ------------------------------------------
     double *d_W1H, *d_b1H, *d_W2H, *d_b2H, *d_W3H, *d_b3H;
     CUDA_CHECK(cudaMalloc(&d_W1H, numH * numHidden1 * sizeof(double)));
     CUDA_CHECK(cudaMalloc(&d_b1H, numHidden1 * sizeof(double)));
@@ -538,7 +768,7 @@ int main(int argc, char** argv)
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // --- Stage 3: force assembly ---------------------------------------------
+    // --- Stage 4: force assembly ---------------------------------------------
     forceAssemblyKernel<<<((int)numAtoms + blockSize - 1) / blockSize, blockSize>>>(
         (int)numAtoms, d_neighborOffsetSizeT, d_neighborAtomSorted, d_neighborSfOffset,
         d_gBaseOf, d_sfCountOf, d_dEdG, d_dGdx, d_dGdy, d_dGdz,
@@ -565,21 +795,24 @@ int main(int argc, char** argv)
     vector<double> nDGdyCpu(batch.neighborDGdx.size(), 0.0);
     vector<double> nDGdzCpu(batch.neighborDGdx.size(), 0.0);
 
-    auto runSfCpu = [&](int begin, int end, vector<RadMember> const& members)
+    auto runRadCpu = [&](int begin, int end, vector<RadMember> const& members, int sfIndexOffset)
     {
         int numMembers = (int)members.size();
+        if (numMembers == 0) return;
         vector<int> e1(numMembers); vector<double> eta(numMembers), rsv(numMembers);
         for (int k = 0; k < numMembers; ++k) { e1[k] = members[k].e1; eta[k] = members[k].eta; rsv[k] = members[k].rs; }
         for (int i = begin; i < end; ++i)
         {
             int off = neighOffsetInt[i], n = neighOffsetInt[i + 1] - off;
             vector<double> result(numMembers, 0.0), dResultX(numMembers, 0.0), dResultY(numMembers, 0.0), dResultZ(numMembers, 0.0);
+            size_t sfCountE = batch.sfCountPerElement[batch.element[i]];
             symFncExpRadGroupReal(n, &neighElemInt[off], &batch.neighborD[off],
                                   &batch.neighborDx[off], &batch.neighborDy[off], &batch.neighborDz[off],
                                   rc, numMembers, e1.data(), eta.data(), rsv.data(),
                                   result.data(), dResultX.data(), dResultY.data(), dResultZ.data(),
-                                  &nDGdxCpu[batch.neighborSfOffset[i]], &nDGdyCpu[batch.neighborSfOffset[i]], &nDGdzCpu[batch.neighborSfOffset[i]]);
-            size_t base = batch.gIndex(i, 0);
+                                  &nDGdxCpu[batch.neighborSfOffset[i]], &nDGdyCpu[batch.neighborSfOffset[i]],
+                                  &nDGdzCpu[batch.neighborSfOffset[i]], sfCountE, (size_t)sfIndexOffset);
+            size_t base = batch.gIndex(i, 0) + sfIndexOffset;
             for (int k = 0; k < numMembers; ++k)
             {
                 gCpu[base + k] = result[k];
@@ -589,8 +822,42 @@ int main(int argc, char** argv)
             }
         }
     };
-    runSfCpu(beginH, endH, membersH);
-    runSfCpu(beginO, endO, membersO);
+    auto runAngCpu = [&](int begin, int end, vector<AngMember> const& members, int sfIndexOffset)
+    {
+        int numMembers = (int)members.size();
+        if (numMembers == 0) return;
+        vector<int> e1(numMembers), e2(numMembers);
+        vector<double> eta(numMembers), lambda(numMembers), zeta(numMembers);
+        for (int k = 0; k < numMembers; ++k)
+        {
+            e1[k] = members[k].e1; e2[k] = members[k].e2;
+            eta[k] = members[k].eta; lambda[k] = members[k].lambda; zeta[k] = members[k].zeta;
+        }
+        for (int i = begin; i < end; ++i)
+        {
+            int off = neighOffsetInt[i], n = neighOffsetInt[i + 1] - off;
+            vector<double> result(numMembers, 0.0), dResultX(numMembers, 0.0), dResultY(numMembers, 0.0), dResultZ(numMembers, 0.0);
+            size_t sfCountE = batch.sfCountPerElement[batch.element[i]];
+            symFncExpAngnGroupReal(n, &neighElemInt[off], &batch.neighborD[off],
+                                   &batch.neighborDx[off], &batch.neighborDy[off], &batch.neighborDz[off],
+                                   rc, numMembers, e1.data(), e2.data(), eta.data(), lambda.data(), zeta.data(),
+                                   result.data(), dResultX.data(), dResultY.data(), dResultZ.data(),
+                                   &nDGdxCpu[batch.neighborSfOffset[i]], &nDGdyCpu[batch.neighborSfOffset[i]],
+                                   &nDGdzCpu[batch.neighborSfOffset[i]], sfCountE, (size_t)sfIndexOffset);
+            size_t base = batch.gIndex(i, 0) + sfIndexOffset;
+            for (int k = 0; k < numMembers; ++k)
+            {
+                gCpu[base + k] = result[k];
+                dGdxCpu[base + k] = dResultX[k];
+                dGdyCpu[base + k] = dResultY[k];
+                dGdzCpu[base + k] = dResultZ[k];
+            }
+        }
+    };
+    runRadCpu(beginH, endH, radH, 0);
+    runRadCpu(beginO, endO, radO, 0);
+    runAngCpu(beginH, endH, angH, numRadH);
+    runAngCpu(beginO, endO, angO, numRadO);
 
     vector<double> energyCpu(numAtoms), dEdGCpu(batch.G.size(), 0.0);
     for (int t = 0; t < numSelH; ++t)
@@ -651,6 +918,7 @@ int main(int argc, char** argv)
     double maxAbsErrG = 0.0, maxAbsErrE = 0.0, maxAbsErrF = 0.0;
     for (size_t k = 0; k < batch.G.size(); ++k)
         maxAbsErrG = max(maxAbsErrG, fabs(gGpu[k] - gCpu[k]));
+
     double sumEnergyGpu = 0.0, sumEnergyCpu = 0.0;
     for (size_t i = 0; i < numAtoms; ++i)
     {
