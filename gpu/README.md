@@ -164,10 +164,32 @@ out of scope ("Neighbor-side derivative bookkeeping is out of scope"):
   index arithmetic cross-checked inline (mirroring step 3's `gIndex()`
   check).
 
-Next steps (not yet done): wire more symmetry-function types through this
-same grouped-kernel + `G`/`dGdx`/`neighborDGdx`-storage pattern, and/or start
-on the actual force-assembly scatter-add that consumes `neighborDGdx,Dy,Dz`
-(Phase 3).
+**Step 5 (done): `symfnc_expangn_group_test.cu`**, neighbor-side derivatives
+for the narrow angular (`SymFncExpAngn`, type 3) family — closes the last
+gap left by `smoke/`'s original per-type tests ("Neighbor-side derivative
+bookkeeping is out of scope" applied there to *all* angular types; step 4
+already closed it for the radial family). Needed to cover the real
+35/42-wide H2O_2G production network end to end (`e2e/`'s first pass only
+covered the 16-wide radial subset, since this piece didn't exist yet).
+
+- Re-derived line by line from `src/libnnp/SymFncExpAngn.cpp:79-225`: an
+  angular triple (central atom, neighbors `j` and `k`) produces THREE force
+  vectors (`drij`, `drik`, `drjk`), split as `atom.dGdr[index] += drij +
+  drik` (central atom, already validated in `smoke/`), `nj.dGdr[...] -=
+  drij + drjk`, `nk.dGdr[...] -= drik - drjk` (both new). Grouped over all
+  of one element's real instances at once (19 for H, 26 for O), sharing the
+  `(j,k)` pair enumeration and cutoff geometry across members, generalized
+  to a per-member `(e1,e2)` filter like `e2e/`'s radial generalization.
+- Since a neighbor slot can appear as `j` in one pair and `k` in another,
+  its neighbor-derivative entry must **accumulate** (`+=`) across the whole
+  double loop — unlike the radial family's neighborDGdx (step 4), where
+  each slot got exactly one direct write. Still no atomics needed: a given
+  central atom's neighbor-derivative block is only ever touched by the one
+  thread computing that atom's own symmetry functions.
+- Validated against an independent CPU pass of the same `__host__
+  __device__` function: both elements pass on the first run (`G`, the
+  central atom's own derivative, and every individual neighbor-slot
+  derivative all matching to ~1e-16).
 
 ## `nn/`
 
