@@ -332,11 +332,69 @@ neighbor `i`'s force is `-sum_k dEdG_j[k] * (j's neighbor-entry-for-i).dGdr[k]`.
 - Validated on the first run: 630 atoms, 66868 neighbor entries, GPU vs.
   independent CPU gather to ~2.4e-13.
 
-Next steps (not yet done): wire real `dEdG`/`dGdx`/`neighborDGdx` values
-through (from `nn/` and `soa/`'s symmetry-function kernels) instead of
-synthetic ones, for an actual end-to-end energy+force pipeline on one
-structure; determinism (`atomicAdd` on doubles is not run-to-run
-bit-reproducible — the plan flags this explicitly, an alternative would be
-a neighbor-major segmented reduction); and, more broadly, Phase 4 (Kalman
-filter weight updater) or Phase 6 (build system integration, without which
-none of this is reachable from the real `nnp-train` binary).
+Next steps (not yet done): determinism (`atomicAdd` on doubles is not
+run-to-run bit-reproducible — the plan flags this explicitly, an
+alternative would be a neighbor-major segmented reduction). Wiring real
+values through instead of synthetic ones is covered next, in `e2e/`.
+
+## `e2e/`
+
+End-to-end integration: chains every piece validated so far — Phase 2's
+radial symmetry function math, Phase 3's NN forward/backward, and force
+assembly — into one real GPU pipeline for the real H2O_2G structure, using
+**real** geometry and **real** symmetry-function parameters parsed straight
+out of `temp/H2O_2G/input.nn`, not synthetic data at each stage like every
+previous step. This is what was recommended after Phase 3 closed out:
+every piece so far had been validated in isolation (`dEdG` used random
+`G`; force assembly used random `dEdG`/derivatives), so nothing had
+exercised the *wiring* between phases with real, physically-connected
+numbers — this is where integration bugs (element/index mismatches, wrong
+cutoffs, parsing mistakes) would actually surface.
+
+**Done: `e2e_single_structure_test.cu`**.
+
+- **Scope**: only the type-2 (`SymFncExpRad`, radial) instances from
+  `input.nn` are used — 16 for H, 16 for O (parsed directly from the file,
+  in order) — not the real production 35/42-wide network (which also
+  includes type-3/angular instances). Reason: Phase 1 step 4's
+  neighbor-side derivative storage was only ever exercised for the radial
+  family; `smoke/`'s angular kernels explicitly left neighbor-side
+  derivatives (and the "rjk" term) out of scope. Extending full angular
+  neighbor derivatives (two neighbors per term, not one, plus that extra
+  term) is a real, separate derivation — a natural follow-up to this step,
+  not bundled into it. So what's tested is a smaller, self-consistent
+  16-input network per element (real geometry, real `eta`/`rs`/`e1`/`rc`
+  values, real neighbor lists, a real `NeuralNetwork` with random weights
+  since no trained weights exist) rather than the full production
+  architecture — but every number in it is real, all the way through
+  symmetry functions → NN forward → `dEdG` → force assembly.
+- **GPU pipeline**: all data stays resident on device across the three
+  kernel launches (symmetry functions → NN forward+`dEdG` → force
+  assembly) — only the initial geometry/weights upload and the final
+  energy/force download cross the host/device boundary, mirroring what a
+  real batched training step would do.
+- **CPU reference**: fully independent — the same real `nnp::NeuralNetwork`
+  class, and the same `symFncExpRadGroupReal()` `__host__ __device__`
+  function called directly on the host (specifically re-checking the
+  *wiring*/indexing, not the core per-neighbor math again, which earlier
+  phases already validated bit-exact). Force assembly's CPU side reuses
+  `force/`'s independent "gather" traversal.
+- The grouped symmetry-function kernel (`sfGroupKernelReal`) generalizes
+  `soa/`'s grouped kernel to a **per-member** `e1` filter (each member can
+  have its own neighbor-element filter) rather than one shared `e1` — a
+  harmless generalization since the cutoff computation doesn't depend on
+  `e1` at all, only which members a given neighbor contributes to; real
+  H/O each mix e1=H and e1=O members (8 each), which wouldn't fit a single
+  shared-`e1` `SymGrp`-style group.
+- Validated on the **first run**: 630 atoms, 66868 neighbor entries, 10080
+  `G` values, all matching the independent CPU reference to ~4e-15 (energy,
+  forces, and `G` all individually checked).
+
+Next steps (not yet done): extend the angular (`ExpAngn`) kernels with
+neighbor-side derivatives to cover the full real 35/42-wide production
+network end to end (not just the radial subset); Phase 4 (Kalman filter
+weight updater, still the highest-risk untouched piece); batched-GEMM
+kernels instead of one-thread-per-atom; and Phase 6 (build system
+integration — a `makefile.cuda`/`N2P2_GPU` flag actually linking this code
+into `nnp-train`, without which none of it is reachable from the real
+training binary, whatever else gets validated standalone).
