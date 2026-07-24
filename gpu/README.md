@@ -237,10 +237,46 @@ to atom *coordinates* — `dEdG` is the other half of the force chain rule,
 - Validated against the real `NeuralNetwork::calculateDEdG()`: both element
   architectures match to ~5e-15.
 
-Next steps (not yet done): batch the forward+backward pass properly with
-`cuBLAS gemmStridedBatched` instead of one-thread-per-atom sequential math
-(these steps' version, matching Phase 2's kernels' style, proves
-correctness first); `calculateDFdc`/`calculateD2EdGdc` (the weight-Jacobian
-half of the ~30.8% NN backward cost, needed for the Kalman/gradient-descent
-updaters, not yet ported); and the force-assembly scatter-add consuming
-`AtomBatch::neighborDGdx,Dy,Dz` (~46.5%, the single biggest cost center).
+**Step 3 (done): `nn_backward_dfdc_test.cu`**, the weight-Jacobian pass,
+`calculateDFdc`/`calculateD2EdGdc` — the other half of the ~30.8% NN
+backward cost (`dEdG`, step 2, is the first half). This is what
+`Training::update()`'s Jacobian assembly actually feeds to the weight
+updater (Kalman filter / gradient descent both fit *forces*, so they need
+`dF/dc`, not just `dE/dc`).
+
+- `AtomBatch::connCountPerElement`/`dFdcBlockOffset`/`dFdc` +
+  `allocateWeightJacobianStorage()`/`dFdcIndex()` — a new, separate
+  per-element block store (can't reuse `gIndex()`/`sfCountPerElement`
+  since a network's connection count and its symmetry-function count are
+  different numbers).
+- `calculateDFdc(dFdc, dGdxyz)` computes `dFdc[c] = -sum_k (d²E/dc dG_k) *
+  dGdxyz[k]`, where `dGdxyz[k]` is `dG_k/dx` for some atom/coordinate —
+  `AtomBatch::dGdx`/`neighborDGdx` (Phase 1, step 4) would supply this in a
+  full integration; here it's synthetic, validating the NN math in
+  isolation first, same incremental approach as steps 1-2's synthetic `G`.
+- The kernel is a hand-specialized, unrolled port of
+  `calculateD2EdGdc()`/`calculateDEdb()`/`calculateDxdG()`'s exact
+  algorithm for this fixed architecture (2 hidden tanh(25) + linear
+  output(1)) — re-derived directly from `NeuralNetwork.cpp:444-719` rather
+  than translated as a generic per-layer loop, since porting the *exact*
+  CPU algorithm (not a from-scratch re-derivation of the same math) is this
+  project's established approach throughout.
+- **One real bug, caught and fixed by the CPU comparison, not by
+  inspection**: the first pass dropped a `dfdx2[j]` factor when computing
+  `dEdb_hidden2[j]` (`calculateDEdb`'s recursion multiplies by the
+  *destination* layer's own `dfdx`, easy to lose track of when hand-porting
+  nested index arithmetic) — every `dFdc` entry touching `W2`/`b1`/`W1` came
+  out wrong by an O(1) amount (max error ~12, obviously not roundoff) until
+  fixed. Worth remembering: this class of bug is exactly why every step in
+  this port validates against the real CPU class numerically rather than
+  trusting a hand derivation on its own.
+- Validated: 1,029,630 total `dFdc` values (H: 420 atoms × 1576
+  connections, O: 210 atoms × 1751 connections) against the real
+  `NeuralNetwork::calculateDFdc()`, to ~2.5e-14.
+
+Next steps (not yet done): batch the forward/backward/Jacobian passes
+properly with `cuBLAS gemmStridedBatched` instead of one-thread-per-atom
+sequential math (these steps' version, matching Phase 2's kernels' style,
+proves correctness first); and the force-assembly scatter-add consuming
+`AtomBatch::neighborDGdx,Dy,Dz` (~46.5%, the single biggest cost center,
+still untouched).

@@ -7,7 +7,7 @@
 #SBATCH --ntasks-per-node=1    # 1 task
 #SBATCH --gres=gpu:1           # 1 gpu
 #SBATCH --mem=8GB
-#SBATCH --job-name=nn-forward-test
+#SBATCH --job-name=nn-phase3-test
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err
 
@@ -31,5 +31,13 @@ nvcc -O3 -std=c++14 -arch=sm_80 -I"$N2P2_DEVEL/include" -I"$EIGEN" \
     -o nn_forward_test AtomBatch.o nn_forward_test.cu \
     "$N2P2_DEVEL/lib/libnnp.a"
 ./nn_forward_test "$N2P2_DEVEL/temp/H2O_2G/input.data"
+
+echo ""
+echo "=== Phase 3 step 3: calculateDFdc/calculateD2EdGdc on GPU ==="
+nvcc -O3 -std=c++14 -arch=sm_80 -I"$N2P2_DEVEL/include" -I"$EIGEN" \
+    -DEIGEN_DONT_PARALLELIZE \
+    -o nn_backward_dfdc_test AtomBatch.o nn_backward_dfdc_test.cu \
+    "$N2P2_DEVEL/lib/libnnp.a"
+./nn_backward_dfdc_test "$N2P2_DEVEL/temp/H2O_2G/input.data"
 
 echo "Done"

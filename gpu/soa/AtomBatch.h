@@ -126,6 +126,29 @@ struct AtomBatch
         return neighborSfOffset[s]
              + neighborSlot * sfCountPerElement[element[s]] + sfIndex;
     }
+
+    // --- NN weight-Jacobian output storage (Phase 3, calculateDFdc) -------
+    // Per-atom derivative of one force component with respect to every NN
+    // connection (weight+bias) of that atom's element's network --
+    // NeuralNetwork::calculateDFdc()'s output (consumed by
+    // Training::update()'s Jacobian assembly for the weight updater). Same
+    // block-per-element idea as G, but the per-element width is that
+    // element's numConnections (weights+biases), not its symmetry-function
+    // count, so it needs its own offset/count arrays rather than reusing
+    // gIndex()/sfCountPerElement.
+    std::vector<std::size_t> connCountPerElement; // size numElements
+    std::vector<std::size_t> dFdcBlockOffset;     // size numElements+1
+    std::vector<double>      dFdc;                // size dFdcBlockOffset[numElements]
+
+    // Flat index into #dFdc for sorted atom s's connIndex-th connection
+    // (weight or bias), in the same flat order as
+    // NeuralNetwork::getConnections()/setConnections().
+    std::size_t dFdcIndex(std::size_t s, std::size_t connIndex) const
+    {
+        std::size_t e = element[s];
+        std::size_t localRow = s - elementOffset[e];
+        return dFdcBlockOffset[e] + localRow * connCountPerElement[e] + connIndex;
+    }
 };
 
 // Build an AtomBatch from a Structure whose neighbor list has already been
@@ -142,3 +165,11 @@ AtomBatch buildAtomBatch(nnp::Structure const& structure, double rc);
 // buildAtomBatch() has already set elementOffset/neighborOffset/numElements.
 void allocateSfStorage(AtomBatch& batch,
                        std::vector<std::size_t> const& sfCountPerElement);
+
+// Size and zero-initialize an AtomBatch's #dFdc storage, one block per
+// element (atoms-of-that-element x connCountPerElement[e]). Independent of
+// allocateSfStorage() -- added when a kernel first needs it (Phase 3's
+// calculateDFdc), same "add storage when a kernel needs it" pattern as G/
+// dGdx/dEdG before it.
+void allocateWeightJacobianStorage(
+    AtomBatch& batch, std::vector<std::size_t> const& connCountPerElement);

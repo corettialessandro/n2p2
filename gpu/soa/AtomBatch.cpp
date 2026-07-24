@@ -114,3 +114,17 @@ void allocateSfStorage(AtomBatch& b, vector<size_t> const& sfCountPerElement)
     b.neighborDGdy.assign(b.neighborSfOffset[b.numAtoms], 0.0);
     b.neighborDGdz.assign(b.neighborSfOffset[b.numAtoms], 0.0);
 }
+
+void allocateWeightJacobianStorage(AtomBatch& b,
+                                   vector<size_t> const& connCountPerElement)
+{
+    b.connCountPerElement = connCountPerElement;
+    b.dFdcBlockOffset.assign(b.numElements + 1, 0);
+    for (size_t e = 0; e < b.numElements; ++e)
+    {
+        size_t atomsInElement = b.elementOffset[e + 1] - b.elementOffset[e];
+        b.dFdcBlockOffset[e + 1] = b.dFdcBlockOffset[e]
+                                 + atomsInElement * connCountPerElement[e];
+    }
+    b.dFdc.assign(b.dFdcBlockOffset[b.numElements], 0.0);
+}
