@@ -168,3 +168,52 @@ Next steps (not yet done): wire more symmetry-function types through this
 same grouped-kernel + `G`/`dGdx`/`neighborDGdx`-storage pattern, and/or start
 on the actual force-assembly scatter-add that consumes `neighborDGdx,Dy,Dz`
 (Phase 3).
+
+## `nn/`
+
+Phase 3 (`../GPU_PORTING_PLAN.md` §5) — NN forward/backward + force
+assembly, the phase Phase 0's profiling identified as the actual dominant
+cost (~78% of wall time: force assembly ~46.5%, NN backward/Jacobian
+~30.8%), unlike symmetry functions (~4%). Picked over further broadening
+`soa/`'s symmetry-function coverage because `AtomBatch`'s element-grouped
+`G` storage is exactly the layout this phase needs (weights are per-element,
+atoms are already sorted by element) — the Phase 1 groundwork was written
+with this phase in mind, not just for symmetry functions.
+
+**Step 1 (done): `nn_forward_test.cu`**, the NN forward pass on GPU, one
+thread per atom (same pattern as `smoke/`'s symmetry-function kernels),
+reading straight from `AtomBatch::G` and writing into `AtomBatch::energy`
+(new atom-level output slot, indexed directly by sorted atom position, no
+block layout needed since it's one scalar per atom unlike `G`). Mirrors
+`Mode::calculateAtomicNeuralNetworks()` (`src/libnnp/Mode.cpp:1666`): one
+shared set of weights per element, propagated independently per atom.
+
+- H2O_2G's real architecture from `temp/H2O_2G/input.nn`
+  (`global_hidden_layers_short 2`, `global_nodes_short 25 25`,
+  `global_activation_short t t l`): input (35 for H, 42 for O — real
+  `symfunction_short` counts in that file) → 25 (tanh) → 25 (tanh) → 1
+  (identity).
+- Ground truth is a **real** `nnp::NeuralNetwork` (linked from
+  `lib/libnnp.a`, not a reimplementation), same architecture, random
+  weights via its own `initializeConnectionsRandomUniform()`, propagated
+  the standard way (`setInput`/`propagate`/`getOutput`) — same "reuse real
+  n2p2 classes as the CPU reference" approach as `smoke/`'s
+  `dump_real_neighbors.cpp`. `G` values are synthetic (this step validates
+  the forward pass in isolation, decoupled from `soa/`'s symmetry-function
+  kernels); atom counts per element (420 H, 210 O) come from the real
+  H2O_2G structure via `AtomBatch`.
+- Weight layout matches `NeuralNetwork::getConnections()`'s documented
+  per-layer order exactly (`W[j*numCur+k]` = weight from previous-layer
+  neuron `j` to current-layer neuron `k`) — already the "X (atoms x
+  numPrev) times W (numPrev x numCur)" shape a later batched-GEMM version
+  would want.
+- Validated both element architectures (H: 420 atoms, O: 210 atoms) to
+  ~1e-15 against `NeuralNetwork::propagate()`.
+
+Next steps (not yet done): batch the forward pass properly with
+`cuBLAS gemmStridedBatched` instead of one-thread-per-atom sequential math
+(this step's version, matching Phase 2's kernels' style, proves correctness
+first); the NN backward pass (`calculateDEdG`/`calculateDFdc`/
+`calculateD2EdGdc`, ~30.8% of wall time); and the force-assembly
+scatter-add consuming `AtomBatch::neighborDGdx,Dy,Dz` (~46.5%, the single
+biggest cost center).

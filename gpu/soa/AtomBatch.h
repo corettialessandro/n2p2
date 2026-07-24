@@ -44,6 +44,11 @@ struct AtomBatch
     std::vector<std::size_t> originalToSorted; // size numAtoms (inverse perm)
     std::vector<std::size_t> element;          // size numAtoms
     std::vector<double>      x, y, z;          // size numAtoms
+    // Per-atom NN output (Atom::energy in Mode::calculateAtomicNeuralNetworks),
+    // one scalar per atom -- unlike G, this needs no per-element block layout
+    // since every atom has exactly one energy value, so it's indexed directly
+    // by sorted position s, same as x/y/z. Zero-initialized by buildAtomBatch().
+    std::vector<double>      energy;           // size numAtoms
 
     // Neighbor CSR, indexed by SORTED position s in [0, numAtoms).
     // Neighbor j of sorted atom s lives at flat index
