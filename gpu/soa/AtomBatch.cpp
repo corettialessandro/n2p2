@@ -28,6 +28,9 @@ AtomBatch buildAtomBatch(Structure const& structure, double rc)
     b.y.assign(b.numAtoms, 0.0);
     b.z.assign(b.numAtoms, 0.0);
     b.energy.assign(b.numAtoms, 0.0);
+    b.forceX.assign(b.numAtoms, 0.0);
+    b.forceY.assign(b.numAtoms, 0.0);
+    b.forceZ.assign(b.numAtoms, 0.0);
 
     // Running write cursor per element, seeded at that element's block start.
     vector<size_t> cursor(b.elementOffset.begin(), b.elementOffset.end() - 1);

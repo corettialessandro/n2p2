@@ -277,6 +277,66 @@ updater (Kalman filter / gradient descent both fit *forces*, so they need
 Next steps (not yet done): batch the forward/backward/Jacobian passes
 properly with `cuBLAS gemmStridedBatched` instead of one-thread-per-atom
 sequential math (these steps' version, matching Phase 2's kernels' style,
-proves correctness first); and the force-assembly scatter-add consuming
-`AtomBatch::neighborDGdx,Dy,Dz` (~46.5%, the single biggest cost center,
-still untouched).
+proves correctness first). Force assembly (the single biggest cost center)
+is covered next, in `force/`.
+
+## `force/`
+
+Force assembly — `Mode::calculateForces()`/`Atom::calculatePairForceShort()`,
+the single biggest cost center Phase 0's profiling identified (~46.5% of
+wall time), untouched until now. Combines Phase 3's `dEdG` (`nn/`) with
+Phase 1's per-neighbor derivative storage (`soa/AtomBatch.h` step 4:
+`dGdx,Dy,Dz` + `neighborDGdx,Dy,Dz`) into actual per-atom forces.
+
+**Done: `force_assembly_test.cu`**. The exact formula
+(`src/libnnp/Atom.cpp:372-402`, the `N2P2_FULL_SFD_MEMORY` branch — the one
+matching `AtomBatch`'s storage shape, one derivative entry per (neighbor
+slot, symmetry function), no per-element filter table needed):
+`F_self_i = -sum_k dEdG_i[k]*dGdr_i[k]`, and atom `j`'s contribution to
+neighbor `i`'s force is `-sum_k dEdG_j[k] * (j's neighbor-entry-for-i).dGdr[k]`.
+
+- `Mode::calculateForces()` computes this from atom `i`'s perspective: loop
+  over `i`'s unique neighbors `j`, then **re-scan** all of `j`'s neighbors
+  looking for `i` (an O(k²) search per atom, mitigated on CPU by a compact
+  per-element symmetry-function table this port doesn't use). `AtomBatch`'s
+  layout makes that re-scan unnecessary: `neighborDGdx,Dy,Dz` is already
+  addressed by (owner atom `j`, its neighbor slot, symmetry function), so
+  the natural GPU formulation is a **scatter**: one thread per atom `j`
+  adds its own self-force directly, then walks its *own* neighbor list
+  once, atomically adding each pair contribution straight onto that
+  neighbor's force accumulator (`atomicAdd` on `double`, native since
+  compute capability 6.0, no custom implementation needed on an A100).
+- `AtomBatch::forceX,Y,Z` — new atom-level output slot (same shape as
+  `energy`: one 3-vector per atom, no per-element block layout).
+- Ground truth is **not** the real `Atom::calculateSelfForceShort()`/
+  `calculatePairForceShort()` here (unlike `NeuralNetwork` in `nn/`): using
+  them would need either the compact per-element table (full
+  `Mode`/`Element`/`Settings` setup, far heavier than this project's other
+  smoke tests) or rebuilding `libnnp.a` with `-DN2P2_FULL_SFD_MEMORY`, which
+  silently changes `Atom`'s struct layout (`Atom.h` conditionally adds a
+  member under that macro) relative to the rest of the already-built
+  library — an ABI mismatch across translation units, not a safe option
+  for a validation test. Instead this validates the scatter-add
+  **algorithm** independently: an explicit, differently-ordered "gather" CPU
+  reference (for each target atom `i`, self term plus a scan over every
+  *other* atom `j`'s neighbor slots looking for `i`) computes the same sums
+  via a genuinely different traversal than the GPU's scatter, so an
+  addressing bug in either one would very likely disagree with the other.
+- `dEdG`/`dGdx,Dy,Dz`/`neighborDGdx,Dy,Dz` values are synthetic random
+  numbers on the real H2O_2G `AtomBatch` — this step validates the assembly
+  formula/addressing in isolation, same incremental philosophy as every
+  step before it. Real values are *not* expected to sum to zero net force
+  here (that Newton's-third-law property depends on the `dGdr`/`-dGdr` sign
+  relationship real `SymFnc` code enforces, which synthetic data doesn't
+  reproduce) — only GPU-vs-CPU agreement is checked.
+- Validated on the first run: 630 atoms, 66868 neighbor entries, GPU vs.
+  independent CPU gather to ~2.4e-13.
+
+Next steps (not yet done): wire real `dEdG`/`dGdx`/`neighborDGdx` values
+through (from `nn/` and `soa/`'s symmetry-function kernels) instead of
+synthetic ones, for an actual end-to-end energy+force pipeline on one
+structure; determinism (`atomicAdd` on doubles is not run-to-run
+bit-reproducible — the plan flags this explicitly, an alternative would be
+a neighbor-major segmented reduction); and, more broadly, Phase 4 (Kalman
+filter weight updater) or Phase 6 (build system integration, without which
+none of this is reachable from the real `nnp-train` binary).

@@ -49,6 +49,10 @@ struct AtomBatch
     // since every atom has exactly one energy value, so it's indexed directly
     // by sorted position s, same as x/y/z. Zero-initialized by buildAtomBatch().
     std::vector<double>      energy;           // size numAtoms
+    // Per-atom force (Atom::f in Mode::calculateForces()), same "one scalar
+    // [here: one 3-vector] per atom, no per-element block layout" shape as
+    // #energy. Zero-initialized by buildAtomBatch().
+    std::vector<double>      forceX, forceY, forceZ; // size numAtoms
 
     // Neighbor CSR, indexed by SORTED position s in [0, numAtoms).
     // Neighbor j of sorted atom s lives at flat index
