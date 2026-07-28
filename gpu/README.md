@@ -296,11 +296,9 @@ updater (Kalman filter / gradient descent both fit *forces*, so they need
   connections, O: 210 atoms × 1751 connections) against the real
   `NeuralNetwork::calculateDFdc()`, to ~2.5e-14.
 
-Next steps (not yet done): batch the forward/backward/Jacobian passes
-properly with `cuBLAS gemmStridedBatched` instead of one-thread-per-atom
-sequential math (these steps' version, matching Phase 2's kernels' style,
-proves correctness first). Force assembly (the single biggest cost center)
-is covered next, in `force/`.
+Batching the forward/dEdG pass with cuBLAS is now done — see `gemm/` below.
+Force assembly (the single biggest cost center) is covered next, in
+`force/`.
 
 ## `force/`
 
@@ -571,9 +569,59 @@ Wiring this into `e2e/` with a real per-structure Jacobian (not synthetic
 `H`/`xi`) is now done — see `e2e/`'s Stage 5 (energy) and Stage 6 (force,
 `calculateDFdc`'s output instead of `calculateDEdc`'s) below.
 
-Next steps (not yet done): batched-GEMM kernels instead of
-one-thread-per-atom for Phase 3's NN forward/backward and this phase's
-`updateP`; and Phase 6 (build system
-integration — a `makefile.cuda`/`N2P2_GPU` flag actually linking this code
-into `nnp-train`, without which none of it is reachable from the real
-training binary, whatever else gets validated standalone).
+The NN forward/`dEdG` batching mentioned below (`gemm/`) is done; `updateP`
+and `calculateDFdc`/`calculateDEdc` are not (see `gemm/`'s own "next steps").
+
+Next steps (not yet done): Phase 6 (build system integration — a
+`makefile.cuda`/`N2P2_GPU` flag actually linking this code into
+`nnp-train`, without which none of it is reachable from the real training
+binary, whatever else gets validated standalone).
+
+## `gemm/`
+
+Performance work: replaces Phase 3's one-thread-per-atom NN forward+`dEdG`
+kernel (`nn/nn_forward_test.cu`) with cuBLAS GEMMs batched across every atom
+of one element at once — the "many tiny per-atom MLPs → a handful of
+per-element batched evaluations" opportunity `GPU_PORTING_PLAN.md`'s Phase 3
+section names, not yet exploited by any prior step (every kernel so far has
+been one CUDA thread doing one atom's tiny sequential MLP, correctness-first
+by design).
+
+**Done: `nn_forward_gemm_test.cu`.** Since every atom of one element shares
+the same weights, this isn't "batched GEMM" in the cuBLAS
+`gemmStridedBatched` sense (many independent small matrix pairs) — it's a
+single ordinary GEMM per layer per element, with only the data (`G`)
+operand varying row-by-row:
+
+- Forward: `G (numAtoms×numIn) . W1 (numIn×25) → H1pre`, bias+`tanh`
+  (elementwise) → `H1 . W2 (25×25) → H2pre`, bias+`tanh` → `H2 . W3 (25×1)`
+  + bias → energy.
+- `dEdG` (the per-input forward-sensitivity sweep) re-expressed as two more
+  GEMMs plus cheap elementwise ops: `v2 = dfdx2 .* W3` (broadcast) →
+  `v1 = v2 . W2ᵀ` → `v1s = dfdx1 .* v1` → `dEdG = v1s . W1ᵀ`. `W1ᵀ`/`W2ᵀ`
+  are precomputed once on the host (tiny matrices, ≤42×25) so every cuBLAS
+  call stays a plain `CUBLAS_OP_N` via the standard row-major-via-
+  column-major trick (`gemmRowMajor()`), rather than mixing that trick with
+  cuBLAS transpose flags — a well-known source of sign/axis mistakes best
+  avoided by construction rather than by careful bookkeeping.
+- Validated three ways: the GEMM path, the already-validated one-thread-
+  per-atom kernel (copied verbatim from `nn/nn_forward_test.cu`), and the
+  real `nnp::NeuralNetwork` class — all agreeing to ~6e-15 on energy and
+  `dEdG`, for both elements.
+- **Timed, not just validated** (`cudaEvent`-based, 500 repeated launches
+  for a steady-state average): **25.6× for H (420 atoms), 27.9× for O (210
+  atoms)** — a real measured win even at this project's modest real batch
+  sizes, better than expected going in (small batches can leave GEMM/cuBLAS
+  call overhead dominant; it didn't here).
+
+Next steps (not yet done): `calculateDFdc`/`calculateDEdc` (the weight-
+Jacobian passes feeding the Kalman filter) are NOT batched this way yet —
+unlike the forward/`dEdG` pass, each atom's Jacobian involves genuinely
+atom-specific outer products (activations × backward sensitivities), not a
+shared-weight-times-shared-batch GEMM, so batching that would need real
+`cuBLAS gemmStridedBatched` (independent small matrix pairs per atom) rather
+than the single-shared-GEMM trick used here — a harder, separate problem.
+Kalman's `updateP` (`O(N²·m)` per call, the dominant cost there) is also
+still the naive one-thread-per-element kernel from `kalman/`.
+
+## `kalman/`
