@@ -421,6 +421,50 @@ first (`soa/symfnc_expangn_group_test.cu`), then wired in here.
   35/42-wide count), all matching the independent CPU reference to ~5e-15
   (energy, forces, and `G` all individually checked).
 
+**Done: Stage 5**, wiring `kalman/`'s Kalman filter into this pipeline with a
+**real** per-structure energy Jacobian in place of `kalman_test.cu`'s
+synthetic `H`/`xi` — closing the loop from "symmetry functions → NN →
+forces" all the way to "→ weight update". This is a genuine energy update,
+the dominant update type in this project's config (`short_energy_fraction
+1.0` vs. `short_force_fraction 0.0041`) — exactly what `Training::update`
+does for the `"energy"` property once per structure.
+
+- **The missing piece was `NeuralNetwork::calculateDEdc()`**
+  (`src/libnnp/NeuralNetwork.cpp:444`) — the derivative of the atomic energy
+  output w.r.t. every connection (weight+bias), *not* `calculateDFdc` (the
+  force-Jacobian already ported in `../nn/nn_backward_dfdc_test.cu`, which
+  isn't what an energy-fit update needs). Re-derived by hand and confirmed
+  against the real source to reduce to exactly the standard backprop deltas
+  `calculateDFdc` already computes as intermediates (`dEdbHidden2`,
+  `dEdbHidden1`): `dE/db3=1`, `dE/dW3[j]=h2[j]`, `dE/db2[j]=W3[j]·dfdx2[j]`,
+  `dE/dW2[i][j]=dEdbHidden2[j]·h1[i]`, `dE/db1[i]=dfdx1[i]·Σ_j
+  W2[i][j]·dEdbHidden2[j]`, `dE/dW1[jin][i]=dEdbHidden1[i]·G[jin]` — same
+  `[W1,b1,W2,b2,W3,b3]` flat order as `calculateDFdc`/`getConnections()`.
+- **Structure-level Jacobian = per-atom `dEdc` summed over that element's
+  atoms**, since every atom of an element shares that element's weights —
+  the same reasoning as the total energy itself being a per-atom sum. The
+  combined `N=3327` state vector is built from the network's *actual current*
+  weights (`connH`/`connO`, already in hand from earlier stages), not zero
+  like `kalman_test.cu`'s proof-of-concept — a real update moves existing
+  weights, it doesn't start a delta from scratch. Observation is `m=1`: this
+  structure's energy residual (`structure.energyRef` — parsed by the real
+  `Structure` class from `input.data` — minus the already-computed total
+  energy).
+- **The Kalman recursion kernels are copied verbatim from `kalman/
+  kalman_test.cu`** (already validated there at this exact `N=3327` size);
+  only the Jacobian/observation feeding them is new. Validated the same way:
+  GPU vs. an independent CPU implementation vs. the real `nnp::KalmanFilter`
+  class (same debug-info-stripping link workaround as `kalman/`, added to
+  this directory's `run.slurm` too).
+- Validated: `max|dEdc_gpu-dEdc_cpu| = 2.3E-13` (3327 combined connections),
+  `max|w_gpu-w_cpu| = 1.1E-16`, `max|w_gpu-w_real| = 2.2E-16`. Applying the
+  updated weights and re-running the forward pass moves the total energy
+  from `1702.3` to `487.1` for this random, untrained network — reported
+  informationally only, since a single Kalman step from random initial
+  weights/`P`/`eta` isn't expected to land anywhere near the real reference
+  energy (`-4.15`), and "did the loss get better" was deliberately not used
+  as a pass/fail criterion (unlike the bit-exact comparisons above).
+
 ## `kalman/`
 
 Phase 4 — the weight-update algorithm (`src/libnnptrain/KalmanFilter.cpp`),
@@ -485,11 +529,15 @@ getting this backwards would silently use the wrong step's value).
   `max|w_gpu-w_cpu| = 9.5E-18`, `max|w_gpu-w_real| = 3.3E-17` (production
   size, 5 sequential updates).
 
-Next steps (not yet done): wiring this Kalman update into the `e2e/`
-pipeline so a single structure's real Jacobian (not synthetic `H`/`xi`)
-drives a real weight update end-to-end; batched-GEMM kernels instead of
-one-thread-per-atom for Phase 3's NN forward/backward and this phase's
-`updateP`; and Phase 6 (build system integration — a `makefile.cuda`/
-`N2P2_GPU` flag actually linking this code into `nnp-train`, without which
-none of it is reachable from the real training binary, whatever else gets
-validated standalone).
+Wiring this into `e2e/` with a real per-structure Jacobian (not synthetic
+`H`/`xi`) is now done — see `e2e/`'s Stage 5 below.
+
+Next steps (not yet done): a force-fit Kalman update (this project's config
+also does force updates, just far less often — `short_force_fraction
+0.0041` — and force-fit uses `calculateDFdc`'s output as its Jacobian
+instead of `calculateDEdc`'s, a straightforward extension of the same
+wiring); batched-GEMM kernels instead of one-thread-per-atom for Phase 3's
+NN forward/backward and this phase's `updateP`; and Phase 6 (build system
+integration — a `makefile.cuda`/`N2P2_GPU` flag actually linking this code
+into `nnp-train`, without which none of it is reachable from the real
+training binary, whatever else gets validated standalone).

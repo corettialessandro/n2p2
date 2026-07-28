@@ -34,11 +34,19 @@
 // SymFnc{ExpRad,ExpAngn}::calculate(). Force assembly's CPU side reuses
 // the same independent "gather" traversal ../force/force_assembly_test.cu
 // introduced.
+//
+// Stage 5 (new): wires ../kalman/'s Kalman filter into this pipeline with a
+// REAL per-structure energy Jacobian instead of synthetic H/xi -- closing
+// the loop from "symmetry functions -> NN -> forces" to "-> weight update".
+// See the Stage 5 kernels' own header comment further down for the
+// NeuralNetwork::calculateDEdc() derivation this needed that didn't exist
+// in this port before now.
 
 #include "../soa/AtomBatch.h"
 #include "ElementMap.h"
 #include "Structure.h"
 #include "NeuralNetwork.h"
+#include "KalmanFilter.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -436,6 +444,343 @@ __global__ void forceAssemblyKernel(
         atomicAdd(&forceX[i], px);
         atomicAdd(&forceY[i], py);
         atomicAdd(&forceZ[i], pz);
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////
+// Stage 5: wiring Phase 4's Kalman filter into this pipeline with a REAL
+// per-structure Jacobian, closing the loop from "symmetry functions -> NN ->
+// forces" to "-> weight update". This is a genuine ENERGY update (the
+// dominant update type in temp/H2O_2G/input.nn: short_energy_fraction 1.0
+// vs. short_force_fraction 0.0041), i.e. exactly what
+// Training::update("energy") does once per structure.
+//
+// The piece this needed that didn't exist yet: NeuralNetwork::calculateDEdc()
+// (src/libnnp/NeuralNetwork.cpp:444), the derivative of the atomic energy
+// output w.r.t. every connection (weight+bias) -- NOT calculateDFdc (that's
+// the force-Jacobian, already ported in ../nn/nn_backward_dfdc_test.cu, not
+// needed for an energy update). Re-derived by hand from the real source and
+// confirmed to reduce to exactly the standard backprop deltas
+// (dEdbHidden2/dEdbHidden1) calculateDFdc already computes as intermediates:
+//   dE/db3        = 1                                (identity output, dfdx=1)
+//   dE/dW3[j]     = h2[j]
+//   dE/db2[j]     = W3[j]*dfdx2[j]                    (== dEdbHidden2[j])
+//   dE/dW2[i][j]  = dEdbHidden2[j] * h1[i]
+//   dE/db1[i]     = dfdx1[i] * sum_j W2[i][j]*dEdbHidden2[j]   (== dEdbHidden1[i])
+//   dE/dW1[jin][i]= dEdbHidden1[i] * G[jin]
+// Same [W1,b1,W2,b2,W3,b3] flat connection order as calculateDFdc/
+// getConnections(). Since all atoms of one element share that element's
+// weights, the STRUCTURE's total energy Jacobian is the per-atom dEdc
+// values summed over that element's atoms -- exactly mirroring how the total
+// energy itself is a per-atom sum.
+//
+// State vector for the Kalman update is the COMBINED H+O weight vector
+// (update_strategy 0 = US_COMBINED, same as ../kalman/kalman_test.cu), built
+// from the REAL current connH/connO weight arrays (not zero, unlike
+// kalman_test.cu's proof-of-concept state) since a real update moves
+// EXISTING weights, not a from-scratch delta. Observation is m=1: this one
+// structure's energy residual (structure.energyRef - the already-computed
+// total energy). The recursion kernels themselves are copied verbatim from
+// ../kalman/kalman_test.cu (already validated there against both an
+// independent CPU reference and the real nnp::KalmanFilter class at this
+// exact N=3327 production size); only the Jacobian/observation feeding them
+// is new here.
+///////////////////////////////////////////////////////////////////////////
+
+__host__ __device__ inline void nnCalculateDEdc(
+    const double* G, int numIn,
+    const double* W1, const double* b1, int numHidden1,
+    const double* W2, const double* b2, int numHidden2,
+    const double* W3, const double* b3, int numOut, // numOut == 1
+    double* dEdc)
+{
+    double h1[64], dfdx1[64];
+    for (int k = 0; k < numHidden1; ++k)
+    {
+        double s = b1[k];
+        for (int j = 0; j < numIn; ++j) s += W1[j * numHidden1 + k] * G[j];
+        h1[k] = tanh(s);
+        dfdx1[k] = 1.0 - h1[k] * h1[k];
+    }
+    double h2[64], dfdx2[64];
+    for (int k = 0; k < numHidden2; ++k)
+    {
+        double s = b2[k];
+        for (int j = 0; j < numHidden1; ++j) s += W2[j * numHidden2 + k] * h1[j];
+        h2[k] = tanh(s);
+        dfdx2[k] = 1.0 - h2[k] * h2[k];
+    }
+
+    size_t const offW1 = 0;
+    size_t const offB1 = offW1 + (size_t)numIn * numHidden1;
+    size_t const offW2 = offB1 + numHidden1;
+    size_t const offB2 = offW2 + (size_t)numHidden1 * numHidden2;
+    size_t const offW3 = offB2 + numHidden2;
+    size_t const offB3 = offW3 + (size_t)numHidden2 * numOut;
+
+    dEdc[offB3] = 1.0; // output layer is identity, dfdx == 1
+
+    double dEdbHidden2[64];
+    for (int j = 0; j < numHidden2; ++j)
+    {
+        dEdc[offW3 + j] = h2[j];
+        dEdbHidden2[j] = W3[j] * dfdx2[j];
+        dEdc[offB2 + j] = dEdbHidden2[j];
+    }
+
+    double dEdbHidden1[64];
+    for (int i = 0; i < numHidden1; ++i)
+    {
+        double s = 0.0;
+        for (int j = 0; j < numHidden2; ++j)
+        {
+            s += W2[i * numHidden2 + j] * dEdbHidden2[j];
+            dEdc[offW2 + (size_t)i * numHidden2 + j] = dEdbHidden2[j] * h1[i];
+        }
+        dEdbHidden1[i] = dfdx1[i] * s;
+        dEdc[offB1 + i] = dEdbHidden1[i];
+    }
+
+    for (int jin = 0; jin < numIn; ++jin)
+        for (int i = 0; i < numHidden1; ++i)
+            dEdc[offW1 + (size_t)jin * numHidden1 + i] = dEdbHidden1[i] * G[jin];
+}
+
+__global__ void nnDEdcKernel(
+    int begin, int numSelected, int numIn,
+    const double* W1, const double* b1, int numHidden1,
+    const double* W2, const double* b2, int numHidden2,
+    const double* W3, const double* b3, int numOut,
+    const double* G, size_t gBlockOffsetE, size_t sfCountE,
+    double* dEdc, size_t dEdcBlockOffsetE, size_t connCountE)
+{
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= numSelected) return;
+    size_t gBase = gBlockOffsetE + (size_t)t * sfCountE;
+    size_t dEdcBase = dEdcBlockOffsetE + (size_t)t * connCountE;
+    nnCalculateDEdc(&G[gBase], numIn, W1, b1, numHidden1, W2, b2, numHidden2,
+                     W3, b3, numOut, &dEdc[dEdcBase]);
+}
+
+// --- Kalman recursion kernels, copied verbatim from ../kalman/kalman_test.cu
+// (KalmanFilter::update(), KT_STANDARD -- see that file's header comment for
+// the full derivation/citation). P row-major N x N; H, X, K column-major
+// N x m; A, Ainv column-major m x m.
+
+__global__ void kalmanComputeX(const double* P, const double* H,
+                                double* X, int N, int m)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int col = blockIdx.y;
+    if (row < N && col < m)
+    {
+        double sum = 0.0;
+        for (int k = 0; k < N; ++k) sum += P[row * N + k] * H[k + col * N];
+        X[row + col * N] = sum;
+    }
+}
+
+__global__ void kalmanComputeA(const double* H, const double* X,
+                                double* A, int N, int m)
+{
+    int i = threadIdx.x;
+    int j = threadIdx.y;
+    if (i < m && j < m)
+    {
+        double sum = 0.0;
+        for (int k = 0; k < N; ++k) sum += H[k + i * N] * X[k + j * N];
+        A[i + j * m] = sum;
+    }
+}
+
+__global__ void kalmanAddDiag(double* A, int m, double value)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < m) A[i + i * m] += value;
+}
+
+__global__ void kalmanInvertGaussJordan(const double* A, double* Ainv,
+                                         double* augmented, int m)
+{
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+
+    int w = 2 * m;
+    for (int i = 0; i < m; ++i)
+    {
+        for (int j = 0; j < m; ++j) augmented[i * w + j] = A[i + j * m];
+        for (int j = 0; j < m; ++j)
+            augmented[i * w + m + j] = (i == j) ? 1.0 : 0.0;
+    }
+
+    for (int col = 0; col < m; ++col)
+    {
+        int pivotRow = col;
+        double best = fabs(augmented[col * w + col]);
+        for (int r = col + 1; r < m; ++r)
+        {
+            double v = fabs(augmented[r * w + col]);
+            if (v > best) { best = v; pivotRow = r; }
+        }
+        if (pivotRow != col)
+        {
+            for (int j = 0; j < w; ++j)
+            {
+                double tmp = augmented[col * w + j];
+                augmented[col * w + j] = augmented[pivotRow * w + j];
+                augmented[pivotRow * w + j] = tmp;
+            }
+        }
+
+        double piv = augmented[col * w + col];
+        for (int j = 0; j < w; ++j) augmented[col * w + j] /= piv;
+
+        for (int r = 0; r < m; ++r)
+        {
+            if (r == col) continue;
+            double factor = augmented[r * w + col];
+            if (factor == 0.0) continue;
+            for (int j = 0; j < w; ++j)
+                augmented[r * w + j] -= factor * augmented[col * w + j];
+        }
+    }
+
+    for (int i = 0; i < m; ++i)
+        for (int j = 0; j < m; ++j)
+            Ainv[i + j * m] = augmented[i * w + m + j];
+}
+
+__global__ void kalmanComputeK(const double* X, const double* Ainv,
+                                double* K, int N, int m)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int col = blockIdx.y;
+    if (row < N && col < m)
+    {
+        double sum = 0.0;
+        for (int k = 0; k < m; ++k) sum += X[row + k * N] * Ainv[k + col * m];
+        K[row + col * N] = sum;
+    }
+}
+
+__global__ void kalmanUpdateP(double* P, const double* K, const double* X,
+                               int N, int m, double q)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i < N && j < N)
+    {
+        double sum = 0.0;
+        for (int k = 0; k < m; ++k) sum += K[i + k * N] * X[j + k * N];
+        double val = P[i * N + j] - sum;
+        if (i == j) val += q;
+        P[i * N + j] = val;
+    }
+}
+
+__global__ void kalmanUpdateW(double* w, const double* K, const double* xi,
+                               int N, int m)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N)
+    {
+        double sum = 0.0;
+        for (int k = 0; k < m; ++k) sum += K[i + k * N] * xi[k];
+        w[i] += sum;
+    }
+}
+
+// --- Independent CPU reference for the Kalman recursion, also copied from
+// ../kalman/kalman_test.cu (own hand-rolled Gauss-Jordan, separate code from
+// the GPU kernel's).
+
+static void cpuGaussJordanInvert(const vector<double>& A, vector<double>& Ainv,
+                                  int m)
+{
+    vector<double> aug(m * 2 * m);
+    int w = 2 * m;
+    for (int i = 0; i < m; ++i)
+    {
+        for (int j = 0; j < m; ++j) aug[i * w + j] = A[i + j * m];
+        for (int j = 0; j < m; ++j) aug[i * w + m + j] = (i == j) ? 1.0 : 0.0;
+    }
+    for (int col = 0; col < m; ++col)
+    {
+        int pivotRow = col;
+        double best = fabs(aug[col * w + col]);
+        for (int r = col + 1; r < m; ++r)
+        {
+            double v = fabs(aug[r * w + col]);
+            if (v > best) { best = v; pivotRow = r; }
+        }
+        if (pivotRow != col)
+            for (int j = 0; j < w; ++j)
+                swap(aug[col * w + j], aug[pivotRow * w + j]);
+
+        double piv = aug[col * w + col];
+        for (int j = 0; j < w; ++j) aug[col * w + j] /= piv;
+
+        for (int r = 0; r < m; ++r)
+        {
+            if (r == col) continue;
+            double factor = aug[r * w + col];
+            if (factor == 0.0) continue;
+            for (int j = 0; j < w; ++j) aug[r * w + j] -= factor * aug[col * w + j];
+        }
+    }
+    Ainv.assign(m * m, 0.0);
+    for (int i = 0; i < m; ++i)
+        for (int j = 0; j < m; ++j)
+            Ainv[i + j * m] = aug[i * w + m + j];
+}
+
+static void cpuKalmanUpdate(vector<double>& P, vector<double>& w,
+                             const vector<double>& H, const vector<double>& xi,
+                             int N, int m, double eta, double q)
+{
+    vector<double> X(N * m, 0.0), A(m * m, 0.0), Ainv, K(N * m, 0.0);
+
+    for (int col = 0; col < m; ++col)
+        for (int row = 0; row < N; ++row)
+        {
+            double sum = 0.0;
+            for (int k = 0; k < N; ++k) sum += P[row * N + k] * H[k + col * N];
+            X[row + col * N] = sum;
+        }
+
+    for (int i = 0; i < m; ++i)
+        for (int j = 0; j < m; ++j)
+        {
+            double sum = 0.0;
+            for (int k = 0; k < N; ++k) sum += H[k + i * N] * X[k + j * N];
+            A[i + j * m] = sum;
+        }
+    for (int i = 0; i < m; ++i) A[i + i * m] += 1.0 / eta;
+
+    cpuGaussJordanInvert(A, Ainv, m);
+
+    for (int col = 0; col < m; ++col)
+        for (int row = 0; row < N; ++row)
+        {
+            double sum = 0.0;
+            for (int k = 0; k < m; ++k) sum += X[row + k * N] * Ainv[k + col * m];
+            K[row + col * N] = sum;
+        }
+
+    for (int i = 0; i < N; ++i)
+        for (int j = 0; j < N; ++j)
+        {
+            double sum = 0.0;
+            for (int k = 0; k < m; ++k) sum += K[i + k * N] * X[j + k * N];
+            double val = P[i * N + j] - sum;
+            if (i == j) val += q;
+            P[i * N + j] = val;
+        }
+
+    for (int i = 0; i < N; ++i)
+    {
+        double sum = 0.0;
+        for (int k = 0; k < m; ++k) sum += K[i + k * N] * xi[k];
+        w[i] += sum;
     }
 }
 
@@ -860,6 +1205,12 @@ int main(int argc, char** argv)
     runAngCpu(beginO, endO, angO, numRadO);
 
     vector<double> energyCpu(numAtoms), dEdGCpu(batch.G.size(), 0.0);
+    // Stage 5's real energy-weight Jacobian, accumulated per element while
+    // we're already looping over atoms with a fresh propagate() (calculateDEdc
+    // reads the same layer activations calculateDEdG does -- neither mutates
+    // them, so calling both after one propagate() is safe).
+    vector<double> jacHCpu(connH.size(), 0.0), jacOCpu(connO.size(), 0.0);
+    vector<double> dEdcAtomBuf;
     for (int t = 0; t < numSelH; ++t)
     {
         int s = beginH + t;
@@ -867,6 +1218,9 @@ int main(int argc, char** argv)
         nnH.propagate();
         nnH.calculateDEdG(&dEdGCpu[batch.gIndex(s, 0)]);
         nnH.getOutput(&energyCpu[s]);
+        dEdcAtomBuf.assign(connH.size(), 0.0);
+        nnH.calculateDEdc(dEdcAtomBuf.data());
+        for (size_t c = 0; c < connH.size(); ++c) jacHCpu[c] += dEdcAtomBuf[c];
     }
     for (int t = 0; t < numSelO; ++t)
     {
@@ -875,6 +1229,9 @@ int main(int argc, char** argv)
         nnO.propagate();
         nnO.calculateDEdG(&dEdGCpu[batch.gIndex(s, 0)]);
         nnO.getOutput(&energyCpu[s]);
+        dEdcAtomBuf.assign(connO.size(), 0.0);
+        nnO.calculateDEdc(dEdcAtomBuf.data());
+        for (size_t c = 0; c < connO.size(); ++c) jacOCpu[c] += dEdcAtomBuf[c];
     }
 
     // Force assembly, CPU "gather" (independent traversal order from the
@@ -938,5 +1295,209 @@ int main(int argc, char** argv)
 
     bool pass = (maxAbsErrG < 1e-9) && (maxAbsErrE < 1e-9) && (maxAbsErrF < 1e-9);
     printf("%s\n", pass ? "PASS" : "FAIL");
-    return pass ? 0 : 1;
+
+    ///////////////////////////////////////////////////////////////////////
+    // Stage 5: real per-structure Kalman ENERGY update (see the kernels'
+    // header comment above for the full derivation).
+    ///////////////////////////////////////////////////////////////////////
+    size_t connCountH = connH.size(), connCountO = connO.size();
+    allocateWeightJacobianStorage(batch, {connCountH, connCountO});
+
+    double* d_dEdc;
+    CUDA_CHECK(cudaMalloc(&d_dEdc, batch.dFdc.size() * sizeof(double)));
+
+    nnDEdcKernel<<<(numSelH + blockSize - 1) / blockSize, blockSize>>>(
+        beginH, numSelH, numH, d_W1H, d_b1H, numHidden1, d_W2H, d_b2H, numHidden2,
+        d_W3H, d_b3H, numOut, d_G, batch.gBlockOffset[H], batch.sfCountPerElement[H],
+        d_dEdc, batch.dFdcBlockOffset[H], batch.connCountPerElement[H]);
+    CUDA_CHECK(cudaGetLastError());
+    nnDEdcKernel<<<(numSelO + blockSize - 1) / blockSize, blockSize>>>(
+        beginO, numSelO, numO, d_W1O, d_b1O, numHidden1, d_W2O, d_b2O, numHidden2,
+        d_W3O, d_b3O, numOut, d_G, batch.gBlockOffset[O], batch.sfCountPerElement[O],
+        d_dEdc, batch.dFdcBlockOffset[O], batch.connCountPerElement[O]);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    CUDA_CHECK(cudaMemcpy(batch.dFdc.data(), d_dEdc, batch.dFdc.size() * sizeof(double), cudaMemcpyDeviceToHost));
+    cudaFree(d_dEdc);
+
+    // Total structure energy Jacobian = per-atom dEdc summed over that
+    // element's atoms (every atom of an element shares that element's
+    // weights, same reasoning as the total energy itself being a per-atom sum).
+    vector<double> jacH(connCountH, 0.0), jacO(connCountO, 0.0);
+    for (int t = 0; t < numSelH; ++t)
+    {
+        size_t s = beginH + t;
+        for (size_t c = 0; c < connCountH; ++c) jacH[c] += batch.dFdc[batch.dFdcIndex(s, c)];
+    }
+    for (int t = 0; t < numSelO; ++t)
+    {
+        size_t s = beginO + t;
+        for (size_t c = 0; c < connCountO; ++c) jacO[c] += batch.dFdc[batch.dFdcIndex(s, c)];
+    }
+
+    double maxAbsErrJac = 0.0;
+    for (size_t c = 0; c < connCountH; ++c) maxAbsErrJac = max(maxAbsErrJac, fabs(jacH[c] - jacHCpu[c]));
+    for (size_t c = 0; c < connCountO; ++c) maxAbsErrJac = max(maxAbsErrJac, fabs(jacO[c] - jacOCpu[c]));
+
+    int N = (int)(connCountH + connCountO), m = 1;
+    vector<double> Hcol(N), w0(N);
+    for (size_t c = 0; c < connCountH; ++c) { Hcol[c] = jacH[c]; w0[c] = connH[c]; }
+    for (size_t c = 0; c < connCountO; ++c) { Hcol[connCountH + c] = jacO[c]; w0[connCountH + c] = connO[c]; }
+
+    double energyRef = structure.energyRef;
+    vector<double> xi(1, energyRef - sumEnergyGpu);
+
+    // Production KalmanFilter parameters (temp/H2O_2G/input.nn:79-86,
+    // kalman_type 0 = KT_STANDARD), same as ../kalman/kalman_test.cu.
+    double const epsilon = 1.0e-2, q0 = 0.01, qtau = 2.302, qmin = 1.0e-6;
+    double const eta0 = 0.01, etatau = 2.302, etamax = 1.0;
+    double eta = eta0, q = q0;
+    if (eta < etamax) eta *= exp(etatau); // first-call schedule, see kalman_test.cu
+
+    vector<double> P0(N * N, 0.0);
+    for (int i = 0; i < N; ++i) P0[i * N + i] = 1.0 / epsilon;
+
+    // --- GPU Kalman update ---------------------------------------------------
+    double *d_P, *d_Hk, *d_xi, *d_X, *d_A, *d_Ainv, *d_Aug, *d_K, *d_w;
+    CUDA_CHECK(cudaMalloc(&d_P, sizeof(double) * N * N));
+    CUDA_CHECK(cudaMalloc(&d_Hk, sizeof(double) * N * m));
+    CUDA_CHECK(cudaMalloc(&d_xi, sizeof(double) * m));
+    CUDA_CHECK(cudaMalloc(&d_X, sizeof(double) * N * m));
+    CUDA_CHECK(cudaMalloc(&d_A, sizeof(double) * m * m));
+    CUDA_CHECK(cudaMalloc(&d_Ainv, sizeof(double) * m * m));
+    CUDA_CHECK(cudaMalloc(&d_Aug, sizeof(double) * m * 2 * m));
+    CUDA_CHECK(cudaMalloc(&d_K, sizeof(double) * N * m));
+    CUDA_CHECK(cudaMalloc(&d_w, sizeof(double) * N));
+    CUDA_CHECK(cudaMemcpy(d_P, P0.data(), sizeof(double) * N * N, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_Hk, Hcol.data(), sizeof(double) * N * m, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_xi, xi.data(), sizeof(double) * m, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_w, w0.data(), sizeof(double) * N, cudaMemcpyHostToDevice));
+
+    dim3 kBlockX(256), kGridX((N + 255) / 256, m);
+    dim3 kBlockA(m, m);
+    dim3 kBlockP(16, 16), kGridP((N + 15) / 16, (N + 15) / 16);
+    dim3 kBlockW(256), kGridW((N + 255) / 256);
+
+    kalmanComputeX<<<kGridX, kBlockX>>>(d_P, d_Hk, d_X, N, m);
+    kalmanComputeA<<<1, kBlockA>>>(d_Hk, d_X, d_A, N, m);
+    kalmanAddDiag<<<(m + 31) / 32, 32>>>(d_A, m, 1.0 / eta);
+    kalmanInvertGaussJordan<<<1, 1>>>(d_A, d_Ainv, d_Aug, m);
+    kalmanComputeK<<<kGridX, kBlockX>>>(d_X, d_Ainv, d_K, N, m);
+    kalmanUpdateP<<<kGridP, kBlockP>>>(d_P, d_K, d_X, N, m, q);
+    kalmanUpdateW<<<kGridW, kBlockW>>>(d_w, d_K, d_xi, N, m);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    vector<double> wNewGpu(N);
+    CUDA_CHECK(cudaMemcpy(wNewGpu.data(), d_w, sizeof(double) * N, cudaMemcpyDeviceToHost));
+
+    cudaFree(d_P); cudaFree(d_Hk); cudaFree(d_xi); cudaFree(d_X);
+    cudaFree(d_A); cudaFree(d_Ainv); cudaFree(d_Aug); cudaFree(d_K); cudaFree(d_w);
+
+    // --- Independent CPU Kalman update (own Gauss-Jordan, own loops) --------
+    vector<double> HcolCpu(N), w0Cpu(N);
+    for (size_t c = 0; c < connCountH; ++c) { HcolCpu[c] = jacHCpu[c]; w0Cpu[c] = connH[c]; }
+    for (size_t c = 0; c < connCountO; ++c) { HcolCpu[connCountH + c] = jacOCpu[c]; w0Cpu[connCountH + c] = connO[c]; }
+    vector<double> xiCpu(1, energyRef - sumEnergyCpu);
+
+    vector<double> Pcpu = P0;
+    vector<double> wCpu = w0Cpu;
+    cpuKalmanUpdate(Pcpu, wCpu, HcolCpu, xiCpu, N, m, eta, q);
+
+    // --- Real nnp::KalmanFilter cross-check (linked from lib/libnnptrain.a,
+    // debug info stripped at link time -- see run.slurm) ---------------------
+    vector<double> wReal = w0Cpu;
+    KalmanFilter kf(N, KalmanFilter::KT_STANDARD);
+    kf.setState(wReal.data());
+    kf.setParametersStandard(epsilon, q0, qtau, qmin, eta0, etatau, etamax);
+    kf.setJacobian(HcolCpu.data(), m);
+    kf.setError(xiCpu.data(), m);
+    kf.update(m);
+
+    double maxAbsErrWGpuCpu = 0.0, maxAbsErrWGpuReal = 0.0;
+    for (int i = 0; i < N; ++i)
+    {
+        maxAbsErrWGpuCpu = max(maxAbsErrWGpuCpu, fabs(wNewGpu[i] - wCpu[i]));
+        maxAbsErrWGpuReal = max(maxAbsErrWGpuReal, fabs(wNewGpu[i] - wReal[i]));
+    }
+
+    printf("\n--- Stage 5: Kalman energy update (N=%d combined weights) ---\n", N);
+    printf("energyRef=%.10E  energy(before)=gpu:%.10E cpu:%.10E\n",
+           energyRef, sumEnergyGpu, sumEnergyCpu);
+    printf("max|dEdc_gpu-dEdc_cpu| = %.3E\n", maxAbsErrJac);
+    printf("max|w_gpu-w_cpu|       = %.3E\n", maxAbsErrWGpuCpu);
+    printf("max|w_gpu-w_real|      = %.3E\n", maxAbsErrWGpuReal);
+
+    // --- Apply the updated weights and re-run the forward pass, purely
+    // informationally: a single Kalman step from this random initial
+    // weights/P/eta is not guaranteed to monotonically reduce the energy
+    // error, so this is NOT a pass/fail criterion -- just a demonstration
+    // that the update composes end-to-end into a new, usable network.
+    vector<double> connHNew(wNewGpu.begin(), wNewGpu.begin() + connCountH);
+    vector<double> connONew(wNewGpu.begin() + connCountH, wNewGpu.end());
+
+    double const *W1Hn, *b1Hn, *W2Hn, *b2Hn, *W3Hn, *b3Hn;
+    double const *W1On, *b1On, *W2On, *b2On, *W3On, *b3On;
+    sliceConn(connHNew, numH, W1Hn, b1Hn, W2Hn, b2Hn, W3Hn, b3Hn);
+    sliceConn(connONew, numO, W1On, b1On, W2On, b2On, W3On, b3On);
+    CUDA_CHECK(cudaMemcpy(d_W1H, W1Hn, numH * numHidden1 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b1H, b1Hn, numHidden1 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_W2H, W2Hn, numHidden1 * numHidden2 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b2H, b2Hn, numHidden2 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_W3H, W3Hn, numHidden2 * numOut * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b3H, b3Hn, numOut * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_W1O, W1On, numO * numHidden1 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b1O, b1On, numHidden1 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_W2O, W2On, numHidden1 * numHidden2 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b2O, b2On, numHidden2 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_W3O, W3On, numHidden2 * numOut * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b3O, b3On, numOut * sizeof(double), cudaMemcpyHostToDevice));
+
+    nnForwardKernel<<<(numSelH + blockSize - 1) / blockSize, blockSize>>>(
+        beginH, numSelH, numH, d_W1H, d_b1H, numHidden1, d_W2H, d_b2H, numHidden2,
+        d_W3H, d_b3H, numOut, d_G, batch.gBlockOffset[H], batch.sfCountPerElement[H],
+        d_energy, d_dEdG);
+    CUDA_CHECK(cudaGetLastError());
+    nnForwardKernel<<<(numSelO + blockSize - 1) / blockSize, blockSize>>>(
+        beginO, numSelO, numO, d_W1O, d_b1O, numHidden1, d_W2O, d_b2O, numHidden2,
+        d_W3O, d_b3O, numOut, d_G, batch.gBlockOffset[O], batch.sfCountPerElement[O],
+        d_energy, d_dEdG);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    vector<double> energyGpuNew(numAtoms);
+    CUDA_CHECK(cudaMemcpy(energyGpuNew.data(), d_energy, numAtoms * sizeof(double), cudaMemcpyDeviceToHost));
+    double sumEnergyGpuNew = 0.0;
+    for (size_t i = 0; i < numAtoms; ++i) sumEnergyGpuNew += energyGpuNew[i];
+
+    nnH.setConnections(connHNew.data());
+    nnO.setConnections(connONew.data());
+    double sumEnergyCpuNew = 0.0;
+    for (int t = 0; t < numSelH; ++t)
+    {
+        int s = beginH + t;
+        nnH.setInput(&gCpu[batch.gIndex(s, 0)]);
+        nnH.propagate();
+        double e; nnH.getOutput(&e);
+        sumEnergyCpuNew += e;
+    }
+    for (int t = 0; t < numSelO; ++t)
+    {
+        int s = beginO + t;
+        nnO.setInput(&gCpu[batch.gIndex(s, 0)]);
+        nnO.propagate();
+        double e; nnO.getOutput(&e);
+        sumEnergyCpuNew += e;
+    }
+
+    printf("energy(after) =gpu:%.10E cpu:%.10E  (informational only, not a pass/fail check)\n",
+           sumEnergyGpuNew, sumEnergyCpuNew);
+
+    bool pass5 = (maxAbsErrJac < 1e-9) && (maxAbsErrWGpuCpu < 1e-8) &&
+                 (maxAbsErrWGpuReal < 1e-8);
+    printf("Stage 5: %s\n", pass5 ? "PASS" : "FAIL");
+
+    bool passAll = pass && pass5;
+    printf("\n%s\n", passAll ? "ALL PASS" : "SOME FAILED");
+    return passAll ? 0 : 1;
 }
