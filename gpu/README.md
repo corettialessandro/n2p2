@@ -569,8 +569,9 @@ Wiring this into `e2e/` with a real per-structure Jacobian (not synthetic
 `H`/`xi`) is now done — see `e2e/`'s Stage 5 (energy) and Stage 6 (force,
 `calculateDFdc`'s output instead of `calculateDEdc`'s) below.
 
-The NN forward/`dEdG` batching mentioned below (`gemm/`) is done; `updateP`
-and `calculateDFdc`/`calculateDEdc` are not (see `gemm/`'s own "next steps").
+All of `gemm/`'s cuBLAS batching (NN forward/`dEdG`, `calculateDFdc`/
+`calculateDEdc`, and this filter's own `updateP`) is now done — see `gemm/`
+below.
 
 Next steps (not yet done): Phase 6 (build system integration — a
 `makefile.cuda`/`N2P2_GPU` flag actually linking this code into
@@ -614,14 +615,91 @@ operand varying row-by-row:
   sizes, better than expected going in (small batches can leave GEMM/cuBLAS
   call overhead dominant; it didn't here).
 
-Next steps (not yet done): `calculateDFdc`/`calculateDEdc` (the weight-
-Jacobian passes feeding the Kalman filter) are NOT batched this way yet —
-unlike the forward/`dEdG` pass, each atom's Jacobian involves genuinely
-atom-specific outer products (activations × backward sensitivities), not a
-shared-weight-times-shared-batch GEMM, so batching that would need real
-`cuBLAS gemmStridedBatched` (independent small matrix pairs per atom) rather
-than the single-shared-GEMM trick used here — a harder, separate problem.
-Kalman's `updateP` (`O(N²·m)` per call, the dominant cost there) is also
-still the naive one-thread-per-element kernel from `kalman/`.
+**Done: `nn_dedc_gemm_test.cu`** — `calculateDEdc` (the energy-weight
+Jacobian, `../e2e/`'s Stage 5), batched with genuine
+`cublasDgemmStridedBatched` calls, the first real use of "batched" GEMM in
+the cuBLAS sense in this port (the forward pass above used ordinary,
+non-batched `dgemm` throughout, since every atom shared the same weight
+matrix). Turns out almost the entire computation is either already
+produced by the forward/`dEdG` pipeline above, or reduces to two per-atom
+**rank-1 outer products**:
+
+- `dE/dW3 = H2` and `dE/db2 = v2`, `dE/db1 = v1s` are direct aliases of
+  arrays the forward/`dEdG` GEMM pipeline already computed — no new work.
+  `dE/db3 = 1` is a constant.
+- `dE/dW2[atom] = outer(h1[atom,:], v2[atom,:])` and `dE/dW1[atom] =
+  outer(G[atom,:], v1s[atom,:])` are batched rank-1 (`k=1`)
+  `cublasDgemmStridedBatched` calls (`outerProductBatched()`), writing
+  directly into the right offset of each atom's packed `[W1,b1,W2,b2,W3,b3]`
+  block (matching `AtomBatch::dFdcIndex`'s layout, so this could feed
+  `../e2e/`'s Stage 5 directly) via the stride parameter, no separate
+  packing/copy for those two blocks.
+- Validated three ways (GEMM path, the existing per-atom kernel copied from
+  `../e2e/`'s Stage 5, the real `NeuralNetwork::calculateDEdc()`) to ~3e-15.
+  **8.5× (H) / 8.8× (O)** speedup.
+
+**Done: `nn_dfdc_gemm_test.cu`** — the harder of the two Jacobian passes:
+`calculateDFdc` (the force-weight Jacobian, `../nn/
+nn_backward_dfdc_test.cu`) loops over every input `k0`, and each iteration
+touches every connection, so this keeps a host-side loop over `k0` (≤42
+iterations, cheap) and batches the atom dimension inside each iteration via
+a mix of ordinary shared-weight GEMMs (`u . W2`, `jacBiasHidden2 . W2ᵀ` —
+same trick as the forward pass, since `W1`/`W2`/`W3` don't depend on the
+atom) and batched rank-1 outer products (the same `cublasDgemmStridedBatched`
+tool `nn_dedc_gemm_test.cu` introduced, now with explicit `alpha`/`beta` so
+contributions **accumulate** across all `k0` iterations into `dFdc_W2`/
+`dFdc_W1` rather than overwriting). The trickiest piece ported faithfully:
+`calculateDFdc`'s `deltaTerm` (the real algorithm's `dE/db_hidden1`
+contribution to `dFdc`'s `W1` block, which lands *only* at the row matching
+the input actually being differentiated) becomes a small elementwise kernel
+touching just that one row per `k0`, not a GEMM. Validated three ways (GEMM
+path, the existing per-atom kernel, the real
+`NeuralNetwork::calculateDFdc()`) to ~2-3e-14. **11.3× (H) / 10.4× (O)**
+speedup — despite roughly 14 kernel/GEMM launches per `k0` iteration (≤42
+of them), launch overhead didn't erase the win.
+
+**Done: `kalman_gemm_test.cu`** — the two dominant `O(N²·m)` steps of
+`KalmanFilter::update()` (`X = P.H`, and the `K.Xᵀ` term of `P -= K.Xᵀ`),
+`~354M` multiply-adds each at the real `N=3327, m=32` production size; every
+other step (`A = Hᵀ.X`, `K = X.Ainv`, the `m×m` inverse, `w += K.xi`) is
+`O(N·m²)` or smaller (`<1%` of the total flops) and is deliberately left as
+`kalman/`'s existing naive kernel. Unlike every other file in this
+directory, `P`/`H`/`X`/`K` here are **column-major**, not row-major —
+`kalman/kalman_test.cu` deliberately stores them that way to match
+`Eigen::Map<MatrixXd>`'s layout, so the same buffers can be handed to the
+real `KalmanFilter` class unchanged. That means cuBLAS's native
+column-major form applies directly here: `X = P.H` and `K = X.Ainv` are
+plain `cublasDgemm(OP_N, OP_N)` calls, and `P -= K.Xᵀ` just needs
+`CUBLAS_OP_T` on `X` — no row-major-via-column-major trick, no materialized
+transpose needed.
+
+- **A first draft got this wrong**: it reused this directory's row-major
+  `gemmRowMajor()` helper out of habit, without checking that Kalman's data
+  layout is the opposite convention — it silently computed the wrong matrix
+  product. Caught immediately (not subtly) by the three-way validation:
+  `P`/`w` diverging from both the naive kernel and the two independent CPU
+  references, worsening with every update. Fixed by using cuBLAS's native
+  column-major calls directly instead of forcing a trick built for a
+  different file's layout. Worth remembering: a helper correct in one file
+  isn't automatically correct in another with a different convention, even
+  within the same directory.
+- Validated three ways (GEMM path vs. the existing naive-kernel path vs. two
+  independent CPU references — an own-loop implementation and the real
+  `nnp::KalmanFilter` class) at both sizes, to ~1e-15.
+- **Modest speedup, reported honestly**: **1.22×** (small) / **1.39×**
+  (production size) — much smaller than the NN pieces above. The naive
+  kernel here was already a reasonably efficient memory-access pattern
+  (each thread's dot product reads contiguous rows), unlike the NN forward
+  kernel's redundant serial per-atom work; cuBLAS still wins, just not
+  dramatically.
+
+Not pursued: `cublasDsymm` to exploit `P`'s symmetry for `X = P.H` (would
+roughly halve that GEMM's cost) — judged not worth the added
+side/uplo-semantics risk for a further ~2× on top of an already-modest win.
+
+All three of Phase 4's GPU-side cost centers this port has profiled or
+ported so far are now batched with cuBLAS in some form; only Phase 6 (build
+system integration) remains to make any of this reachable from real
+`nnp-train`.
 
 ## `kalman/`
