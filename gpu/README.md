@@ -762,36 +762,53 @@ and forces/Kalman (out of this pass's chosen scope).
   to swap the final linker to `nvcc`, unlike every `gpu/*/run.slurm` script
   so far (those always used `nvcc` as the final linker; this is the first
   place that didn't need to).
-- **Validated at the real call site**: `gpu/e2e_predict_check/
-  mode_gpu_call_site_test.cpp` builds a real `Prediction` object from the
-  real H2O_2G `input.nn`/trained `weights.001.data`/`weights.008.data`, and
-  calls the actual public `Mode::calculateAtomicNeuralNetworks()` (its
-  class-level doc comment literally shows this exact call as intended
-  usage) directly — once linked against a plain CPU-only build, once
-  against a `GPU=1` build — comparing `Atom::energy`/`Atom::dEdG` for all
-  630 atoms. `max|E_cpu-E_gpu| = 3.9E-14`, `max|dEdG_cpu-dEdG_gpu| =
-  2.3E-13` — bit-level agreement, consistent with every other GPU-vs-CPU
-  comparison throughout this port.
-- **A real, pre-existing, unrelated bug was found (not fixed) along the
-  way**: the original plan was to validate through the actual `nnp-predict`
-  binary end-to-end, but it segfaults on this branch (confirmed via a core
-  dump and `gdb` post-mortem backtrace) inside `SymGrpExpRad::calculate()`,
-  called from `Element::calculateSymmetryFunctionGroups()` — entirely
-  *before* `calculateAtomicNeuralNetworks()` is ever reached, in code this
-  Phase 6 pass never touched. This is why `mode_gpu_call_site_test.cpp`
-  bypasses `Mode::calculateSymmetryFunctionGroups()` and populates
-  `Atom::G` directly instead (with synthetic values — since
-  `calculateAtomicNeuralNetworks()` only reads `Atom::G` and writes
-  `Atom::energy`/`dEdG`, confirmed by reading its source, synthetic input
-  is exactly as valid a test of *this* call site as real symmetry-function
-  output would be). Fixing the `SymGrpExpRad` crash is out of scope for
-  this GPU port and hasn't been attempted — worth its own investigation
-  separately, since it currently means `nnp-predict` cannot complete a
-  normal run on this dataset on this branch at all, independent of any GPU
-  work.
+- **Validated two ways**: `gpu/e2e_predict_check/mode_gpu_call_site_test.cpp`
+  calls the actual public `Mode::calculateAtomicNeuralNetworks()` directly
+  (its class-level doc comment literally shows this exact call as intended
+  usage) on a real `Prediction` object built from real H2O_2G
+  `input.nn`/trained weights, with synthetic `Atom::G` (valid since this
+  function only reads `Atom::G` and writes `Atom::energy`/`dEdG` — confirmed
+  by reading its source) — `max|E_cpu-E_gpu| = 3.9E-14`,
+  `max|dEdG_cpu-dEdG_gpu| = 2.3E-13`. **And, the real end-to-end
+  deliverable**: `gpu/e2e_predict_check/run_nnp_predict_gpu_vs_cpu.slurm`
+  builds and runs the actual `nnp-predict` binary itself, twice (once
+  CPU-only, once `GPU=1`), on the real H2O_2G structure, and diffs
+  `energy.out`/`nnatoms.out`/`nnforces.out` — `max abs diff` ~1e-16/1e-17
+  across all 630 atoms' energies and forces. Both agree with each other and
+  with the sensible physical result (`Ediff` ~4e-5 eV/atom against the
+  reference for this trained model).
+- **A red herring along the way, now resolved**: `nnp-predict` initially
+  segfaulted reliably on this branch (confirmed via a core dump and `gdb`
+  backtrace, inside `SymGrpExpRad::calculate()`/`SymGrpExpAngn::calculate()`
+  — code this Phase 6 pass never touched, called well before
+  `calculateAtomicNeuralNetworks()`). Root-caused by systematically bisecting
+  optimization flags and rebuild state (a `-O0` build never crashed; ASan/
+  UBSan at the exact production flags never crashed either; the crash
+  location shifted between separate crashing runs; and, critically, the
+  *identical* `-O3 -march=native` build stopped crashing entirely, 0/20
+  repeated runs, once every object file was rebuilt from a `make clean`
+  state on the actual execution node). Conclusion: it was a **stale,
+  non-portable prebuilt `lib/libnnp.a`** left over from before this
+  investigation, compiled with `-march=native` on a different machine than
+  where it was later executed — not a source bug, and not anything this
+  port introduced. A full `make clean && make` on the actual target node
+  resolved it completely; `mode_gpu_call_site_test.cpp` is kept anyway since
+  it's a useful, lighter-weight regression check of just this call site.
+- **A real gotcha this Phase 6 pass *did* introduce**, discovered while
+  restoring a clean state afterward: `lib/libnnp.a` is one shared archive
+  across every application, and whether `Mode.o` inside it references
+  `gpuNnForwardDEdG()` is baked in by whichever `GPU=` value `libnnp` was
+  *last* built with — not tracked per-application. Building `GPU=1
+  nnp-predict` and then plain `nnp-train` (no `GPU=1`) without rebuilding
+  `libnnp` first fails at `nnp-train`'s link step with an undefined
+  reference (`APP_TRAINING`/`APP_DATASET`'s link lines aren't GPU-aware).
+  Documented directly in `src/application/makefile` next to the `GPU=1`
+  block; the fix when switching `GPU=` values is to rebuild `libnnp` first
+  (`cd src/libnnp && make clean && make ... GPU=<value>`).
 
 Next steps (not yet done): wire in symmetry functions and forces/Kalman for
 a real end-to-end GPU training step (this pass deliberately stopped at one
-call site); investigate the pre-existing `SymGrpExpRad` crash blocking a
-full `nnp-predict` run; extend `GPU=1` to `nnp-train`'s training loop
-itself, not just `APP_CORE`'s prediction-only binaries.
+call site); extend `GPU=1` to `nnp-train`'s training loop itself, not just
+`APP_CORE`'s prediction-only binaries (and make `APP_TRAINING`/
+`APP_DATASET`'s link lines GPU-aware, closing the gotcha above properly
+instead of just documenting it).

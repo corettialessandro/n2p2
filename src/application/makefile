@@ -94,6 +94,15 @@ endif
 # is wired into -- so far only nnp-predict has actually been run and
 # validated with GPU=1 (see GPU_PORTING_PLAN.md's Phase 6), the mechanism
 # itself is not nnp-predict-specific.
+#
+# GOTCHA: whether Mode.o (inside the shared ../../lib/libnnp.a) references
+# gpuNnForwardDEdG() is baked in by whichever GPU= value libnnp was LAST
+# built with -- it isn't tracked per-application. Building `GPU=1
+# nnp-predict` and then plain `nnp-train` (no GPU=1) without rebuilding
+# libnnp first fails at nnp-train's link step with an undefined reference
+# to gpuNnForwardDEdG (APP_TRAINING/APP_DATASET's link lines are not
+# GPU-aware). If you switch GPU= value, rebuild libnnp (`cd ../libnnp &&
+# make clean && make ... GPU=<value>`) before building anything else.
 ifeq ($(GPU), 1)
 $(APP_CORE): OPTIONS+= -DN2P2_GPU
 $(APP_CORE): INCLUDES+= -I$(PROJECT_DIR)/src/libnnpgpu
