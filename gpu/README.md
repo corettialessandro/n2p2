@@ -421,9 +421,75 @@ first (`soa/symfnc_expangn_group_test.cu`), then wired in here.
   35/42-wide count), all matching the independent CPU reference to ~5e-15
   (energy, forces, and `G` all individually checked).
 
-Next steps (not yet done): Phase 4 (Kalman filter weight updater, still the
-highest-risk untouched piece); batched-GEMM kernels instead of
-one-thread-per-atom; and Phase 6 (build system integration — a
-`makefile.cuda`/`N2P2_GPU` flag actually linking this code into
-`nnp-train`, without which none of it is reachable from the real training
-binary, whatever else gets validated standalone).
+## `kalman/`
+
+Phase 4 — the weight-update algorithm (`src/libnnptrain/KalmanFilter.cpp`),
+i.e. the piece that turns Jacobians (Phase 3's `calculateDFdc`/
+`calculateD2EdGdc` output) and errors into an updated weight vector. This is
+what nnp-train actually calls once per scheduled structure/force-component
+during training (not once per epoch) — `Training::update()`
+(`src/libnnptrain/Training.cpp:2975-3010`) gathers one Jacobian column and
+one error value per MPI rank (`MPI_Gather`, `parallel_mode 0` =
+`PM_TRAIN_RK0`, so the `KalmanFilter` object only ever exists on rank 0),
+then calls `KalmanFilter::update()`.
+
+**Done: `kalman_test.cu`** — only `KT_STANDARD` is ported (`kalman_type 0` in
+`temp/H2O_2G/input.nn:79`, the only mode this project's config uses;
+`KT_FADINGMEMORY` exists in the CPU code but isn't exercised here, same
+"port what's actually used" choice already made for symmetry functions).
+The algorithm, replicated kernel-by-kernel from `KalmanFilter.cpp:126-197`:
+`X = P.H` → `A = HᵀX + R` (`R = I/eta`) → `K = X.A⁻¹` → `P -= K.Xᵀ`, `P += Q`
+(`Q = I*q`) → `w += K.xi`, with the `eta`/`q` exponential schedules applied
+in the exact same order as the real code (`eta` grows *before* being used to
+build `R` that step; `q` decays *after* being used to build `Q` that step —
+getting this backwards would silently use the wrong step's value).
+
+- **State size**: `update_strategy 0` (`US_COMBINED`) in `input.nn:42` means
+  *one* filter covers both elements' weights combined — `N = 3327` for
+  H2O_2G (1576 H-connections + 1751 O-connections), `P` dense `3327×3327`
+  (~89 MB, not block-diagonal — H/O cross-covariance is tracked). `m`
+  (observation count) equals the MPI rank count doing the gather — 32 in
+  this project's job scripts. Both a small smoke-test size (`N=50, m=5`)
+  and this real production size (`N=3327, m=32`) are exercised.
+- **Three independent implementations validated against each other**: the
+  CUDA kernels; a from-scratch nested-loop CPU reference with its own
+  hand-rolled Gauss-Jordan inversion (catches CUDA indexing bugs); and the
+  **real** `nnp::KalmanFilter` class itself, linked from `lib/libnnptrain.a`
+  and run in lockstep on identical `H`/`xi` sequences. Its `P`/`K` are
+  private with no getters, so only its externally-visible weight vector `w`
+  is checked — but since every step's `w` update depends on the full `P`/`K`
+  chain, a bug anywhere in the recursion would surface in `w` within a step
+  or two, making this a strong ground-truth check despite the limited
+  visibility.
+- **The `m×m` inverse uses a single-thread (`<<<1,1>>>`) Gauss-Jordan
+  kernel**, deliberately not parallel — `m` is small (32 in production) and
+  this step is about proving the recursion's numerics correct, not
+  performance. The augmented matrix is a caller-sized device buffer, not a
+  fixed-size local array — the earlier `e2e/` buffer-overflow bug made that
+  mistake once already; not repeating it here even though `m` is small
+  enough that a guessed size would probably have been fine in practice.
+  `updateP` (`O(N²·m)` per call) is the dominant cost and the real target
+  for a later cuBLAS `dsyrk`/`dgemm`-based rewrite.
+- **Linking `lib/libnnptrain.a` hit a new variant of the GSL debug-section
+  problem** noted elsewhere in this README: `KalmanFilter.o`'s own
+  `.debug_info` section is compressed in a way this cluster's `ld` (binutils
+  2.30) can't decompress ("unable to initialize decompress status for
+  section .debug_info"), which makes `ld` reject the *entire* archive
+  ("File format not recognized") rather than just that one section. Fix:
+  extract just the four objects actually needed (`KalmanFilter.o`/
+  `Updater.o` from `libnnptrain.a`, `Stopwatch.o`/`utility.o` from
+  `libnnp.a` — confirmed via `nm -u` to have zero undefined GSL/MPI runtime
+  symbols) and `strip --strip-debug` them before linking, instead of linking
+  the full archives.
+- Validated: both sizes PASS, `max|P_gpu-P_cpu| = 2.8E-14`,
+  `max|w_gpu-w_cpu| = 9.5E-18`, `max|w_gpu-w_real| = 3.3E-17` (production
+  size, 5 sequential updates).
+
+Next steps (not yet done): wiring this Kalman update into the `e2e/`
+pipeline so a single structure's real Jacobian (not synthetic `H`/`xi`)
+drives a real weight update end-to-end; batched-GEMM kernels instead of
+one-thread-per-atom for Phase 3's NN forward/backward and this phase's
+`updateP`; and Phase 6 (build system integration — a `makefile.cuda`/
+`N2P2_GPU` flag actually linking this code into `nnp-train`, without which
+none of it is reachable from the real training binary, whatever else gets
+validated standalone).
