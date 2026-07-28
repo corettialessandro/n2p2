@@ -785,6 +785,197 @@ static void cpuKalmanUpdate(vector<double>& P, vector<double>& w,
 }
 
 ///////////////////////////////////////////////////////////////////////////
+// Stage 6: a force-fit Kalman update -- same wiring as Stage 5, but for a
+// single force COMPONENT of a single atom instead of the structure's total
+// energy (this project's config also does force updates, just far less
+// often: short_force_fraction 0.0041 vs. short_energy_fraction 1.0).
+//
+// The Jacobian this needs is calculateDFdc's output (../nn/
+// nn_backward_dfdc_test.cu, already ported and validated -- copied
+// verbatim below), not calculateDEdc's (Stage 5's, energy only). The
+// subtlety: a force component depends on MULTIPLE atoms' networks, not just
+// the target atom's own -- exactly the same "self + every neighbor that
+// lists the target" structure forceAssemblyKernel already uses for the
+// scalar energy->force chain rule, just contracting each contributing
+// atom's OWN calculateDFdc against ITS OWN dGdxyz (its own dGdx for the
+// self term, or the matching neighborDGdx slot for each neighbor-listing
+// atom) instead of a scalar dEdG*dGdx product:
+//   dF_T,x/dc = -sum_k d(dEdG_T[k])/dc * dGdx_T[k]                  (self,
+//               only atom T itself)
+//             - sum_{j : T in j's neighbor list} sum_k d(dEdG_j[k])/dc
+//                                                * neighborDGdx[j,slot(T),k]
+// and d(dEdG_atom[k])/dc is exactly what calculateDFdc's internal
+// calculateD2EdGdc already computes per input k, before contracting with
+// whatever dGdxyz array is handed to it -- so calling nnCalculateDFdc on
+// contributing atom j's own G/weights with dGdxyz = neighborDGdx[j,slot(T),:]
+// (instead of j's own dGdx) gives exactly j's contribution to T's force
+// Jacobian, matching forceAssemblyKernel's scatter pattern but accumulating
+// a full per-weight vector instead of a scalar.
+///////////////////////////////////////////////////////////////////////////
+
+// Copied verbatim from ../nn/nn_backward_dfdc_test.cu (see that file's
+// header comment for the full derivation/citation). dFdc must be
+// caller-zeroed; accumulated via -=.
+__host__ __device__ inline void nnCalculateDFdc(
+    const double* G, int numIn,
+    const double* W1, const double* b1, int numHidden1,
+    const double* W2, const double* b2, int numHidden2,
+    const double* W3, const double* b3, int numOut, // numOut == 1
+    const double* dGdxyz, double* dFdc)
+{
+    double h1[64], dfdx1[64], d2fdx2_1[64];
+    for (int k = 0; k < numHidden1; ++k)
+    {
+        double s = b1[k];
+        for (int j = 0; j < numIn; ++j) s += W1[j * numHidden1 + k] * G[j];
+        h1[k] = tanh(s);
+        dfdx1[k] = 1.0 - h1[k] * h1[k];
+        d2fdx2_1[k] = -2.0 * h1[k] * dfdx1[k];
+    }
+    double h2[64], dfdx2[64], d2fdx2_2[64];
+    for (int k = 0; k < numHidden2; ++k)
+    {
+        double s = b2[k];
+        for (int j = 0; j < numHidden1; ++j) s += W2[j * numHidden2 + k] * h1[j];
+        h2[k] = tanh(s);
+        dfdx2[k] = 1.0 - h2[k] * h2[k];
+        d2fdx2_2[k] = -2.0 * h2[k] * dfdx2[k];
+    }
+
+    double dEdbHidden2[64];
+    for (int j = 0; j < numHidden2; ++j) dEdbHidden2[j] = W3[j] * dfdx2[j];
+
+    double S1[64], dEdbHidden1[64];
+    for (int i = 0; i < numHidden1; ++i)
+    {
+        double s = 0.0;
+        for (int j = 0; j < numHidden2; ++j) s += W2[i * numHidden2 + j] * dEdbHidden2[j];
+        S1[i] = s;
+        dEdbHidden1[i] = dfdx1[i] * s;
+    }
+
+    size_t const offW1 = 0;
+    size_t const offB1 = offW1 + (size_t)numIn * numHidden1;
+    size_t const offW2 = offB1 + numHidden1;
+    size_t const offB2 = offW2 + (size_t)numHidden1 * numHidden2;
+    size_t const offW3 = offB2 + numHidden2;
+
+    for (int k0 = 0; k0 < numIn; ++k0)
+    {
+        double dGk0 = dGdxyz[k0];
+
+        double dxdG1[64];
+        for (int i = 0; i < numHidden1; ++i) dxdG1[i] = W1[k0 * numHidden1 + i];
+
+        double dxdG2[64];
+        for (int j = 0; j < numHidden2; ++j)
+        {
+            double s = 0.0;
+            for (int i = 0; i < numHidden1; ++i)
+                s += W2[i * numHidden2 + j] * dfdx1[i] * dxdG1[i];
+            dxdG2[j] = s;
+        }
+
+        double jacBiasHidden2[64], jacW3[64];
+        for (int j = 0; j < numHidden2; ++j)
+        {
+            jacBiasHidden2[j] = W3[j] * d2fdx2_2[j] * dxdG2[j];
+            jacW3[j] = dfdx2[j] * dxdG2[j];
+        }
+
+        double jacBiasHidden1[64];
+        for (int i = 0; i < numHidden1; ++i)
+        {
+            double s = 0.0;
+            for (int j = 0; j < numHidden2; ++j) s += W2[i * numHidden2 + j] * jacBiasHidden2[j];
+            jacBiasHidden1[i] = dfdx1[i] * s + d2fdx2_1[i] * dxdG1[i] * S1[i];
+        }
+
+        for (int j = 0; j < numHidden2; ++j)
+        {
+            dFdc[offW3 + j] -= jacW3[j] * dGk0;
+            dFdc[offB2 + j] -= jacBiasHidden2[j] * dGk0;
+        }
+        for (int i = 0; i < numHidden1; ++i)
+        {
+            dFdc[offB1 + i] -= jacBiasHidden1[i] * dGk0;
+            for (int j = 0; j < numHidden2; ++j)
+            {
+                double jacW2 = jacBiasHidden2[j] * h1[i] + dEdbHidden2[j] * dfdx1[i] * dxdG1[i];
+                dFdc[offW2 + (size_t)i * numHidden2 + j] -= jacW2 * dGk0;
+            }
+        }
+        for (int jin = 0; jin < numIn; ++jin)
+        {
+            double deltaTerm = (jin == k0) ? 1.0 : 0.0;
+            for (int i = 0; i < numHidden1; ++i)
+            {
+                double jacW1 = jacBiasHidden1[i] * G[jin] + deltaTerm * dEdbHidden1[i];
+                dFdc[offW1 + (size_t)jin * numHidden1 + i] -= jacW1 * dGk0;
+            }
+        }
+    }
+}
+
+// One thread per atom j (same "self + scan own neighbor list" structure as
+// forceAssemblyKernel), fixed to a single target atom/component (X) and
+// contributing a full per-weight Jacobian vector via atomicAdd instead of a
+// scalar force. numConnMax is a generous, compile-time-known bound (this
+// file's fixed architecture caps real connection counts at 1751 for O) --
+// not a size guessed from unbounded runtime data like the earlier
+// neighbor-count buffer-overflow bug (see ../soa/'s and this file's own
+// Stage 1/2 history) -- so a fixed local buffer here is safe.
+__global__ void forceJacobianKernel(
+    int numAtoms, int targetAtomSorted,
+    const size_t* elementArr, const size_t* gBaseOf, const size_t* sfCountOf,
+    const size_t* neighborOffset, const size_t* neighborAtomSorted,
+    const size_t* neighborSfOffset,
+    const double* G, const double* dGdx, const double* neighborDGdx,
+    int numH, const double* W1H, const double* b1H, const double* W2H,
+    const double* b2H, const double* W3H, const double* b3H,
+    int numO, const double* W1O, const double* b1O, const double* W2O,
+    const double* b2O, const double* W3O, const double* b3O,
+    int numHidden1, int numHidden2, int numOut,
+    size_t connCountH, size_t connCountO, double* jac)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= numAtoms) return;
+
+    size_t ej = elementArr[j];
+    bool isH = (ej == 0);
+    int numIn = isH ? numH : numO;
+    const double *W1 = isH ? W1H : W1O, *b1 = isH ? b1H : b1O;
+    const double *W2 = isH ? W2H : W2O, *b2 = isH ? b2H : b2O;
+    const double *W3 = isH ? W3H : W3O, *b3 = isH ? b3H : b3O;
+    size_t connCount = isH ? connCountH : connCountO;
+    size_t jacOffset = isH ? 0 : connCountH;
+
+    size_t gBase = gBaseOf[j];
+    double dFdcLocal[2048];
+
+    if (j == targetAtomSorted)
+    {
+        for (size_t c = 0; c < connCount; ++c) dFdcLocal[c] = 0.0;
+        nnCalculateDFdc(&G[gBase], numIn, W1, b1, numHidden1, W2, b2, numHidden2,
+                        W3, b3, numOut, &dGdx[gBase], dFdcLocal);
+        for (size_t c = 0; c < connCount; ++c) atomicAdd(&jac[jacOffset + c], dFdcLocal[c]);
+    }
+
+    size_t nBegin = neighborOffset[j], nEnd = neighborOffset[j + 1];
+    size_t sfBase = neighborSfOffset[j];
+    size_t sfCountJ = sfCountOf[j];
+    for (size_t slot = 0; slot < nEnd - nBegin; ++slot)
+    {
+        if (neighborAtomSorted[nBegin + slot] != (size_t)targetAtomSorted) continue;
+        size_t base = sfBase + slot * sfCountJ;
+        for (size_t c = 0; c < connCount; ++c) dFdcLocal[c] = 0.0;
+        nnCalculateDFdc(&G[gBase], numIn, W1, b1, numHidden1, W2, b2, numHidden2,
+                        W3, b3, numOut, &neighborDGdx[base], dFdcLocal);
+        for (size_t c = 0; c < connCount; ++c) atomicAdd(&jac[jacOffset + c], dFdcLocal[c]);
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////
 // input.nn parsing: real "symfunction_short" lines only, in file order.
 ///////////////////////////////////////////////////////////////////////////
 
@@ -1497,7 +1688,166 @@ int main(int argc, char** argv)
                  (maxAbsErrWGpuReal < 1e-8);
     printf("Stage 5: %s\n", pass5 ? "PASS" : "FAIL");
 
-    bool passAll = pass && pass5;
+    ///////////////////////////////////////////////////////////////////////
+    // Stage 6: force-fit Kalman update, same wiring as Stage 5, using
+    // calculateDFdc instead of calculateDEdc. Runs independently of Stage 5
+    // (not chained after it) -- first reset the weights Stage 5 mutated
+    // (nnH/nnO's connections and the GPU weight buffers) back to the
+    // original random weights, so Stage 6 starts from the same baseline
+    // Stage 5 did, using connH/connO (never mutated -- Stage 5 only ever
+    // wrote its updated weights into separate connHNew/connONew vectors).
+    ///////////////////////////////////////////////////////////////////////
+    nnH.setConnections(connH.data());
+    nnO.setConnections(connO.data());
+    CUDA_CHECK(cudaMemcpy(d_W1H, W1H, numH * numHidden1 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b1H, b1H, numHidden1 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_W2H, W2H, numHidden1 * numHidden2 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b2H, b2H, numHidden2 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_W3H, W3H, numHidden2 * numOut * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b3H, b3H, numOut * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_W1O, W1O, numO * numHidden1 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b1O, b1O, numHidden1 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_W2O, W2O, numHidden1 * numHidden2 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b2O, b2O, numHidden2 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_W3O, W3O, numHidden2 * numOut * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_b3O, b3O, numOut * sizeof(double), cudaMemcpyHostToDevice));
+
+    // Target: sorted atom 0's x-component -- mirrors task_batch_size_force 1
+    // (one force component per scheduled update).
+    int const targetAtom = 0;
+    double fRefX = structure.atoms[batch.sortedToOriginal[targetAtom]].fRef[0];
+
+    vector<size_t> elementArr(numAtoms);
+    for (size_t s = 0; s < numAtoms; ++s) elementArr[s] = batch.element[s];
+    size_t* d_elementArr;
+    CUDA_CHECK(cudaMalloc(&d_elementArr, numAtoms * sizeof(size_t)));
+    CUDA_CHECK(cudaMemcpy(d_elementArr, elementArr.data(), numAtoms * sizeof(size_t), cudaMemcpyHostToDevice));
+
+    double* d_jacForce;
+    CUDA_CHECK(cudaMalloc(&d_jacForce, N * sizeof(double)));
+    CUDA_CHECK(cudaMemset(d_jacForce, 0, N * sizeof(double)));
+
+    forceJacobianKernel<<<((int)numAtoms + blockSize - 1) / blockSize, blockSize>>>(
+        (int)numAtoms, targetAtom, d_elementArr, d_gBaseOf, d_sfCountOf,
+        d_neighborOffsetSizeT, d_neighborAtomSorted, d_neighborSfOffset,
+        d_G, d_dGdx, d_nDGdx,
+        numH, d_W1H, d_b1H, d_W2H, d_b2H, d_W3H, d_b3H,
+        numO, d_W1O, d_b1O, d_W2O, d_b2O, d_W3O, d_b3O,
+        numHidden1, numHidden2, numOut, connCountH, connCountO, d_jacForce);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    vector<double> jacForceGpu(N);
+    CUDA_CHECK(cudaMemcpy(jacForceGpu.data(), d_jacForce, N * sizeof(double), cudaMemcpyDeviceToHost));
+    cudaFree(d_jacForce);
+    cudaFree(d_elementArr);
+
+    // --- Independent CPU Jacobian: real nnH/nnO.calculateDFdc(), same
+    // self+neighbor-scan gather already used for forceXCpu above. ---------
+    vector<double> jacForceCpu(N, 0.0);
+    {
+        size_t s = targetAtom;
+        size_t e = batch.element[s];
+        size_t connCountS = (e == (size_t)H) ? connCountH : connCountO;
+        size_t offS = (e == (size_t)H) ? 0 : connCountH;
+        vector<double> dFdcLocal(connCountS, 0.0);
+        NeuralNetwork& nn = (e == (size_t)H) ? nnH : nnO;
+        nn.setInput(&gCpu[batch.gIndex(s, 0)]);
+        nn.propagate();
+        nn.calculateDFdc(dFdcLocal.data(), &dGdxCpu[batch.gIndex(s, 0)]);
+        for (size_t c = 0; c < connCountS; ++c) jacForceCpu[offS + c] += dFdcLocal[c];
+    }
+    for (size_t j = 0; j < numAtoms; ++j)
+    {
+        size_t nBegin = batch.neighborOffset[j], nEnd = batch.neighborOffset[j + 1];
+        size_t sfBaseJ = batch.neighborSfOffset[j], sfCountJ = sfCountOf[j];
+        size_t ej = batch.element[j];
+        size_t connCountJ = (ej == (size_t)H) ? connCountH : connCountO;
+        size_t offJ = (ej == (size_t)H) ? 0 : connCountH;
+        NeuralNetwork& nnJ = (ej == (size_t)H) ? nnH : nnO;
+        for (size_t slot = 0; slot < nEnd - nBegin; ++slot)
+        {
+            if (batch.neighborAtomSorted[nBegin + slot] != (size_t)targetAtom) continue;
+            size_t base = sfBaseJ + slot * sfCountJ;
+            vector<double> dFdcLocal(connCountJ, 0.0);
+            nnJ.setInput(&gCpu[batch.gIndex(j, 0)]);
+            nnJ.propagate();
+            nnJ.calculateDFdc(dFdcLocal.data(), &nDGdxCpu[base]);
+            for (size_t c = 0; c < connCountJ; ++c) jacForceCpu[offJ + c] += dFdcLocal[c];
+        }
+    }
+
+    double maxAbsErrJacForce = 0.0;
+    for (int c = 0; c < N; ++c)
+        maxAbsErrJacForce = max(maxAbsErrJacForce, fabs(jacForceGpu[c] - jacForceCpu[c]));
+
+    // --- Kalman force update: GPU, independent CPU, and the real
+    // nnp::KalmanFilter class, exactly like Stage 5 but with this Jacobian. --
+    vector<double> xiForce(1, fRefX - forceXGpu[targetAtom]);
+    double etaF = eta0, qF = q0;
+    if (etaF < etamax) etaF *= exp(etatau);
+
+    double *d_P6, *d_Hk6, *d_xi6, *d_X6, *d_A6, *d_Ainv6, *d_Aug6, *d_K6, *d_w6;
+    CUDA_CHECK(cudaMalloc(&d_P6, sizeof(double) * N * N));
+    CUDA_CHECK(cudaMalloc(&d_Hk6, sizeof(double) * N * m));
+    CUDA_CHECK(cudaMalloc(&d_xi6, sizeof(double) * m));
+    CUDA_CHECK(cudaMalloc(&d_X6, sizeof(double) * N * m));
+    CUDA_CHECK(cudaMalloc(&d_A6, sizeof(double) * m * m));
+    CUDA_CHECK(cudaMalloc(&d_Ainv6, sizeof(double) * m * m));
+    CUDA_CHECK(cudaMalloc(&d_Aug6, sizeof(double) * m * 2 * m));
+    CUDA_CHECK(cudaMalloc(&d_K6, sizeof(double) * N * m));
+    CUDA_CHECK(cudaMalloc(&d_w6, sizeof(double) * N));
+    CUDA_CHECK(cudaMemcpy(d_P6, P0.data(), sizeof(double) * N * N, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_Hk6, jacForceGpu.data(), sizeof(double) * N * m, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_xi6, xiForce.data(), sizeof(double) * m, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_w6, w0.data(), sizeof(double) * N, cudaMemcpyHostToDevice));
+
+    kalmanComputeX<<<kGridX, kBlockX>>>(d_P6, d_Hk6, d_X6, N, m);
+    kalmanComputeA<<<1, kBlockA>>>(d_Hk6, d_X6, d_A6, N, m);
+    kalmanAddDiag<<<(m + 31) / 32, 32>>>(d_A6, m, 1.0 / etaF);
+    kalmanInvertGaussJordan<<<1, 1>>>(d_A6, d_Ainv6, d_Aug6, m);
+    kalmanComputeK<<<kGridX, kBlockX>>>(d_X6, d_Ainv6, d_K6, N, m);
+    kalmanUpdateP<<<kGridP, kBlockP>>>(d_P6, d_K6, d_X6, N, m, qF);
+    kalmanUpdateW<<<kGridW, kBlockW>>>(d_w6, d_K6, d_xi6, N, m);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    vector<double> wNewForceGpu(N);
+    CUDA_CHECK(cudaMemcpy(wNewForceGpu.data(), d_w6, sizeof(double) * N, cudaMemcpyDeviceToHost));
+    cudaFree(d_P6); cudaFree(d_Hk6); cudaFree(d_xi6); cudaFree(d_X6);
+    cudaFree(d_A6); cudaFree(d_Ainv6); cudaFree(d_Aug6); cudaFree(d_K6); cudaFree(d_w6);
+
+    vector<double> xiForceCpu(1, fRefX - forceXCpu[targetAtom]);
+    vector<double> Pcpu6 = P0;
+    vector<double> wCpu6 = w0Cpu;
+    cpuKalmanUpdate(Pcpu6, wCpu6, jacForceCpu, xiForceCpu, N, m, etaF, qF);
+
+    vector<double> wReal6 = w0Cpu;
+    KalmanFilter kf6(N, KalmanFilter::KT_STANDARD);
+    kf6.setState(wReal6.data());
+    kf6.setParametersStandard(epsilon, q0, qtau, qmin, eta0, etatau, etamax);
+    kf6.setJacobian(jacForceCpu.data(), m);
+    kf6.setError(xiForceCpu.data(), m);
+    kf6.update(m);
+
+    double maxAbsErrWGpuCpu6 = 0.0, maxAbsErrWGpuReal6 = 0.0;
+    for (int i = 0; i < N; ++i)
+    {
+        maxAbsErrWGpuCpu6 = max(maxAbsErrWGpuCpu6, fabs(wNewForceGpu[i] - wCpu6[i]));
+        maxAbsErrWGpuReal6 = max(maxAbsErrWGpuReal6, fabs(wNewForceGpu[i] - wReal6[i]));
+    }
+
+    printf("\n--- Stage 6: Kalman force-fit update (atom %d, x-component) ---\n", targetAtom);
+    printf("fRef=%.10E  force(before)=gpu:%.10E cpu:%.10E\n",
+           fRefX, forceXGpu[targetAtom], forceXCpu[targetAtom]);
+    printf("max|dFdc_gpu-dFdc_cpu| = %.3E (%d combined connections)\n", maxAbsErrJacForce, N);
+    printf("max|w_gpu-w_cpu|       = %.3E\n", maxAbsErrWGpuCpu6);
+    printf("max|w_gpu-w_real|      = %.3E\n", maxAbsErrWGpuReal6);
+
+    bool pass6 = (maxAbsErrJacForce < 1e-9) && (maxAbsErrWGpuCpu6 < 1e-8) &&
+                 (maxAbsErrWGpuReal6 < 1e-8);
+    printf("Stage 6: %s\n", pass6 ? "PASS" : "FAIL");
+
+    bool passAll = pass && pass5 && pass6;
     printf("\n%s\n", passAll ? "ALL PASS" : "SOME FAILED");
     return passAll ? 0 : 1;
 }

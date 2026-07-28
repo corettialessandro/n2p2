@@ -465,6 +465,44 @@ does for the `"energy"` property once per structure.
   energy (`-4.15`), and "did the loss get better" was deliberately not used
   as a pass/fail criterion (unlike the bit-exact comparisons above).
 
+**Done: Stage 6**, a force-fit Kalman update — same wiring as Stage 5, but
+using `calculateDFdc` (the force-weight Jacobian, `../nn/
+nn_backward_dfdc_test.cu`) instead of `calculateDEdc`, since this project's
+config also does force updates (`short_force_fraction 0.0041`, far less
+often than energy's `1.0` but still part of a real training run).
+
+- **A single force component depends on more than one atom's network**,
+  unlike energy: atom T's force is `-Σ_k dEdG_T[k]·dGdx_T[k]` (T's own
+  network) *minus* a sum over every atom J that lists T as a neighbor of
+  `-Σ_k dEdG_J[k]·neighborDGdx[J,slot(T),k]` (J's own network) — exactly the
+  self+neighbor-scatter structure `forceAssemblyKernel` (Stage 4) already
+  uses for the scalar `dEdG·dGdx` product. The insight this reuses: `d(dEdG_
+  atom[k])/dc` is exactly what `calculateDFdc`'s internal `calculateD2EdGdc`
+  already computes per input `k`, before contracting with whatever
+  `dGdxyz` array is handed to it — so calling the *same* `nnCalculateDFdc`
+  on a contributing atom's own G/weights with `dGdxyz = neighborDGdx[J,
+  slot(T),:]` (instead of J's own `dGdx`) gives exactly J's contribution to
+  T's force Jacobian, accumulating a full per-weight vector via `atomicAdd`
+  instead of a scalar.
+- **`forceJacobianKernel`**: one thread per atom J (same shape as
+  `forceAssemblyKernel`), fixed to a single target atom/component (sorted
+  atom 0, x) — if `J == target`, contract its own `dGdx` (self term); scan
+  J's own neighbor list for any slot pointing at the target and contract
+  `neighborDGdx` for each match (neighbor term). Both cases call the same
+  `nnCalculateDFdc` (copied verbatim from `../nn/nn_backward_dfdc_test.cu`)
+  into a fixed `double[2048]` local buffer — safe here, unlike the earlier
+  buffer-overflow bug, since this file's architecture caps real connection
+  counts at a compile-time-known 1751 (O), not an unbounded runtime neighbor
+  count.
+- **CPU reference** calls the real `nnH`/`nnO.calculateDFdc()` directly, one
+  call per contributing atom, using the same self+neighbor-scan gather
+  `forceXCpu` above already does. Stage 6 runs independently of Stage 5 (not
+  chained after it) — it first resets `nnH`/`nnO`'s connections and the GPU
+  weight buffers back to the original random weights Stage 5 mutated for its
+  informational re-run, so both stages start from the same baseline.
+- Validated: `max|dFdc_gpu-dFdc_cpu| = 6.7E-16` (3327 combined connections),
+  `max|w_gpu-w_cpu| = 1.1E-16`, `max|w_gpu-w_real| = 3.9E-16`.
+
 ## `kalman/`
 
 Phase 4 — the weight-update algorithm (`src/libnnptrain/KalmanFilter.cpp`),
@@ -530,14 +568,12 @@ getting this backwards would silently use the wrong step's value).
   size, 5 sequential updates).
 
 Wiring this into `e2e/` with a real per-structure Jacobian (not synthetic
-`H`/`xi`) is now done — see `e2e/`'s Stage 5 below.
+`H`/`xi`) is now done — see `e2e/`'s Stage 5 (energy) and Stage 6 (force,
+`calculateDFdc`'s output instead of `calculateDEdc`'s) below.
 
-Next steps (not yet done): a force-fit Kalman update (this project's config
-also does force updates, just far less often — `short_force_fraction
-0.0041` — and force-fit uses `calculateDFdc`'s output as its Jacobian
-instead of `calculateDEdc`'s, a straightforward extension of the same
-wiring); batched-GEMM kernels instead of one-thread-per-atom for Phase 3's
-NN forward/backward and this phase's `updateP`; and Phase 6 (build system
+Next steps (not yet done): batched-GEMM kernels instead of
+one-thread-per-atom for Phase 3's NN forward/backward and this phase's
+`updateP`; and Phase 6 (build system
 integration — a `makefile.cuda`/`N2P2_GPU` flag actually linking this code
 into `nnp-train`, without which none of it is reachable from the real
 training binary, whatever else gets validated standalone).
