@@ -26,6 +26,17 @@ PROJECT_ARFLAGS=-rcsv
 PROJECT_CFLAGS_BLAS=
 PROJECT_LDFLAGS_BLAS=-lopenblas -lgsl -lgslcblas
 
+# GPU support (src/libnnpgpu, gated by `make GPU=1` -- see the GPU section
+# further down and GPU_PORTING_PLAN.md's Phase 6). Not used at all unless
+# GPU=1 is passed on the make command line, so a plain `make` build is
+# completely unaffected. PROJECT_CUDA_HOME defaults to $(CUDA_HOME), set by
+# `module load cuda/...` on clusters using environment modules -- override
+# on the command line (or here) if your CUDA install isn't found that way.
+PROJECT_NVCC=nvcc
+PROJECT_CUDA_ARCH=sm_80
+PROJECT_CUDA_HOME=${CUDA_HOME}
+PROJECT_LDFLAGS_GPU=-L$(PROJECT_CUDA_HOME)/lib64 -lcudart -lcublas
+
 ###############################################################################
 # COMPILE-TIME OPTIONS
 ###############################################################################
@@ -62,3 +73,8 @@ PROJECT_LDFLAGS_BLAS=-lopenblas -lgsl -lgslcblas
 
 # Disable Eigen multi threading.
 PROJECT_OPTIONS+= -DEIGEN_DONT_PARALLELIZE
+
+# GPU acceleration (src/libnnpgpu) is NOT toggled here like the flags above --
+# it needs an extra nvcc-compiled library and extra link flags, not just a
+# -D define, so it's controlled by `make GPU=1` instead (see src/libnnp/
+# makefile, src/libnnpgpu/makefile, src/application/makefile).

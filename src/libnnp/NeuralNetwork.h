@@ -150,6 +150,32 @@ public:
     /** Return number of biases.
      */
     int                      getNumBiases() const;
+    /** Return total number of layers (including input and output layer).
+     */
+    int                      getNumLayers() const;
+    /** Return number of neurons in a given layer.
+     *
+     * @param[in] layer Layer index (0 = input layer, #getNumLayers() - 1 =
+     *                   output layer).
+     */
+    int                      getNumNeuronsInLayer(int layer) const;
+    /** Check whether this network matches the fixed architecture a
+     *  hand-specialized GPU implementation (src/libnnpgpu) was written
+     *  for: exactly two hidden layers (i.e. four layers total) with
+     *  #AF_TANH activation and a single-neuron #AF_IDENTITY output layer,
+     *  neuron normalization disabled (not implemented on the GPU side),
+     *  and hidden layer sizes within maxHiddenLayerSize. Architecture
+     *  (number of hidden layers, their sizes, activation functions) is a
+     *  run-time property read from input.nn, not a compile-time constant,
+     *  so callers wanting a GPU fast path must check this first and fall
+     *  back to the CPU path otherwise -- see
+     *  Mode::calculateAtomicNeuralNetworks().
+     *
+     * @param[in] maxHiddenLayerSize Upper bound the GPU implementation
+     *                               supports for each hidden layer's size.
+     */
+    bool                     hasGpuCompatibleArchitecture(
+                                        int maxHiddenLayerSize = 64) const;
     /** Set neural network weights and biases.
      *
      * @param[in] connections One-dimensional array with neural network

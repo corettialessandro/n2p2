@@ -2,7 +2,10 @@
 
 Code for the `nnp-train` GPU port described in `../GPU_PORTING_PLAN.md`. Kept
 separate from `src/` so it doesn't touch the shared, upstream-tracked build
-tree until it's ready to be integrated (see the plan's Phase 6).
+tree until it's ready to be integrated (see the plan's Phase 6) -- as of
+Phase 6's first pass, one real, narrow integration point now exists in
+`src/` too: `src/libnnpgpu/` and a `Mode::calculateAtomicNeuralNetworks()`
+call site gated behind `N2P2_GPU`/`make GPU=1`, described at this file's end.
 
 ## `smoke/`
 
@@ -573,10 +576,9 @@ All of `gemm/`'s cuBLAS batching (NN forward/`dEdG`, `calculateDFdc`/
 `calculateDEdc`, and this filter's own `updateP`) is now done — see `gemm/`
 below.
 
-Next steps (not yet done): Phase 6 (build system integration — a
-`makefile.cuda`/`N2P2_GPU` flag actually linking this code into
-`nnp-train`, without which none of it is reachable from the real training
-binary, whatever else gets validated standalone).
+Phase 6 (build system integration, `N2P2_GPU` flag, first real call site
+into `nnp-predict`/`nnp-train`) is now done for the NN forward+`dEdG`
+piece — see `src/libnnpgpu/` below.
 
 ## `gemm/`
 
@@ -698,8 +700,98 @@ roughly halve that GEMM's cost) — judged not worth the added
 side/uplo-semantics risk for a further ~2× on top of an already-modest win.
 
 All three of Phase 4's GPU-side cost centers this port has profiled or
-ported so far are now batched with cuBLAS in some form; only Phase 6 (build
-system integration) remains to make any of this reachable from real
-`nnp-train`.
+ported so far are now batched with cuBLAS in some form.
 
-## `kalman/`
+## `src/libnnpgpu/` (Phase 6: build system integration)
+
+Everything above lives entirely under `gpu/` — standalone test harnesses,
+each with its own duplicated copy of the math and its own `main()`, never
+linked into the real `nnp-train`/`nnp-predict` binaries. Phase 6
+(`GPU_PORTING_PLAN.md`) is the first step that actually changes the shared,
+upstream-tracked `src/` tree: a real, minimal-footprint call site, scoped
+deliberately narrow (see the three options this was scoped from — build
+skeleton only / one real call site / full pipeline — "one real call site"
+was chosen as the smallest slice that proves the whole pattern end-to-end,
+matching `GPU_PORTING_PLAN.md` §7's own advice).
+
+**What's wired in**: `Mode::calculateAtomicNeuralNetworks()`'s `HDNNP_2G`
+branch (`src/libnnp/Mode.cpp:1672`) — the NN forward+`dEdG` pass, batched
+via cuBLAS exactly as `gpu/gemm/nn_forward_gemm_test.cu` already validated
+(25.6×/27.9× there). Deliberately **not** wired in this pass: symmetry
+function computation (stays on CPU — `Atom::G` is already populated by the
+time this function runs, so there was nothing to gain by touching it here)
+and forces/Kalman (out of this pass's chosen scope).
+
+- **`src/libnnpgpu/`**: a new, separate library (`GpuNeuralNetwork.h/.cu`),
+  built only when `GPU=1` is passed to `make` (otherwise a clean no-op —
+  see its own `makefile`). Its one function, `gpuNnForwardDEdG()`, is
+  `nn_forward_gemm_test.cu`'s forward+`dEdG` pipeline generalized from that
+  file's hardcoded 25/25 hidden-layer sizes to **run-time** sizes — because
+  architecture (hidden layer count/sizes/activations) is a property n2p2
+  reads from `input.nn`'s `global_hidden_layers_short`/`global_nodes_short`/
+  `global_activation_short` keywords (with optional per-element overrides),
+  not a fixed constant; several of this repo's other bundled example
+  datasets use different sizes (e.g. `examples/nnp-predict/Anisole_SCAN`
+  uses 30/20, asymmetric). A hardcoded-25/25 GPU path would have been a
+  real, silent correctness bug for any dataset that didn't happen to match
+  H2O_2G's numbers.
+- **`NeuralNetwork::hasGpuCompatibleArchitecture()`** (new, purely additive
+  public method, `src/libnnp/NeuralNetwork.h/.cpp`): checks a network has
+  exactly two `AF_TANH` hidden layers, a single-neuron `AF_IDENTITY` output
+  layer, neuron normalization disabled, and hidden sizes within a bound —
+  the shape `src/libnnpgpu` supports. `Mode::calculateAtomicNeuralNetworks()`
+  checks this for every element before taking the GPU path and falls back
+  to the exact original per-atom CPU loop, atom by atom, if any element's
+  network doesn't match (a real run-time possibility, not a formality —
+  proven by `gpu/gemm/libnnpgpu_test.cu`, which deliberately exercises a
+  30/20 architecture alongside H2O_2G's 25/25 to confirm the generalization
+  is genuinely correct, not just re-lucky on one dataset's numbers, ~5e-15
+  agreement in both cases).
+- **Build system**: a new `GPU` make variable (default off, mirroring how
+  `COMP`/`MODE` already work), threaded from the master `src/makefile`
+  through `src/libnnp/makefile`/`src/libnnpgpu/makefile`/`src/application/
+  makefile`. `GPU=1` adds `-DN2P2_GPU` and an extra include path where
+  needed, and links `libnnpgpu.a` plus `-lcudart -lcublas` into any
+  `APP_CORE` binary (`nnp-predict` and friends — the mechanism applies to
+  all of them since they share `Mode::calculateAtomicNeuralNetworks()`,
+  though only `nnp-predict` has actually been run and validated with
+  `GPU=1` so far). A plain `make` (no `GPU=1`) is completely unaffected —
+  confirmed by rebuilding `nnp-train` afterward with the same makefiles
+  and no changes to its build. **g++ links the nvcc-compiled
+  `libnnpgpu.a` into the final binary with no special handling** — no need
+  to swap the final linker to `nvcc`, unlike every `gpu/*/run.slurm` script
+  so far (those always used `nvcc` as the final linker; this is the first
+  place that didn't need to).
+- **Validated at the real call site**: `gpu/e2e_predict_check/
+  mode_gpu_call_site_test.cpp` builds a real `Prediction` object from the
+  real H2O_2G `input.nn`/trained `weights.001.data`/`weights.008.data`, and
+  calls the actual public `Mode::calculateAtomicNeuralNetworks()` (its
+  class-level doc comment literally shows this exact call as intended
+  usage) directly — once linked against a plain CPU-only build, once
+  against a `GPU=1` build — comparing `Atom::energy`/`Atom::dEdG` for all
+  630 atoms. `max|E_cpu-E_gpu| = 3.9E-14`, `max|dEdG_cpu-dEdG_gpu| =
+  2.3E-13` — bit-level agreement, consistent with every other GPU-vs-CPU
+  comparison throughout this port.
+- **A real, pre-existing, unrelated bug was found (not fixed) along the
+  way**: the original plan was to validate through the actual `nnp-predict`
+  binary end-to-end, but it segfaults on this branch (confirmed via a core
+  dump and `gdb` post-mortem backtrace) inside `SymGrpExpRad::calculate()`,
+  called from `Element::calculateSymmetryFunctionGroups()` — entirely
+  *before* `calculateAtomicNeuralNetworks()` is ever reached, in code this
+  Phase 6 pass never touched. This is why `mode_gpu_call_site_test.cpp`
+  bypasses `Mode::calculateSymmetryFunctionGroups()` and populates
+  `Atom::G` directly instead (with synthetic values — since
+  `calculateAtomicNeuralNetworks()` only reads `Atom::G` and writes
+  `Atom::energy`/`dEdG`, confirmed by reading its source, synthetic input
+  is exactly as valid a test of *this* call site as real symmetry-function
+  output would be). Fixing the `SymGrpExpRad` crash is out of scope for
+  this GPU port and hasn't been attempted — worth its own investigation
+  separately, since it currently means `nnp-predict` cannot complete a
+  normal run on this dataset on this branch at all, independent of any GPU
+  work.
+
+Next steps (not yet done): wire in symmetry functions and forces/Kalman for
+a real end-to-end GPU training step (this pass deliberately stopped at one
+call site); investigate the pre-existing `SymGrpExpRad` crash blocking a
+full `nnp-predict` run; extend `GPU=1` to `nnp-train`'s training loop
+itself, not just `APP_CORE`'s prediction-only binaries.

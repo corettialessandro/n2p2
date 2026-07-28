@@ -19,6 +19,11 @@ COMP=gnu
 # Possible modes are "static", "shared" and "test".
 MODE=static
 
+# GPU acceleration (src/libnnpgpu), off by default -- set GPU=1 on the make
+# command line to enable (currently wired into nnp-predict only -- see
+# GPU_PORTING_PLAN.md's Phase 6).
+GPU=
+
 # Include global (project-wide) settings.
 include $(PROJECT_DIR)/src/makefile.$(COMP)
 
@@ -83,6 +88,16 @@ ifeq ($(MODE), shared)
 $(APP_CORE): LDFLAGS=-L$(PROJECT_LIB) -lnnp
 else
 $(APP_CORE): LDFLAGS=$(PROJECT_LIB)/libnnp.a
+endif
+# GPU acceleration (src/libnnpgpu): applies to any APP_CORE binary, since
+# they all go through the same Mode::calculateAtomicNeuralNetworks() this
+# is wired into -- so far only nnp-predict has actually been run and
+# validated with GPU=1 (see GPU_PORTING_PLAN.md's Phase 6), the mechanism
+# itself is not nnp-predict-specific.
+ifeq ($(GPU), 1)
+$(APP_CORE): OPTIONS+= -DN2P2_GPU
+$(APP_CORE): INCLUDES+= -I$(PROJECT_DIR)/src/libnnpgpu
+$(APP_CORE): LDFLAGS+= $(PROJECT_LIB)/libnnpgpu.a $(PROJECT_LDFLAGS_GPU)
 endif
 $(APP_CORE):
 	$(CC) $(CFLAGS) $(DEBUG) $(INCLUDES) $(OPTIONS) -o $@.o -c $@.cpp

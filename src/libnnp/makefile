@@ -19,6 +19,11 @@ COMP=gnu
 # Possible modes are "static", "shared" and "test".
 MODE=static
 
+# GPU acceleration (src/libnnpgpu), off by default -- set GPU=1 on the make
+# command line (or via the master makefile) to enable. See
+# GPU_PORTING_PLAN.md's Phase 6 and src/libnnpgpu/makefile.
+GPU=
+
 # Include global (project-wide) settings.
 include $(PROJECT_DIR)/src/makefile.$(COMP)
 
@@ -46,6 +51,14 @@ ARFLAGS=$(PROJECT_ARFLAGS)
 
 # Extra include paths for compiling.
 INCLUDES=-I./ -I$(PROJECT_EIGEN)
+
+# GPU acceleration: Mode.cpp's #ifdef N2P2_GPU branch needs both the define
+# and to find GpuNeuralNetwork.h (src/libnnpgpu is not otherwise on the
+# include path since it's a separate, nvcc-built library).
+ifeq ($(GPU), 1)
+OPTIONS+= -DN2P2_GPU
+INCLUDES+= -I$(PROJECT_DIR)/src/libnnpgpu
+endif
 
 
 ###############################################################################

@@ -144,6 +144,30 @@ int NeuralNetwork::getNumBiases() const
     return numBiases;
 }
 
+int NeuralNetwork::getNumLayers() const
+{
+    return numLayers;
+}
+
+int NeuralNetwork::getNumNeuronsInLayer(int layer) const
+{
+    return layers[layer].numNeurons;
+}
+
+bool NeuralNetwork::hasGpuCompatibleArchitecture(int maxHiddenLayerSize) const
+{
+    if (numLayers != 4) return false;
+    if (normalizeNeurons) return false;
+    if (layers[1].activationFunction != AF_TANH) return false;
+    if (layers[2].activationFunction != AF_TANH) return false;
+    if (layers[3].activationFunction != AF_IDENTITY) return false;
+    if (layers[3].numNeurons != 1) return false;
+    if (layers[1].numNeurons > maxHiddenLayerSize) return false;
+    if (layers[2].numNeurons > maxHiddenLayerSize) return false;
+
+    return true;
+}
+
 void NeuralNetwork::setConnections(double const* const& connections)
 {
     int count = 0;

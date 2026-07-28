@@ -21,6 +21,11 @@ COMP=gnu
 # used instead.
 MODE=static
 
+# GPU acceleration (src/libnnpgpu), off by default -- set GPU=1 on the make
+# command line to enable (see GPU_PORTING_PLAN.md's Phase 6). A plain
+# `make` build is completely unaffected either way.
+GPU=
+
 # Installation directory for binaries.
 INSTALL_BIN=$(HOME)/local/bin
 
@@ -66,6 +71,7 @@ MAKEFLAGS:=$(MAKEFLAGS_ORIGINAL)
 	doc-sphinx \
 	doc-doxygen \
 	libnnp \
+	libnnpgpu \
 	libnnptrain \
 	libnnpif \
 	lammps-hdnnp \
@@ -75,6 +81,7 @@ MAKEFLAGS:=$(MAKEFLAGS_ORIGINAL)
 	clean-doc-doxygen \
 	clean-no-doc \
 	clean-libnnp \
+	clean-libnnpgpu \
 	clean-libnnptrain \
 	clean-libnnpif \
 	clean-lammps-hdnnp \
@@ -86,8 +93,12 @@ all: libnnp \
      libnnptrain \
      libnnpif \
      all-app
+ifeq ($(GPU), 1)
+all: libnnpgpu
+endif
 
 clean: clean-libnnp \
+       clean-libnnpgpu \
        clean-libnnptrain \
        clean-libnnpif \
        clean-app \
@@ -121,10 +132,19 @@ clean-doc-doxygen:
 # libnnp #
 ##########
 libnnp:
-	cd libnnp && $(MAKE) COMP=$(COMP) MODE=$(MODE)
+	cd libnnp && $(MAKE) COMP=$(COMP) MODE=$(MODE) GPU=$(GPU)
 
 clean-libnnp:
 	cd libnnp && $(MAKE) clean
+
+#############
+# libnnpgpu #
+#############
+libnnpgpu:
+	cd libnnpgpu && $(MAKE) COMP=$(COMP) MODE=$(MODE) GPU=$(GPU)
+
+clean-libnnpgpu:
+	cd libnnpgpu && $(MAKE) clean
 
 ###############
 # libnnptrain #
@@ -151,14 +171,20 @@ clean-libnnpif:
 ####################
 # All at once (parallel).
 all-app: libnnptrain
-	cd application && $(MAKE) COMP=$(COMP) MODE=$(MODE)
+ifeq ($(GPU), 1)
+all-app: libnnpgpu
+endif
+	cd application && $(MAKE) COMP=$(COMP) MODE=$(MODE) GPU=$(GPU)
 
 clean-app:
 	cd application && $(MAKE) clean
 
 # Individual applications.
 $(APP_LIBNNP): libnnp
-	cd application && $(MAKE) $@ COMP=$(COMP) MODE=$(MODE)
+ifeq ($(GPU), 1)
+$(APP_LIBNNP): libnnpgpu
+endif
+	cd application && $(MAKE) $@ COMP=$(COMP) MODE=$(MODE) GPU=$(GPU)
 
 $(APP_LIBNNPTRAIN): libnnptrain
 	cd application && $(MAKE) $@ COMP=$(COMP) MODE=$(MODE)

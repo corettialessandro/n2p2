@@ -18,6 +18,9 @@
 #include "NeuralNetwork.h"
 #include "utility.h"
 #include "version.h"
+#ifdef N2P2_GPU
+#include "GpuNeuralNetwork.h"
+#endif
 #include <cmath>
 #ifdef _OPENMP
 #include <omp.h>
@@ -1671,6 +1674,80 @@ void Mode::calculateAtomicNeuralNetworks(Structure& structure,
 
     if (nnpType == NNPType::HDNNP_2G)
     {
+#ifdef N2P2_GPU
+        // Phase 6 (GPU_PORTING_PLAN.md): batch this element-by-element on
+        // the GPU via src/libnnpgpu, replacing the one-atom-at-a-time CPU
+        // loop below -- see gpu/gemm/nn_forward_gemm_test.cu (25.6x/27.9x
+        // measured speedup there) and src/libnnpgpu/GpuNeuralNetwork.cu
+        // (the same math, generalized to whatever hidden-layer sizes this
+        // dataset's input.nn actually configures). Falls back to the exact
+        // CPU loop below, atom by atom, if ANY element's network doesn't
+        // match the fixed architecture (two tanh hidden layers, single
+        // identity output neuron) src/libnnpgpu was hand-specialized for --
+        // see NeuralNetwork::hasGpuCompatibleArchitecture()'s doc comment
+        // for why that's a real run-time possibility, not a formality.
+        bool allElementsGpuCompatible = true;
+        for (size_t e = 0; e < elements.size(); ++e)
+        {
+            if (!elements.at(e).neuralNetworks.at(id)
+                    .hasGpuCompatibleArchitecture())
+            {
+                allElementsGpuCompatible = false;
+                break;
+            }
+        }
+
+        if (allElementsGpuCompatible)
+        {
+            vector<vector<size_t>> atomsByElement(elements.size());
+            for (size_t i = 0; i < structure.atoms.size(); ++i)
+            {
+                atomsByElement.at(structure.atoms.at(i).element).push_back(i);
+            }
+
+            for (size_t e = 0; e < elements.size(); ++e)
+            {
+                vector<size_t> const& atomIndices = atomsByElement.at(e);
+                if (atomIndices.empty()) continue;
+
+                NeuralNetwork& nn = elements.at(e).neuralNetworks.at(id);
+                int const numAtoms = (int)atomIndices.size();
+                int const numIn = nn.getNumNeuronsInLayer(0);
+                int const numHidden1 = nn.getNumNeuronsInLayer(1);
+                int const numHidden2 = nn.getNumNeuronsInLayer(2);
+
+                vector<double> connections(nn.getNumConnections());
+                nn.getConnections(connections.data());
+
+                vector<double> G((size_t)numAtoms * numIn);
+                for (int t = 0; t < numAtoms; ++t)
+                {
+                    Atom const& a = structure.atoms.at(atomIndices.at(t));
+                    copy(a.G.begin(), a.G.end(), G.begin() + (size_t)t * numIn);
+                }
+
+                vector<double> energyOut(numAtoms);
+                vector<double> dEdGOut((size_t)numAtoms * numIn);
+                gpuNnForwardDEdG(numAtoms, numIn, numHidden1, numHidden2,
+                                 connections.data(), G.data(),
+                                 energyOut.data(), dEdGOut.data());
+
+                for (int t = 0; t < numAtoms; ++t)
+                {
+                    Atom& a = structure.atoms.at(atomIndices.at(t));
+                    a.energy = energyOut.at(t);
+                    if (derivatives)
+                    {
+                        copy(dEdGOut.begin() + (size_t)t * numIn,
+                             dEdGOut.begin() + (size_t)(t + 1) * numIn,
+                             a.dEdG.begin());
+                    }
+                }
+            }
+
+            return;
+        }
+#endif
         for (vector<Atom>::iterator it = structure.atoms.begin();
              it != structure.atoms.end(); ++it)
         {
