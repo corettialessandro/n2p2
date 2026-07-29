@@ -187,7 +187,10 @@ endif
 	cd application && $(MAKE) $@ COMP=$(COMP) MODE=$(MODE) GPU=$(GPU)
 
 $(APP_LIBNNPTRAIN): libnnptrain
-	cd application && $(MAKE) $@ COMP=$(COMP) MODE=$(MODE)
+ifeq ($(GPU), 1)
+$(APP_LIBNNPTRAIN): libnnpgpu
+endif
+	cd application && $(MAKE) $@ COMP=$(COMP) MODE=$(MODE) GPU=$(GPU)
 
 $(CLEAN_APP):
 	cd application && $(MAKE) $@

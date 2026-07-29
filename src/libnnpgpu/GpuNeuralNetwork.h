@@ -43,6 +43,34 @@ void gpuNnForwardDEdG(int numAtoms, int numIn, int numHidden1, int numHidden2,
                       double const* connections,
                       double const* G, double* energyOut, double* dEdGOut);
 
+/** Batched cuBLAS forward pass + calculateDEdc for every atom of ONE
+ *  element at once, SUMMED across atoms (the energy-weight Jacobian
+ *  contribution Training::update()'s "energy" branch needs: one Jacobian
+ *  row per structure, accumulated atom-by-atom on the CPU side via
+ *  NeuralNetwork::calculateDEdc()). Ported from
+ *  gpu/gemm/nn_dedc_gemm_test.cu's per-atom batching, but the atom-axis
+ *  reduction is folded directly into two extra GEMMs (contracting the atom
+ *  dimension) instead of materializing a per-atom dEdc array and summing on
+ *  the host -- cheaper here since the caller only ever wants the sum.
+ *  Same architecture restriction as gpuNnForwardDEdG(): callers MUST check
+ *  hasGpuCompatibleArchitecture() first.
+ *
+ * @param[in]  numAtoms Number of atoms (all of the same element).
+ * @param[in]  numIn Number of symmetry functions / input neurons.
+ * @param[in]  numHidden1 Size of the first hidden layer.
+ * @param[in]  numHidden2 Size of the second hidden layer.
+ * @param[in]  connections Flat connections array, same order as
+ *             NeuralNetwork::getConnections() ([W1,b1,W2,b2,W3,b3]).
+ * @param[in]  G Symmetry function values, (numAtoms x numIn) row-major.
+ * @param[out] energyOut Atomic energies, length numAtoms.
+ * @param[out] dEdcSumOut Sum over all numAtoms atoms of calculateDEdc()'s
+ *             per-atom output, same flat [W1,b1,W2,b2,W3,b3] layout and
+ *             length as NeuralNetwork::getNumConnections().
+ */
+void gpuNnEnergyDEdcSum(int numAtoms, int numIn, int numHidden1, int numHidden2,
+                        double const* connections,
+                        double const* G, double* energyOut, double* dEdcSumOut);
+
 }
 
 #endif

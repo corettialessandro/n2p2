@@ -20,8 +20,9 @@ COMP=gnu
 MODE=static
 
 # GPU acceleration (src/libnnpgpu), off by default -- set GPU=1 on the make
-# command line to enable (currently wired into nnp-predict only -- see
-# GPU_PORTING_PLAN.md's Phase 6).
+# command line to enable (currently wired into nnp-predict via
+# Mode::calculateAtomicNeuralNetworks(), and nnp-train's HDNNP_2G energy
+# Jacobian via Training::update() -- see GPU_PORTING_PLAN.md's Phase 6).
 GPU=
 
 # Include global (project-wide) settings.
@@ -121,6 +122,14 @@ $(APP_DATASET): LDFLAGS=-L$(PROJECT_LIB) -lnnptrain -lnnp -lgsl $(PROJECT_LDFLAG
 else
 $(APP_DATASET): LDFLAGS=$(PROJECT_LIB)/libnnptrain.a $(PROJECT_LIB)/libnnp.a -lgsl $(PROJECT_LDFLAGS_BLAS)
 endif
+# GPU acceleration (src/libnnpgpu): these applications go through
+# Mode::calculateAtomicNeuralNetworks() too (via Dataset), same GOTCHA as
+# APP_CORE above applies -- rebuild libnnp before switching GPU= values.
+ifeq ($(GPU), 1)
+$(APP_DATASET): OPTIONS+= -DN2P2_GPU
+$(APP_DATASET): INCLUDES+= -I$(PROJECT_DIR)/src/libnnpgpu
+$(APP_DATASET): LDFLAGS+= $(PROJECT_LIB)/libnnpgpu.a $(PROJECT_LDFLAGS_GPU)
+endif
 $(APP_DATASET):
 	$(MPICC) $(CFLAGS) $(DEBUG) $(INCLUDES) $(OPTIONS) -o $@.o -c $@.cpp
 	$(MPICC) $(CFLAGS) $(DEBUG) $(OPTIONS) -o $@ $@.o $(LDFLAGS)
@@ -132,6 +141,15 @@ ifeq ($(MODE), shared)
 $(APP_TRAINING): LDFLAGS=-L$(PROJECT_LIB) -lnnptrain -lnnp -lgsl $(PROJECT_LDFLAGS_BLAS)
 else
 $(APP_TRAINING): LDFLAGS=$(PROJECT_LIB)/libnnptrain.a $(PROJECT_LIB)/libnnp.a -lgsl $(PROJECT_LDFLAGS_BLAS)
+endif
+# GPU acceleration (src/libnnpgpu): nnp-train's Training::update() energy
+# Jacobian branch (HDNNP_2G) calls gpuNnEnergyDEdcSum() the same way
+# Mode::calculateAtomicNeuralNetworks() calls gpuNnForwardDEdG() -- see
+# GPU_PORTING_PLAN.md's Phase 6 follow-up. Same GOTCHA as APP_CORE above.
+ifeq ($(GPU), 1)
+$(APP_TRAINING): OPTIONS+= -DN2P2_GPU
+$(APP_TRAINING): INCLUDES+= -I$(PROJECT_DIR)/src/libnnpgpu
+$(APP_TRAINING): LDFLAGS+= $(PROJECT_LIB)/libnnpgpu.a $(PROJECT_LDFLAGS_GPU)
 endif
 $(APP_TRAINING): nnp-train.cpp
 	$(MPICC) $(CFLAGS) $(DEBUG) $(INCLUDES) $(OPTIONS) -o $@.o -c $@.cpp

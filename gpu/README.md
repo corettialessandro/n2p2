@@ -806,9 +806,98 @@ and forces/Kalman (out of this pass's chosen scope).
   block; the fix when switching `GPU=` values is to rebuild `libnnp` first
   (`cd src/libnnp && make clean && make ... GPU=<value>`).
 
-Next steps (not yet done): wire in symmetry functions and forces/Kalman for
-a real end-to-end GPU training step (this pass deliberately stopped at one
-call site); extend `GPU=1` to `nnp-train`'s training loop itself, not just
-`APP_CORE`'s prediction-only binaries (and make `APP_TRAINING`/
-`APP_DATASET`'s link lines GPU-aware, closing the gotcha above properly
-instead of just documenting it).
+### Follow-up: `nnp-train`'s energy-Jacobian call site
+
+The natural second call site, chosen because it's the one place in
+`nnp-train` where the already-measured 8.5×/8.8× `calculateDEdc` speedup
+(`gemm/nn_dedc_gemm_test.cu`, above) would actually show up as real
+wall-clock time, unlike `nnp-predict`'s single-shot usage pattern.
+**What's wired in**: `Training::update()`'s `"energy"` Jacobian branch
+(`src/libnnptrain/Training.cpp`, the `if (k == "energy")` block), `HDNNP_2G`
+only — this loop runs once per selected update candidate (i.e. potentially
+many times per epoch, unlike `nnp-predict`'s one-shot call), accumulating
+each atom's `calculateDEdc()` output straight into the Kalman filter's
+Jacobian row for that structure's total energy.
+
+- **New library function, `gpuNnEnergyDEdcSum()`** (`src/libnnpgpu/
+  GpuNeuralNetwork.h/.cu`): batches the forward pass + `calculateDEdc()` for
+  every atom of one element, but returns the **sum over atoms**, not a
+  per-atom array — the only thing `Training::update()` ever does with
+  `calculateDEdc()`'s output is add it into one shared Jacobian row, so
+  there is no reason to materialize (or transfer off the GPU) a per-atom
+  result at all. This makes the atom-axis reduction cheaper here than in
+  `nn_dedc_gemm_test.cu`'s original per-atom design: instead of batched
+  rank-1 (`k=1`) `cublasDgemmStridedBatched` outer products followed by a
+  separate sum, the atom axis is directly the **contracted** dimension of
+  two GEMMs (`dE/dW1_sum = Gᵀ.v1s`, `dE/dW2_sum = H1ᵀ.v2`), computed via a
+  new `gemmRowMajorATransB()` helper (row-major-via-column-major trick,
+  `CUBLAS_OP_T` on the second cuBLAS operand instead of a materialized host
+  transpose). The four bias/output-layer sums (`dE/db1`, `dE/db2`, `dE/dW3`)
+  reuse the same helper with a device "ones" vector as the contracted
+  operand (i.e. the reduction is *also* just a GEMM, not a separate kernel);
+  `dE/db3`'s sum is the constant `numAtoms`, set directly on the host.
+- **Validated standalone**: `gpu/gemm/libnnpgpu_dedc_test.cu` (`run_libnnpgpu_
+  dedc.slurm`) checks `gpuNnEnergyDEdcSum()`'s energy and summed-`dEdc`
+  output against the real `NeuralNetwork::calculateDEdc()` summed by hand
+  over every atom, for both H2O_2G's real architecture (25/25 hidden,
+  H and O) and, again, the deliberately-different Anisole_SCAN-like 30/20
+  case — `max|E_gpu-E_cpu| ≤ 4.9E-15`, `max|dEdcSum_gpu-dEdcSum_cpu| ≤
+  2.4E-13` across all three, ALL PASS.
+- **Dispatch in `Training.cpp`**: mirrors `Mode.cpp`'s pattern exactly —
+  checks `hasGpuCompatibleArchitecture()` for every element, and only when
+  all pass, gathers `G` per element across every atom of the current
+  structure, calls `gpuNnEnergyDEdcSum()` once per element, scatters
+  `it->energy` back, and adds the returned sum directly into
+  `pu.jacobian`. Falls back to the untouched original per-atom
+  `calculateDEdc()` loop (now wrapped in `if (!doneOnGpu)`) for `HDNNP_4G`
+  (extra charge input neuron, electrostatics coupling — out of scope here)
+  or any GPU-incompatible architecture. `HDNNP_4G`/`HDNNP_Q`'s other
+  branches (`"force"`, `"charge"`) are untouched.
+- **A second, genuinely new build-system gotcha found and fixed** (distinct
+  from the `libnnp.a`-GPU-state-stickiness one above, which was only
+  *documented*, not fixed, until now): the master `src/makefile`'s
+  `$(APP_LIBNNPTRAIN)` rule (covers `nnp-train`, `nnp-checkdw`, and all of
+  `APP_DATASET`) depended only on `libnnp`/`libnnptrain` and never forwarded
+  `GPU=$(GPU)` or depended on `libnnpgpu` — unlike `$(APP_LIBNNP)`, which
+  already had both. Building `make GPU=1 nnp-train` from a clean tree
+  therefore compiled and linked `nnp-train.o` with `-DN2P2_GPU` (that part
+  *is* inherited automatically — GNU Make re-exports command-line variables
+  to sub-`make`s) but never actually built `lib/libnnpgpu.a` first, so the
+  link failed: `cannot find ../../lib/libnnpgpu.a`. Fixed by adding the same
+  conditional `libnnpgpu` prerequisite (and explicit `GPU=$(GPU)` forwarding)
+  to `$(APP_LIBNNPTRAIN)` that `$(APP_LIBNNP)` already had. Also closed the
+  previously-just-documented half of this gap: `src/application/makefile`'s
+  `$(APP_TRAINING)`/`$(APP_DATASET)` link rules now add `-DN2P2_GPU`, the
+  `libnnpgpu` include path, and `libnnpgpu.a`/`$(PROJECT_LDFLAGS_GPU)` when
+  `GPU=1`, exactly like `$(APP_CORE)` already did.
+- **The real end-to-end deliverable**: `gpu/e2e_train_check/run_nnp_train_
+  gpu_vs_cpu.slurm` builds the actual `nnp-train` binary twice (CPU-only,
+  then `GPU=1`, each via a full clean rebuild) and runs **one real training
+  epoch** (32 MPI ranks, the real, full H2O_2G production dataset and
+  `input.nn`, fixed `random_seed` so both runs start from identical
+  randomized initial weights and an identical train/test split) end to end
+  through the Kalman-filter updater. Result: `learning-curve.out` and the
+  post-epoch-1 `weights.001.000001.out`/`weights.008.000001.out` (H's 1576
+  and O's 1751 connections) match **exactly** — `0.000E+00` max abs
+  difference, bit-identical to all 17 printed significant digits — while
+  clearly differing from the epoch-0 (pre-update) weights, confirming a real
+  Kalman update happened and both code paths agree on it precisely, not just
+  approximately.
+- **Honest performance note**: this call site touches only the energy
+  Jacobian, which `temp/H2O_2G/timing.out` shows is a small fraction of
+  per-epoch time (`Etrain` ~1.8s vs `Ftrain` ~150s per epoch in that log) —
+  the force-Jacobian update (`calculateDFdc`, still CPU-only) dominates.
+  Wall-clock speedup for `nnp-train` as a whole is expected to be small
+  until forces/Kalman are also ported (see next steps); this pass's value
+  is the same as `nnp-predict`'s: a second real, validated call site
+  proving the pattern generalizes, not a training-speed claim.
+
+Next steps (not yet done): wire in forces/Kalman
+(`calculateDFdc`/`KalmanFilter::update()`, both already validated standalone
+in `gemm/nn_dfdc_gemm_test.cu` and `gemm/kalman_gemm_test.cu`) for a real
+end-to-end GPU training step where the dominant per-epoch cost actually
+moves to the GPU; extend the `HDNNP_2G`-only energy-Jacobian dispatch above
+to `HDNNP_4G` (needs the extra charge input neuron and electrostatics
+coupling handled); and only then would measuring actual `nnp-train`
+wall-clock speedup be a meaningful exercise rather than a foregone small
+number.

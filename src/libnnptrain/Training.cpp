@@ -19,6 +19,9 @@
 #include "GradientDescent.h"
 #include "KalmanFilter.h"
 #include "NeuralNetwork.h"
+#ifdef N2P2_GPU
+#include "GpuNeuralNetwork.h"
+#endif
 #include "utility.h"
 #include "mpi-extra.h"
 #ifdef _OPENMP
@@ -2567,32 +2570,126 @@ void Training::update(string const& property)
                    calculateAtomicNeuralNetworks(s, derivatives, "elec");
                    chargeEquilibration(s, derivatives);
                 }
-                // Loop over atoms and calculate atomic energy contributions.
-                for (vector<Atom>::iterator it = s.atoms.begin();
-                     it != s.atoms.end(); ++it)
-                {
-                    size_t i = it->element;
-                    NeuralNetwork& nn = elements.at(i).neuralNetworks.at(nnId);
 
-                    // TODO: This part should simplify with improved NN class.
-                    for (size_t j = 0; j < it->G.size(); ++j)
+                bool doneOnGpu = false;
+#ifdef N2P2_GPU
+                // Phase 6 follow-up (GPU_PORTING_PLAN.md): batch this
+                // element-by-element on the GPU via src/libnnpgpu,
+                // mirroring Mode::calculateAtomicNeuralNetworks()'s
+                // dispatch (see GpuNeuralNetwork.h's gpuNnEnergyDEdcSum(),
+                // validated in gpu/gemm/libnnpgpu_dedc_test.cu). Only
+                // HDNNP_2G is handled here -- HDNNP_4G's extra charge input
+                // neuron and electrostatics coupling are out of scope.
+                // Falls back to the exact CPU loop below, atom by atom, if
+                // any element's network doesn't match the fixed
+                // architecture src/libnnpgpu was specialized for -- see
+                // NeuralNetwork::hasGpuCompatibleArchitecture().
+                if (nnpType == NNPType::HDNNP_2G)
+                {
+                    bool allElementsGpuCompatible = true;
+                    for (size_t e = 0; e < numElements; ++e)
                     {
-                        nn.setInput(j, it->G.at(j));
+                        if (!elements.at(e).neuralNetworks.at(nnId)
+                                .hasGpuCompatibleArchitecture())
+                        {
+                            allElementsGpuCompatible = false;
+                            break;
+                        }
                     }
-                    if (nnpType == NNPType::HDNNP_4G)
-                        nn.setInput(it->G.size(), it->charge);
-                    nn.propagate();
-                    nn.getOutput(&(it->energy));
-                    // Compute derivative of output node with respect to all
-                    // neural network connections (weights + biases).
-                    nn.calculateDEdc(&(dXdc.at(i).front()));
-                    // Finally sum up Jacobian.
-                    if (updateStrategy == US_ELEMENT) iu = i;
-                    else iu = 0;
-                    for (size_t j = 0; j < dXdc.at(i).size(); ++j)
+
+                    if (allElementsGpuCompatible)
                     {
-                        pu.jacobian.at(iu).at(offset.at(i) + j) +=
-                            dXdc.at(i).at(j);
+                        vector<vector<size_t>> atomsByElement(numElements);
+                        for (size_t ia = 0; ia < s.atoms.size(); ++ia)
+                        {
+                            atomsByElement.at(s.atoms.at(ia).element)
+                                .push_back(ia);
+                        }
+
+                        for (size_t e = 0; e < numElements; ++e)
+                        {
+                            vector<size_t> const& atomIndices =
+                                atomsByElement.at(e);
+                            if (atomIndices.empty()) continue;
+
+                            NeuralNetwork& nn =
+                                elements.at(e).neuralNetworks.at(nnId);
+                            int const numAtoms = (int)atomIndices.size();
+                            int const numIn = nn.getNumNeuronsInLayer(0);
+                            int const numHidden1 = nn.getNumNeuronsInLayer(1);
+                            int const numHidden2 = nn.getNumNeuronsInLayer(2);
+
+                            vector<double> connections(nn.getNumConnections());
+                            nn.getConnections(connections.data());
+
+                            vector<double> G((size_t)numAtoms * numIn);
+                            for (int t = 0; t < numAtoms; ++t)
+                            {
+                                Atom const& a =
+                                    s.atoms.at(atomIndices.at(t));
+                                copy(a.G.begin(), a.G.end(),
+                                     G.begin() + (size_t)t * numIn);
+                            }
+
+                            vector<double> energyOut(numAtoms);
+                            gpuNnEnergyDEdcSum(numAtoms, numIn, numHidden1,
+                                               numHidden2, connections.data(),
+                                               G.data(), energyOut.data(),
+                                               dXdc.at(e).data());
+
+                            for (int t = 0; t < numAtoms; ++t)
+                            {
+                                s.atoms.at(atomIndices.at(t)).energy =
+                                    energyOut.at(t);
+                            }
+
+                            // Finally sum up Jacobian.
+                            if (updateStrategy == US_ELEMENT) iu = e;
+                            else iu = 0;
+                            for (size_t j = 0; j < dXdc.at(e).size(); ++j)
+                            {
+                                pu.jacobian.at(iu).at(offset.at(e) + j) +=
+                                    dXdc.at(e).at(j);
+                            }
+                        }
+
+                        doneOnGpu = true;
+                    }
+                }
+#endif
+                if (!doneOnGpu)
+                {
+                    // Loop over atoms and calculate atomic energy
+                    // contributions.
+                    for (vector<Atom>::iterator it = s.atoms.begin();
+                         it != s.atoms.end(); ++it)
+                    {
+                        size_t i = it->element;
+                        NeuralNetwork& nn =
+                            elements.at(i).neuralNetworks.at(nnId);
+
+                        // TODO: This part should simplify with improved
+                        // NN class.
+                        for (size_t j = 0; j < it->G.size(); ++j)
+                        {
+                            nn.setInput(j, it->G.at(j));
+                        }
+                        if (nnpType == NNPType::HDNNP_4G)
+                            nn.setInput(it->G.size(), it->charge);
+                        nn.propagate();
+                        nn.getOutput(&(it->energy));
+                        // Compute derivative of output node with respect
+                        // to all neural network connections (weights +
+                        // biases).
+                        nn.calculateDEdc(&(dXdc.at(i).front()));
+                        // Finally sum up Jacobian.
+                        if (updateStrategy == US_ELEMENT) iu = i;
+                        else iu = 0;
+                        for (size_t j = 0; j < dXdc.at(i).size(); ++j)
+                        {
+                            pu.jacobian.at(iu).at(offset.at(i) + j) +=
+                                dXdc.at(i).at(j);
+                        }
                     }
                 }
             }
