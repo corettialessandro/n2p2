@@ -1059,37 +1059,94 @@ production data** — the most important lesson from this whole call site:
   `12.14s` (CPU) to `0.39s` (GPU), a genuine `~31×`. But the *energy*-branch
   update column, `E_upd`, got **slower** (`1.58s → 5.37s`), and — more
   importantly — `F_com` (MPI communication time for the force branch)
-  ballooned from `2.96s` to `50.45s`, and the **overall epoch got slower
-  overall** (`156.0s → 211.2s`, about `1.35×` slower), even though the
-  piece of code this pass actually touched got dramatically faster in
-  isolation. The likely explanation: this cluster's job allocates a
-  **single physical GPU shared by all 32 MPI ranks** (`--gres=gpu:1`,
-  `--ntasks-per-node=32`, no MPS configured) — each rank runs the *exact
-  same* redundant Kalman computation (by design: every rank
-  independently recomputes the identical update from identical
-  `MPI_Allgatherv`'d data, avoiding a separate broadcast step), so 32
-  separate CUDA contexts now contend for one device far more often per
-  epoch than either Jacobian call site did. `MPI_Allgatherv`'s wall time
-  is set by whichever rank is slowest to arrive, so uneven GPU-context
-  scheduling delays across ranks plausibly show up as inflated
-  "communication" time even though the actual payload didn't change. This
-  is a single epoch's measurement, not a scientifically thorough timing
-  study, but the direction is clear enough not to overclaim: correctness
-  is solid, but realizing this call site's speedup as a net `nnp-train`
-  win likely needs a different execution model (e.g. only rank 0
-  computing the update and broadcasting `w`, instead of 32-way redundant
-  GPU computation) rather than more of what worked for the embarrassingly
-  parallel Jacobian branches.
+  ballooned from `2.96s` to `50.45s`, and the **overall epoch got slower**
+  (`156.0s → 211.2s`, about `1.35×` slower), even though the piece of code
+  this pass actually touched got dramatically faster in isolation.
 
-Next steps (not yet done): investigate the MPI/GPU-contention effect above
-properly (multi-epoch timing to separate one-time CUDA context setup from
-a recurring per-call cost; consider a rank-0-computes-and-broadcasts
-redesign for the Kalman step specifically, since redundant 32-way
-computation is what turns "32 processes, 1 GPU" from a non-issue into a
-bottleneck at this call site's calling frequency); extend all three
-dispatches above from `HDNNP_2G` to `HDNNP_4G` (needs the extra charge
-input neuron and electrostatics coupling handled); and, now that all three
-of Phase 4's profiled cost centers are wired into the real binary, a
-proper multi-epoch wall-clock benchmark of `nnp-train` as a whole would
-be a meaningful exercise — though per the finding above, the answer isn't
-a foregone "faster" until the GPU-contention question is resolved.
+### Follow-up: `PM_TRAIN_RK0` was silently running the update on every rank
+
+Investigating the finding above turned up a real, pre-existing bug (not
+something this port introduced, but one it made *costly* for the first
+time): `temp/H2O_2G/input.nn` sets `parallel_mode 0` (`PM_TRAIN_RK0`),
+whose class-level documentation
+(`Training.h`'s `ParallelMode` enum) reads *"Weight update is carried out
+on rank 0 and new weights are redistributed to all tasks."* But
+`Training::update()`'s actual weight-update loop called
+`updaters.at(i)->update()` **unconditionally on every rank**, with no
+`myRank == 0` guard at all. Under `PM_TRAIN_RK0`, the preceding
+`MPI_Gather`/`MPI_Reduce` calls only deliver the fully-assembled
+error/Jacobian to rank 0 — every other rank's `update()` call runs on its
+own incomplete, stale local data — and the resulting weights are
+unconditionally overwritten by the `MPI_Bcast` immediately after, while
+`status()`/log output is rank-0-only too. So every non-zero rank's
+`update()` call was **pure wasted work, computed and immediately
+discarded, every single time**, on both `GradientDescent` and
+`KalmanFilter`. Cheap enough on CPU (a small dense linear-algebra call)
+not to matter or be noticed; once `KalmanFilter::update()` started
+dispatching to the GPU, "cheap and wasted" became "32 concurrent,
+wasted CUDA calls against one shared device," which is exactly the kind
+of contention the finding above was pointing at.
+
+**Fixed** by guarding the whole `updaters.at(i)->update()` loop (and its
+`setError`/`setJacobian`/`setSizeObservation` calls) with
+`if (myRank == 0 || parallelMode == PM_TRAIN_ALL)` in `Training.cpp` —
+making the code actually implement what `PM_TRAIN_RK0` already claimed.
+Verified safe by confirming neither updater's `update()` contains any
+MPI collective (so skipping it on non-zero ranks can't deadlock) and that
+no other code path reads a non-rank-0 updater's internal state (`P`,
+`eta`, `q`, Adam's `m`/`v`) — only rank 0's `status()`/log output is ever
+written. Re-running the full CPU-vs-GPU comparison after this fix
+reproduced the **exact same** `1.253E-03` learning-curve/weights diff as
+before (confirming the eliminated work was truly inconsequential to the
+result), and measurably helped the two things it targeted: `F_com`
+dropped from `50.45s` to `19.44s` (`2.6×` better, though still `5.4×`
+worse than CPU's `3.58s`) and `E_upd` flipped from *slower-than-CPU*
+(`5.37s`) to faster (`0.05s`, since the few energy-branch calls no longer
+pay 32-way redundant overhead).
+
+**But the overall epoch barely moved** (`211.2s → 212.8s` — within
+run-to-run noise). Breaking down every `timing.out` column's GPU-minus-CPU
+delta for this run ranks the actual contributors by absolute impact:
+
+| column | CPU | GPU | Δ |
+|---|---|---|---|
+| `F_err` (the force-Jacobian dispatch itself) | `137.4s` | `183.5s` | **`+46.1s`** |
+| `F_com` | `3.58s` | `19.44s` | `+15.9s` |
+| `E_err` (energy-Jacobian dispatch) | `0.24s` | `5.41s` | `+5.2s` |
+| `F_upd` (this fix's target) | `12.31s` | `0.39s` | `-11.9s` |
+| `E_upd` (this fix's target) | `1.60s` | `0.05s` | `-1.6s` |
+
+`F_err`/`E_err` are where `gpuNnForceDFdcSum()`/`gpuNnEnergyDEdcSum()`
+actually run — the two Jacobian call sites validated for *correctness*
+earlier in this port, but never benchmarked at full 32-rank concurrency
+until now. They're the **dominant** remaining cost, and unlike the Kalman
+update, this work is **not redundant** — every rank genuinely needs its
+own local structure's Jacobian, so there's no rank-0-and-broadcast trick
+available here. The most likely explanation is the same underlying
+mechanism as the Kalman finding (32 MPI ranks issuing frequent CUDA calls
+against one physical GPU with no MPS configured contend for the device
+regardless of whether the work is redundant or not), just without an
+easy fix, since the parallel work itself is real and necessary.
+
+**Bottom line**: the `PM_TRAIN_RK0` fix is a genuine, low-risk correctness
+improvement (matches documented behavior, verified safe, measurably helps
+what it targets) and is kept regardless of the net epoch-time outcome.
+But it revealed that this cluster's "32 ranks, 1 shared GPU, no MPS"
+resource allocation is the more fundamental bottleneck for this
+workload's calling pattern (many small, frequent GPU calls from many
+concurrent processes) — realizing a net `nnp-train` speedup from any of
+these three call sites likely needs either NVIDIA MPS enabled for the
+job, or far fewer, larger GPU calls (e.g. batching multiple ranks' work
+through one process), rather than further changes to the call sites
+themselves. This is still a single epoch's measurement on a shared
+cluster, not a controlled multi-run study — the exact multipliers should
+be taken as directional, not definitive.
+
+Next steps (not yet done): investigate whether NVIDIA MPS is available on
+this cluster and whether enabling it closes the `F_err`/`F_com`
+contention gap; extend all three dispatches above from `HDNNP_2G` to
+`HDNNP_4G` (needs the extra charge input neuron and electrostatics
+coupling handled); and only revisit a full multi-epoch `nnp-train`
+wall-clock benchmark once the contention question above is actually
+resolved, rather than measuring a foregone "faster" that this session's
+data doesn't yet support.

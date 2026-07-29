@@ -3193,19 +3193,38 @@ void Training::update(string const& property)
 #ifdef _OPENMP
     omp_set_num_threads(num_threads);
 #endif
-    // Loop over all updaters.
-    for (size_t i = 0; i < updaters.size(); ++i)
+    // Loop over all updaters. Under PM_TRAIN_RK0, only rank 0's result is
+    // ever used: the MPI_Gather*/MPI_Reduce calls above only deliver the
+    // fully-assembled error/Jacobian to rank 0 (every other rank's
+    // pu.error/pu.jacobian still just holds its own, incomplete local
+    // contribution), and the weights this call produces are immediately
+    // overwritten by the MPI_Bcast below, while status()/log output
+    // (Training::writeUpdaterStatus() and friends) is rank-0-only too --
+    // so every other rank calling update() here is pure wasted work on
+    // incomplete data, discarded either way. That was cheap enough on
+    // CPU not to matter, but once KalmanFilter::update() started
+    // dispatching to the GPU it became a real bottleneck: 32 MPI ranks
+    // all issuing redundant, immediately-discarded CUDA calls against a
+    // single shared physical GPU, which measurably inflated MPI
+    // communication wait times elsewhere in the loop (see gpu/README.md).
+    // This also matches PM_TRAIN_RK0's own class-level documentation
+    // ("Weight update is carried out on rank 0"), which the code
+    // previously didn't actually implement for this call.
+    if (myRank == 0 || parallelMode == PM_TRAIN_ALL)
     {
-        updaters.at(i)->setError(&(pu.error.at(i).front()),
-                                 pu.error.at(i).size());
-        updaters.at(i)->setJacobian(&(pu.jacobian.at(i).front()),
-                                    pu.error.at(i).size());
-        if (updaterType == UT_KF)
+        for (size_t i = 0; i < updaters.size(); ++i)
         {
-            KalmanFilter* kf = dynamic_cast<KalmanFilter*>(updaters.at(i));
-            kf->setSizeObservation(pu.error.at(i).size());
+            updaters.at(i)->setError(&(pu.error.at(i).front()),
+                                     pu.error.at(i).size());
+            updaters.at(i)->setJacobian(&(pu.jacobian.at(i).front()),
+                                        pu.error.at(i).size());
+            if (updaterType == UT_KF)
+            {
+                KalmanFilter* kf = dynamic_cast<KalmanFilter*>(updaters.at(i));
+                kf->setSizeObservation(pu.error.at(i).size());
+            }
+            updaters.at(i)->update();
         }
-        updaters.at(i)->update();
     }
     countUpdates++;
 
