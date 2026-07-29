@@ -1262,3 +1262,74 @@ going, rather than guessing a third time; if launch count is confirmed as
 the driver, consider restructuring the `k0` loop to batch multiple
 inputs' worth of work into fewer, larger launches instead of one
 GEMM/kernel set per input.
+
+### Follow-up: profiled a single `gpuNnForceDFdcSum()` call -- launch count in isolation is not the bottleneck; multi-rank GPU sharing is the prime suspect now
+
+Built a minimal, targeted harness (`gpu/gemm/profile_dfdc.cu`,
+`gpu/gemm/run_profile_dfdc.slurm`) instead of guessing a third time:
+construct H2O_2G's real "H" architecture (35 inputs, 25/25 hidden),
+call `gpuNnForceDFdcSum()` with a representative 420-atom input five
+times to warm up the persistent per-architecture state (weight buffers,
+capacity growth, cuBLAS handle, driver JIT), then bracket exactly ONE
+further steady-state call with `cudaProfilerStart()`/`cudaProfilerStop()`
+so `nsys profile --capture-range=cudaProfilerApi` and
+`ncu --profile-from-start off` capture only that one call, on an
+otherwise idle GPU (single process, `--ntasks-per-node=1`, no MPS, no
+other rank sharing the device).
+
+**Measured, in isolation:**
+
+| Metric | Value |
+| --- | --- |
+| Kernel launches in the one call | `817` |
+| Total GPU kernel execution time (`nsys cuda_gpu_kern_sum`, all 817 launches summed) | `~3.12ms` |
+| Wall-clock span, first kernel start to last kernel end (queried directly from the `.sqlite` export's `CUPTI_ACTIVITY_KIND_KERNEL` table) | `~4.59ms` |
+| Host-side `cudaLaunchKernel` dispatch overhead (`nsys cuda_api_sum`, 817 calls) | `~2.41ms` total, `~2.9us`/call avg |
+| Individual kernel durations (`ncu --print-summary per-kernel`) | `~2.1-2.2us` (elementwise/scale kernels) up to `~6.4-11.1us` (cutlass GEMM kernels); nothing anomalous for their problem sizes |
+| One large `cudaMemset` (zeroing an accumulator/scratch buffer) | `~355us` |
+| `cudaMemcpy` (12 calls, H2D+D2H) | `~210us` total |
+
+Every one of these numbers is small and clean. The kernels are legitimately
+tiny, dispatch overhead is normal, and the whole call -- ~800 launches and
+all -- completes end-to-end in **about 4.6ms** when nothing else is
+competing for the GPU.
+
+**This changes the diagnosis.** `~4.6ms`/call in isolation is roughly
+20-40x smaller than the `~150-185ms`/call that `F_err`'s real, measured
+total (`104.4s`-`108.9s` over an epoch's worth of update candidates)
+implies in the actual 32-rank MPS run. The earlier "launch-count/cuBLAS
+overhead" hypothesis predicted that ~800 launches would be
+*intrinsically* costly -- that's now directly measured and ruled out: in
+isolation they are cheap. What's left is the one variable this harness
+deliberately removed: **32 concurrent MPI ranks sharing one physical GPU
+through MPS**, each independently issuing its own ~800 tiny back-to-back
+launches at the same time, every training step. MPS lets those ranks'
+kernels execute concurrently instead of time-slicing whole contexts (that
+was the earlier, already-confirmed win -- see the MPS section above), but
+each rank's hundreds of launches still has to pass through the MPS
+server's shared submission path; with 32 ranks doing that simultaneously,
+aggregate launch volume (up to ~26,000 near-simultaneous tiny launches
+per training step, cluster-wide) plausibly creates queueing/dispatch
+contention at the GPU that a single isolated process structurally cannot
+reproduce.
+
+**What's confirmed vs. still a hypothesis, explicitly:**
+- CONFIRMED (directly measured): one isolated call's launch count (817),
+  its total kernel time (~3.1ms), its wall-clock span (~4.6ms), and that
+  none of its individual kernels or launches are anomalously slow.
+- NOT YET CONFIRMED: that 32-way MPS contention specifically (rather than
+  something else) is what inflates this to `~150-185ms`/call in the real
+  run. Confirming that requires profiling the actual multi-rank job under
+  load -- e.g. `nsys`/`ncu` attached to one representative rank while the
+  other 31 are simultaneously running against the same MPS-shared GPU --
+  which is a meaningfully harder profiling setup than this isolated
+  harness and was not attempted here.
+
+Next steps (not yet done): profile one rank of the real 32-rank MPS job
+(not an isolated single-process harness) to directly confirm or rule out
+multi-rank contention as the cause of the `~150-185ms`/call figure. If
+confirmed, the fix is a different shape of problem than "make the kernels
+faster" -- it becomes about *how many concurrent launch-heavy processes
+share one GPU* (e.g. fewer MPI ranks per GPU, or consolidating multiple
+ranks' Jacobian work behind one process/queue), not about the kernels
+themselves, which this profiling run shows are already fast.
