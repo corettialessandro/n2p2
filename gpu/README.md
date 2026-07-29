@@ -1333,3 +1333,95 @@ faster" -- it becomes about *how many concurrent launch-heavy processes
 share one GPU* (e.g. fewer MPI ranks per GPU, or consolidating multiple
 ranks' Jacobian work behind one process/queue), not about the kernels
 themselves, which this profiling run shows are already fast.
+
+### Follow-up: profiled rank 0 of the REAL 32-rank MPS run -- contention confirmed, and it's blocking/sync stalls, not slower kernels
+
+Ran the actual training job (32 MPI ranks, MPS enabled, real `H2O_2G`
+data, 1 epoch) exactly as in the MPS section above, but with `nsys`
+tracing rank 0 only (`gpu/e2e_train_check/profile_rank0_wrapper.sh` +
+`run_nnp_train_gpu_mps_profile.slurm`). `nsys` does a single-pass trace,
+not `ncu`'s multi-pass kernel replay, so it doesn't re-execute or reorder
+kernels and can't desync rank 0 from the other 31 at an MPI collective --
+it only adds recording overhead to rank 0's own calls. The run completed
+normally (energy/force RMSEs matched the expected order of magnitude,
+no hang, no crash), confirming this is safe to do.
+
+This epoch's `timing.out`: `F_err = 107.9s` over `F_count = 275` force
+updates on rank 0 -- an average of **`~392ms` per update**, close to
+(actually somewhat worse than) the earlier `~150-185ms` back-of-envelope
+guess.
+
+**Individual kernels and launch dispatch are essentially unchanged from
+the isolated baseline** (`nsys cuda_gpu_kern_sum` on rank 0's whole-epoch
+trace):
+
+| Kernel | Isolated (1 call, no contention) | Real run (whole epoch, rank 0, med.) |
+| --- | --- | --- |
+| cutlass GEMM (`nt`) | `~9.5us` | `~9.0us` |
+| cutlass GEMM (`nn`) | `~6.4us` | `~6.8us` |
+| `gemvNSP_kernel` | `~4.8us` | `~4.0us` |
+| `splitKreduce_kernel` | `~3.7us` | `~3.2us` |
+| elementwise/scale kernels | `~2.1-2.2us` | `~2.6-2.8us` |
+| `cudaLaunchKernel` dispatch | `~2.9us` avg | `~3.7us` avg / `~3.2us` median |
+
+Same kernels, same problem sizes, same durations, give or take noise.
+**This directly rules out "kernels execute slower under contention" and
+"launch dispatch is slower under contention"** -- neither is true. Total
+GPU kernel execution time summed over rank 0's *entire* `131.5s` epoch
+(every kernel, every dispatch function, every Kalman update, all `514555`
+kernel launches) is only **`~2.26s`** -- `~1.7%` of the epoch. The GPU
+itself is doing almost no work, from rank 0's point of view, essentially
+the whole time.
+
+**What's actually eating the time is host-side blocking on the shared
+GPU** (`nsys cuda_api_sum`, rank 0, whole epoch):
+
+| Blocking API | Calls | Total time | Notable outliers |
+| --- | --- | --- | --- |
+| `cudaDeviceSynchronize` | `2498` | `17.45s` | median `30us`, max `44.6ms` |
+| `cudaFree` | `122` | `1.39s` | **one single call: `1.376s`** |
+| `cudaMemcpy` | `26902` | `1.08s` | max `9.4ms` |
+
+`cudaFree` and (for host-visible pointers) `cudaMemcpy` both carry an
+implicit device synchronization -- they block until all outstanding work
+on the device has drained. A single `cudaFree` call blocking for
+`1.376s`, or `cudaDeviceSynchronize` occasionally taking `44.6ms` when its
+own rank's queued work is `~4.6ms` worth of kernels in total, is the
+signature of a GPU whose queue is backed up by the other 31 ranks'
+concurrent submissions, not of this rank's own work being slow. In the
+isolated single-process baseline, `cudaDeviceSynchronize` was called
+exactly twice for `~293us` total; here it's called `2498` times for
+`17.45s` on a training run that never asks for that many syncs when run
+alone.
+
+**What's confirmed vs. still open, explicitly:**
+- CONFIRMED: `F_err`'s real per-update average (`~392ms`) is roughly
+  `85x` the isolated per-call cost (`~4.6ms`).
+- CONFIRMED: neither kernel execution time nor launch dispatch overhead
+  is elevated under real 32-rank contention -- both match the isolated
+  baseline closely.
+- CONFIRMED: rank 0 spends `~2.26s` of a `131.5s` epoch actually running
+  GPU kernels, and at least `~20s` blocked inside synchronizing CUDA API
+  calls (`cudaDeviceSynchronize`/`cudaFree`/`cudaMemcpy`) whose durations
+  have no counterpart in the isolated baseline -- direct evidence of
+  32-way GPU-sharing contention via MPS, not of anything being
+  computationally slower.
+- NOT YET EXPLAINED: the confirmed blocking-wait time (`~20s`) is a
+  meaningful chunk of `F_err`'s `107.9s` but doesn't account for all of
+  it. The remainder is most likely legitimate CPU-side work (symmetry
+  function / data-marshaling code around each GPU dispatch call, which
+  predates the GPU port and runs regardless) whose share simply looks
+  much larger now that the GPU part of each call is contention-dominated
+  rather than compute-dominated -- but this is not directly measured yet,
+  only inferred by elimination, and is flagged as such rather than
+  presented as confirmed.
+
+Next steps (not yet done): the earlier "batch launches into fewer, larger
+kernels" idea is now much less promising -- kernels aren't the problem,
+contention for the shared queue is. A more promising direction is
+reducing how many independent processes hammer one GPU's queue
+simultaneously (e.g. fewer MPI ranks per GPU with each rank handling a
+larger batch, or consolidating multiple ranks' Jacobian work behind one
+process). Finer-grained NVTX instrumentation of the CPU-only sections of
+`Training::update()`'s PART 2 loop would help confirm or rule out the
+"remaining time is legitimate CPU-side work" inference above.
