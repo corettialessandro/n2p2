@@ -2717,61 +2717,177 @@ void Training::update(string const& property)
                                     elements);
                 }
 
-                // Loop over atoms and calculate atomic energy contributions.
-                for (vector<Atom>::iterator it = s.atoms.begin();
-                     it != s.atoms.end(); ++it)
+                bool doneOnGpu = false;
+#ifdef N2P2_GPU
+                // Phase 6 follow-up (GPU_PORTING_PLAN.md): the harder of
+                // the two Jacobian call sites -- calculateDFdc() loops over
+                // every input and touches every connection each time (see
+                // GpuNeuralNetwork.h's gpuNnForceDFdcSum() doc comment and
+                // gpu/gemm/nn_dfdc_gemm_test.cu's derivation). Only
+                // HDNNP_2G is handled (same scope restriction as the
+                // "energy" branch above); HDNNP_4G's extra charge input
+                // neuron/dQdxia handling and N2P2_FULL_SFD_MEMORY's
+                // per-atom dGdxia storage are both out of scope here. Falls
+                // back to the exact CPU loop below if any element's
+                // network doesn't match src/libnnpgpu's fixed architecture.
+#ifndef N2P2_FULL_SFD_MEMORY
+                if (nnpType == NNPType::HDNNP_2G)
                 {
-                    // For force update save derivative of symmetry function
-                    // with respect to coordinate.
-#ifndef N2P2_FULL_SFD_MEMORY
-                    collectDGdxia((*it), sC->a, sC->c);
+                    bool allElementsGpuCompatible = true;
+                    for (size_t e = 0; e < numElements; ++e)
+                    {
+                        if (!elements.at(e).neuralNetworks.at(nnId)
+                                .hasGpuCompatibleArchitecture())
+                        {
+                            allElementsGpuCompatible = false;
+                            break;
+                        }
+                    }
 
-                    if (nnpType == NNPType::HDNNP_4G)
+                    if (allElementsGpuCompatible)
                     {
-                        double dQdxia = s.atoms.at(sC->a).dQdr.at(it->index)[sC->c];
-                        dGdxia.back() = dQdxia;
-                    }
-#else
-                    it->collectDGdxia(sC->a, sC->c, maxCutoffRadius);
-                    if (nnpType == NNPType::HDNNP_4G)
-                    {
-                        double dQdxia = s.atoms.at(sC->a).dQdr.at(it->index)[sC->c];
-                        it->dGdxia.resize(it->G.size() + 1);
-                        it->dGdxia.back() = dQdxia;
-                    }
-#endif
-                    size_t i = it->element;
-                    NeuralNetwork& nn = elements.at(i).neuralNetworks.at(nnId);
-                    // TODO: This part should simplify with improved NN class.
-                    for (size_t j = 0; j < it->G.size(); ++j)
-                    {
-                        nn.setInput(j, it->G.at(j));
-                    }
-                    if (nnpType == NNPType::HDNNP_4G)
-                        nn.setInput(it->G.size(), it->charge);
-                    nn.propagate();
-                    if (derivatives) nn.calculateDEdG(&((it->dEdG).front()));
-                    nn.getOutput(&(it->energy));
+                        vector<vector<size_t>> atomsByElement(numElements);
+                        for (size_t ia = 0; ia < s.atoms.size(); ++ia)
+                        {
+                            atomsByElement.at(s.atoms.at(ia).element)
+                                .push_back(ia);
+                        }
 
-                    // Compute derivative of output node with respect to all
-                    // neural network connections (weights + biases).
-#ifndef N2P2_FULL_SFD_MEMORY
-                    nn.calculateDFdc(&(dXdc.at(i).front()),
-                                     &(dGdxia.front()));
-#else
-                    nn.calculateDFdc(&(dXdc.at(i).front()),
-                                     &(it->dGdxia.front()));
-#endif
-                    // Finally sum up Jacobian.
-                    if (updateStrategy == US_ELEMENT) iu = i;
-                    else iu = 0;
-                    for (size_t j = 0; j < dXdc.at(i).size(); ++j)
-                    {
-                        pu.jacobian.at(iu).at(offset.at(i) + j) +=
-                            dXdc.at(i).at(j);
+                        // collectDGdxia() writes into the shared #dGdxia
+                        // scratch member (overwritten every call), so every
+                        // atom's result must be copied out before any of
+                        // them can be batched together.
+                        vector<vector<double>> dGdxyzByAtom(s.atoms.size());
+                        for (size_t ia = 0; ia < s.atoms.size(); ++ia)
+                        {
+                            collectDGdxia(s.atoms.at(ia), sC->a, sC->c);
+                            dGdxyzByAtom.at(ia) = dGdxia;
+                        }
+
+                        for (size_t e = 0; e < numElements; ++e)
+                        {
+                            vector<size_t> const& atomIndices =
+                                atomsByElement.at(e);
+                            if (atomIndices.empty()) continue;
+
+                            NeuralNetwork& nn =
+                                elements.at(e).neuralNetworks.at(nnId);
+                            int const numAtoms = (int)atomIndices.size();
+                            int const numIn = nn.getNumNeuronsInLayer(0);
+                            int const numHidden1 = nn.getNumNeuronsInLayer(1);
+                            int const numHidden2 = nn.getNumNeuronsInLayer(2);
+
+                            vector<double> connections(nn.getNumConnections());
+                            nn.getConnections(connections.data());
+
+                            vector<double> G((size_t)numAtoms * numIn);
+                            vector<double> dGdxyz((size_t)numAtoms * numIn);
+                            for (int t = 0; t < numAtoms; ++t)
+                            {
+                                Atom const& a =
+                                    s.atoms.at(atomIndices.at(t));
+                                copy(a.G.begin(), a.G.end(),
+                                     G.begin() + (size_t)t * numIn);
+                                vector<double> const& d =
+                                    dGdxyzByAtom.at(atomIndices.at(t));
+                                copy(d.begin(), d.end(),
+                                     dGdxyz.begin() + (size_t)t * numIn);
+                            }
+
+                            vector<double> energyOut(numAtoms);
+                            vector<double> dEdGOut((size_t)numAtoms * numIn);
+                            gpuNnForceDFdcSum(numAtoms, numIn, numHidden1,
+                                              numHidden2, connections.data(),
+                                              G.data(), dGdxyz.data(),
+                                              energyOut.data(),
+                                              dEdGOut.data(),
+                                              dXdc.at(e).data());
+
+                            for (int t = 0; t < numAtoms; ++t)
+                            {
+                                Atom& a = s.atoms.at(atomIndices.at(t));
+                                a.energy = energyOut.at(t);
+                                copy(dEdGOut.begin() + (size_t)t * numIn,
+                                     dEdGOut.begin() + (size_t)(t + 1) * numIn,
+                                     a.dEdG.begin());
+                            }
+
+                            // Finally sum up Jacobian.
+                            if (updateStrategy == US_ELEMENT) iu = e;
+                            else iu = 0;
+                            for (size_t j = 0; j < dXdc.at(e).size(); ++j)
+                            {
+                                pu.jacobian.at(iu).at(offset.at(e) + j) +=
+                                    dXdc.at(e).at(j);
+                            }
+                        }
+
+                        doneOnGpu = true;
                     }
                 }
+#endif
+#endif
+                if (!doneOnGpu)
+                {
+                    // Loop over atoms and calculate atomic energy
+                    // contributions.
+                    for (vector<Atom>::iterator it = s.atoms.begin();
+                         it != s.atoms.end(); ++it)
+                    {
+                        // For force update save derivative of symmetry
+                        // function with respect to coordinate.
+#ifndef N2P2_FULL_SFD_MEMORY
+                        collectDGdxia((*it), sC->a, sC->c);
 
+                        if (nnpType == NNPType::HDNNP_4G)
+                        {
+                            double dQdxia = s.atoms.at(sC->a).dQdr.at(it->index)[sC->c];
+                            dGdxia.back() = dQdxia;
+                        }
+#else
+                        it->collectDGdxia(sC->a, sC->c, maxCutoffRadius);
+                        if (nnpType == NNPType::HDNNP_4G)
+                        {
+                            double dQdxia = s.atoms.at(sC->a).dQdr.at(it->index)[sC->c];
+                            it->dGdxia.resize(it->G.size() + 1);
+                            it->dGdxia.back() = dQdxia;
+                        }
+#endif
+                        size_t i = it->element;
+                        NeuralNetwork& nn =
+                            elements.at(i).neuralNetworks.at(nnId);
+                        // TODO: This part should simplify with improved
+                        // NN class.
+                        for (size_t j = 0; j < it->G.size(); ++j)
+                        {
+                            nn.setInput(j, it->G.at(j));
+                        }
+                        if (nnpType == NNPType::HDNNP_4G)
+                            nn.setInput(it->G.size(), it->charge);
+                        nn.propagate();
+                        if (derivatives) nn.calculateDEdG(&((it->dEdG).front()));
+                        nn.getOutput(&(it->energy));
+
+                        // Compute derivative of output node with respect
+                        // to all neural network connections (weights +
+                        // biases).
+#ifndef N2P2_FULL_SFD_MEMORY
+                        nn.calculateDFdc(&(dXdc.at(i).front()),
+                                         &(dGdxia.front()));
+#else
+                        nn.calculateDFdc(&(dXdc.at(i).front()),
+                                         &(it->dGdxia.front()));
+#endif
+                        // Finally sum up Jacobian.
+                        if (updateStrategy == US_ELEMENT) iu = i;
+                        else iu = 0;
+                        for (size_t j = 0; j < dXdc.at(i).size(); ++j)
+                        {
+                            pu.jacobian.at(iu).at(offset.at(i) + j) +=
+                                dXdc.at(i).at(j);
+                        }
+                    }
+                }
             }
             // Assume stage 2.
             else if (nnpType == NNPType::HDNNP_Q)

@@ -71,6 +71,50 @@ void gpuNnEnergyDEdcSum(int numAtoms, int numIn, int numHidden1, int numHidden2,
                         double const* connections,
                         double const* G, double* energyOut, double* dEdcSumOut);
 
+/** Batched cuBLAS forward pass + calculateDEdG + calculateDFdc for every
+ *  atom of ONE element at once, with the force-weight Jacobian SUMMED
+ *  across atoms -- the contribution Training::update()'s "force" branch
+ *  needs: for one fixed (atom, coordinate) update candidate, every atom in
+ *  the structure contributes calculateDFdc(dGdxyz_atom) to the SAME
+ *  Jacobian row, accumulated on the CPU side today via a per-atom loop.
+ *  Ported from gpu/gemm/nn_dfdc_gemm_test.cu's per-atom batching (itself
+ *  the hardest of the three Jacobian passes -- a host-side loop over each
+ *  of the numIn inputs, since calculateDFdc's inner algorithm touches every
+ *  connection once per input). Unlike that file, this function only ever
+ *  needs the atom-axis SUM (same insight as gpuNnEnergyDEdcSum()), which
+ *  turns every one of nn_dfdc_gemm_test.cu's batched RANK-1
+ *  cublasDgemmStridedBatched outer products into a single ordinary
+ *  cublasDgemm contracting the atom dimension directly -- simpler *and*
+ *  cheaper than the per-atom-preserving version, not just cheaper to
+ *  transfer off the device.
+ *  Same architecture restriction as gpuNnForwardDEdG(): callers MUST check
+ *  hasGpuCompatibleArchitecture() first.
+ *
+ * @param[in]  numAtoms Number of atoms (all of the same element).
+ * @param[in]  numIn Number of symmetry functions / input neurons.
+ * @param[in]  numHidden1 Size of the first hidden layer.
+ * @param[in]  numHidden2 Size of the second hidden layer.
+ * @param[in]  connections Flat connections array, same order as
+ *             NeuralNetwork::getConnections() ([W1,b1,W2,b2,W3,b3]).
+ * @param[in]  G Symmetry function values, (numAtoms x numIn) row-major.
+ * @param[in]  dGdxyz Derivative of each atom's own symmetry functions with
+ *             respect to the ONE external coordinate degree of freedom
+ *             this call's Jacobian row is for (i.e. what
+ *             Training::collectDGdxia() computes per atom), (numAtoms x
+ *             numIn) row-major, same layout as G.
+ * @param[out] energyOut Atomic energies, length numAtoms.
+ * @param[out] dEdGOut Derivative of atomic energy w.r.t. each symmetry
+ *             function, (numAtoms x numIn) row-major, same layout as G.
+ * @param[out] dFdcSumOut Sum over all numAtoms atoms of calculateDFdc()'s
+ *             per-atom output (each atom's own dGdxyz row used for its own
+ *             contribution), same flat [W1,b1,W2,b2,W3,b3] layout and
+ *             length as NeuralNetwork::getNumConnections().
+ */
+void gpuNnForceDFdcSum(int numAtoms, int numIn, int numHidden1, int numHidden2,
+                       double const* connections,
+                       double const* G, double const* dGdxyz,
+                       double* energyOut, double* dEdGOut, double* dFdcSumOut);
+
 }
 
 #endif

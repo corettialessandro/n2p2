@@ -892,12 +892,84 @@ Jacobian row for that structure's total energy.
   is the same as `nnp-predict`'s: a second real, validated call site
   proving the pattern generalizes, not a training-speed claim.
 
-Next steps (not yet done): wire in forces/Kalman
-(`calculateDFdc`/`KalmanFilter::update()`, both already validated standalone
-in `gemm/nn_dfdc_gemm_test.cu` and `gemm/kalman_gemm_test.cu`) for a real
-end-to-end GPU training step where the dominant per-epoch cost actually
-moves to the GPU; extend the `HDNNP_2G`-only energy-Jacobian dispatch above
-to `HDNNP_4G` (needs the extra charge input neuron and electrostatics
-coupling handled); and only then would measuring actual `nnp-train`
-wall-clock speedup be a meaningful exercise rather than a foregone small
-number.
+### Follow-up: `nnp-train`'s force-Jacobian call site
+
+The harder of the two Jacobian passes, and the one that actually matters
+for `nnp-train`'s wall-clock time: `timing.out` shows `Ftrain` (the
+force-Jacobian update) dominates the epoch (~150s vs ~1.8s for `Etrain`
+above). **What's wired in**: `Training::update()`'s `"force"` Jacobian
+branch (`HDNNP_2G` only, same scope restriction as the energy branch) —
+for one fixed `(atom, coordinate)` update candidate, every atom in the
+structure contributes `calculateDFdc()`'s per-connection output (using
+*its own* `dGdxia` from `collectDGdxia()`) to the same Jacobian row.
+
+- **New library function, `gpuNnForceDFdcSum()`** (`src/libnnpgpu/
+  GpuNeuralNetwork.h/.cu`): ports `gemm/nn_dfdc_gemm_test.cu`'s algorithm —
+  a host-side loop over each of the `numIn` inputs (cheap, at most a few
+  dozen iterations), each touching every connection — but, exactly like
+  `gpuNnEnergyDEdcSum()`, only ever needs the atom-axis **sum**, not a
+  per-atom array. That turns every one of the standalone benchmark's
+  batched RANK-1 `cublasDgemmStridedBatched` outer products into a single
+  ordinary `cublasDgemm` contracting the atom dimension directly (e.g.
+  `dFdc_W2`'s per-atom `outer(P[atom,:],jacBH2[atom,:])` summed over atoms
+  is just `Pᵀ.jacBH2`, a plain GEMM) — simpler *and* cheaper than the
+  per-atom-preserving version, not just cheaper to transfer off the device.
+  The one new wrinkle: `dGdxyz`'s per-input "column" needs to be a
+  *contiguous* device array for this trick to apply (the atom-summed GEMMs
+  contract over the atom axis, which requires that axis's operand
+  contiguous) — but `dGdxyz` arrives atom-major, so a one-time
+  `transposeKernel()` produces `dGdxyzᵀ` before the input loop, making each
+  iteration's column access contiguous. Also computes energy and `dEdG`
+  in the same pass (reusing the same `v1s`/`W1ᵀ` intermediates
+  `gpuNnForwardDEdG()` uses), since `Mode::calculateForces()` still needs
+  correct `it->energy`/`it->dEdG` afterward regardless of the Jacobian path.
+- **Validated standalone, first try**: `gpu/gemm/libnnpgpu_dfdc_test.cu`
+  (`run_libnnpgpu_dfdc.slurm`) checks energy, `dEdG`, and the atom-summed
+  `dFdc` against the real `NeuralNetwork` class (`calculateDFdc()` summed by
+  hand over every atom), for H2O_2G's real 25/25 architecture (H and O) and
+  the Anisole_SCAN-like 30/20 case — `max|E| ≤ 4.9E-15`, `max|dEdG| ≤
+  6.4E-15`, `max|dFdcSum| ≤ 1.4E-13` across all three, ALL PASS with no
+  fixes needed (the derivation above was worked out on paper before coding,
+  gemm-call-by-gemm-call, against `nn_dfdc_gemm_test.cu`'s reference
+  algorithm).
+- **Dispatch in `Training.cpp`**: same pattern as the energy branch —
+  `collectDGdxia()` writes into a single shared scratch member
+  (overwritten every call), so every atom's result is first collected into
+  a per-atom `vector` before any batching can happen; then, per element,
+  gathers `G` and `dGdxyz` across the structure's atoms, calls
+  `gpuNnForceDFdcSum()` once, scatters `energy`/`dEdG` back, and adds the
+  returned sum into `pu.jacobian`. Falls back to the untouched original
+  per-atom loop (wrapped in `if (!doneOnGpu)`) for `HDNNP_4G`,
+  `N2P2_FULL_SFD_MEMORY` builds, or any GPU-incompatible architecture.
+- **The real end-to-end deliverable**: rerunning the same
+  `gpu/e2e_train_check/run_nnp_train_gpu_vs_cpu.slurm` used for the energy
+  branch (unchanged) now exercises *both* GPU Jacobian paths together,
+  since forces are trained by default in `H2O_2G`'s `input.nn`. Result:
+  identical to the energy-only run — `learning-curve.out` and both
+  elements' post-epoch-1 weights (3327 connections total) match **exactly**,
+  `0.000E+00` max abs difference, bit-identical to all 17 printed
+  significant digits, while the logged force RMSE columns confirm a real,
+  substantial force-driven update happened (not a degenerate/no-op
+  comparison).
+
+### Not yet done: `KalmanFilter::update()`
+
+The two dominant `O(N²·m)` GEMMs inside `KalmanFilter::update()` (`X = P.H`
+and the `K.Hᵀ` term of `P -= K.Xᵀ`) are already validated standalone
+(`gemm/kalman_gemm_test.cu`, `1.22×`/`1.39×` at the real `N=3327, m=32`
+production size — a modest win, since the existing naive kernel there
+already has a reasonably efficient memory-access pattern). Unlike the two
+Jacobian passes above, this hasn't been wired into any real call site yet
+— `KalmanFilter`/`Updater`'s actual weight-update bookkeeping wasn't
+investigated as part of this pass, so it needs its own research pass
+before attempting the wiring, the same way `Training.cpp`'s Jacobian
+branches each needed their own read-through first.
+
+Next steps (not yet done): wire in `KalmanFilter::update()`'s GEMMs (the
+one piece of Phase 4's profiled cost centers still sitting entirely on
+`gemm/`'s standalone benchmark, not in any real binary); extend both
+Jacobian dispatches above from `HDNNP_2G` to `HDNNP_4G` (needs the extra
+charge input neuron and electrostatics coupling handled in both); and, with
+`Ftrain`'s dominant cost now GPU-accelerated, measuring actual `nnp-train`
+wall-clock speedup finally becomes a meaningful exercise rather than a
+foregone small number.
