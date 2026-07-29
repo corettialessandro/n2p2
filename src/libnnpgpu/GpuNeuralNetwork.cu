@@ -11,12 +11,44 @@
 // which callers use to confirm the *shape* of the network -- exactly two
 // tanh hidden layers, single identity output neuron -- is one this code
 // supports, before calling in with the actual sizes).
+//
+// Persistent per-architecture device state (added after the first real
+// end-to-end nnp-train timing run showed why it mattered): each of the
+// three functions below used to cudaMalloc every buffer it needed --
+// roughly three dozen for gpuNnForceDFdcSum() -- and cudaFree all of them
+// again before returning, on EVERY call. That's the same mistake
+// GpuKalmanFilter.h/.cu was deliberately designed to avoid for P (see its
+// own header comment), just not noticed here at first because these
+// functions were validated for correctness in isolation, not benchmarked
+// at the real calling frequency (once per update candidate, ~300+ times
+// per epoch) until a full end-to-end run with GPU contention resolved
+// (via MPS -- see gpu/README.md) exposed the remaining gap between
+// "kernel is 10x faster in isolation" and "call site is 1.3x faster
+// end to end": cudaMalloc/cudaFree carry real fixed driver overhead
+// independent of matrix size, and at this call frequency that overhead,
+// not the actual compute, was dominating the wall-clock cost.
+//
+// Fix: weight-dependent buffers (sized by numIn/numHidden1/numHidden2,
+// fixed for a given element's architecture, only their VALUES change
+// call to call since Kalman updates weights every time) and atom-
+// dependent buffers (sized by numAtoms, which varies call to call) are
+// now cached in a process-lifetime state per (numIn, numHidden1,
+// numHidden2) triple -- in practice one entry per distinct element
+// architecture (H, O, ...). Weight buffers are allocated once and
+// re-uploaded (cudaMemcpy, not cudaMalloc) every call; atom-dependent
+// buffers grow on demand (never shrink), the same pattern
+// GpuKalmanFilter.cu's ensureMCapacity() already uses for the analogous
+// problem. The three functions' public signatures are unchanged -- this
+// is purely an internal caching layer, transparent to every caller
+// (Mode.cpp, Training.cpp).
 
 #include "GpuNeuralNetwork.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <map>
+#include <tuple>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
@@ -184,6 +216,260 @@ __global__ void transposeKernel(double const* in, int numAtoms, int width, doubl
     out[(size_t)col * numAtoms + atom] = in[idx];
 }
 
+// Architecture key: a given element's (numIn, numHidden1, numHidden2)
+// never changes during a run, so it uniquely identifies which persistent
+// state a call should reuse. If two different elements happened to share
+// the exact same triple, they'd correctly share one state too (every call
+// fully overwrites the weight buffers before use, and n2p2 doesn't call
+// these functions concurrently across elements), just without a
+// performance-irrelevant separate allocation.
+using ArchKey = std::tuple<int, int, int>;
+
+void hostTransposeW1(double const* W1, int numIn, int numHidden1, double* W1T)
+{
+    for (int j = 0; j < numIn; ++j)
+        for (int i = 0; i < numHidden1; ++i)
+            W1T[(size_t)i * numIn + j] = W1[(size_t)j * numHidden1 + i];
+}
+
+void hostTransposeW2(double const* W2, int numHidden1, int numHidden2, double* W2T)
+{
+    for (int i = 0; i < numHidden1; ++i)
+        for (int j = 0; j < numHidden2; ++j)
+            W2T[(size_t)j * numHidden1 + i] = W2[(size_t)i * numHidden2 + j];
+}
+
+// --- gpuNnForwardDEdG's persistent state -----------------------------------
+
+struct GpuNnForwardState
+{
+    int numIn = 0, numHidden1 = 0, numHidden2 = 0;
+    int atomCapacity = 0;
+
+    // Weight-dependent (fixed size, alloc once; re-uploaded every call).
+    double *d_W1 = nullptr, *d_b1 = nullptr, *d_W2 = nullptr, *d_b2 = nullptr;
+    double *d_W3 = nullptr, *d_W1T = nullptr, *d_W2T = nullptr;
+    std::vector<double> W1Thost, W2Thost;
+
+    // Atom-dependent (grow on demand).
+    double *d_G = nullptr, *d_H1pre = nullptr, *d_H1 = nullptr, *d_dfdx1 = nullptr;
+    double *d_H2pre = nullptr, *d_H2 = nullptr, *d_dfdx2 = nullptr;
+    double *d_outPre = nullptr, *d_energy = nullptr;
+    double *d_v2 = nullptr, *d_v1 = nullptr, *d_v1s = nullptr, *d_dEdG = nullptr;
+};
+
+void ensureAtomCapacity(GpuNnForwardState& s, int numAtoms)
+{
+    if (numAtoms <= s.atomCapacity) return;
+    cudaFree(s.d_G); cudaFree(s.d_H1pre); cudaFree(s.d_H1); cudaFree(s.d_dfdx1);
+    cudaFree(s.d_H2pre); cudaFree(s.d_H2); cudaFree(s.d_dfdx2);
+    cudaFree(s.d_outPre); cudaFree(s.d_energy);
+    cudaFree(s.d_v2); cudaFree(s.d_v1); cudaFree(s.d_v1s); cudaFree(s.d_dEdG);
+
+    int const numIn = s.numIn, numHidden1 = s.numHidden1, numHidden2 = s.numHidden2;
+    CUDA_CHECK(cudaMalloc(&s.d_G, (size_t)numAtoms * numIn * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_H1pre, (size_t)numAtoms * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_H1, (size_t)numAtoms * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_dfdx1, (size_t)numAtoms * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_H2pre, (size_t)numAtoms * numHidden2 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_H2, (size_t)numAtoms * numHidden2 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_dfdx2, (size_t)numAtoms * numHidden2 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_outPre, (size_t)numAtoms * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_energy, (size_t)numAtoms * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_v2, (size_t)numAtoms * numHidden2 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_v1, (size_t)numAtoms * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_v1s, (size_t)numAtoms * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_dEdG, (size_t)numAtoms * numIn * sizeof(double)));
+    s.atomCapacity = numAtoms;
+}
+
+GpuNnForwardState& getForwardState(int numIn, int numHidden1, int numHidden2)
+{
+    static std::map<ArchKey, GpuNnForwardState*> cache;
+    ArchKey key(numIn, numHidden1, numHidden2);
+    auto it = cache.find(key);
+    if (it != cache.end()) return *it->second;
+
+    GpuNnForwardState* s = new GpuNnForwardState();
+    s->numIn = numIn; s->numHidden1 = numHidden1; s->numHidden2 = numHidden2;
+    s->W1Thost.resize((size_t)numHidden1 * numIn);
+    s->W2Thost.resize((size_t)numHidden2 * numHidden1);
+    CUDA_CHECK(cudaMalloc(&s->d_W1, (size_t)numIn * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->d_b1, (size_t)numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->d_W2, (size_t)numHidden1 * numHidden2 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->d_b2, (size_t)numHidden2 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->d_W3, (size_t)numHidden2 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->d_W1T, (size_t)numHidden1 * numIn * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->d_W2T, (size_t)numHidden2 * numHidden1 * sizeof(double)));
+    cache[key] = s;
+    return *s;
+}
+
+// --- gpuNnEnergyDEdcSum's persistent state ----------------------------------
+
+struct GpuNnEnergyState
+{
+    int numIn = 0, numHidden1 = 0, numHidden2 = 0;
+    int atomCapacity = 0;
+
+    double *d_W1 = nullptr, *d_b1 = nullptr, *d_W2 = nullptr, *d_b2 = nullptr;
+    double *d_W3 = nullptr, *d_W2T = nullptr;
+    std::vector<double> W2Thost;
+    double* d_dEdcSum = nullptr; // connCount-sized, fixed per architecture
+
+    double *d_G = nullptr, *d_H1pre = nullptr, *d_H1 = nullptr, *d_dfdx1 = nullptr;
+    double *d_H2pre = nullptr, *d_H2 = nullptr, *d_dfdx2 = nullptr;
+    double *d_outPre = nullptr, *d_energy = nullptr;
+    double *d_v2 = nullptr, *d_v1 = nullptr, *d_v1s = nullptr, *d_ones = nullptr;
+};
+
+void ensureAtomCapacity(GpuNnEnergyState& s, int numAtoms)
+{
+    if (numAtoms <= s.atomCapacity) return;
+    cudaFree(s.d_G); cudaFree(s.d_H1pre); cudaFree(s.d_H1); cudaFree(s.d_dfdx1);
+    cudaFree(s.d_H2pre); cudaFree(s.d_H2); cudaFree(s.d_dfdx2);
+    cudaFree(s.d_outPre); cudaFree(s.d_energy);
+    cudaFree(s.d_v2); cudaFree(s.d_v1); cudaFree(s.d_v1s); cudaFree(s.d_ones);
+
+    int const numIn = s.numIn, numHidden1 = s.numHidden1, numHidden2 = s.numHidden2;
+    CUDA_CHECK(cudaMalloc(&s.d_G, (size_t)numAtoms * numIn * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_H1pre, (size_t)numAtoms * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_H1, (size_t)numAtoms * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_dfdx1, (size_t)numAtoms * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_H2pre, (size_t)numAtoms * numHidden2 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_H2, (size_t)numAtoms * numHidden2 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_dfdx2, (size_t)numAtoms * numHidden2 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_outPre, (size_t)numAtoms * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_energy, (size_t)numAtoms * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_v2, (size_t)numAtoms * numHidden2 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_v1, (size_t)numAtoms * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_v1s, (size_t)numAtoms * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_ones, (size_t)numAtoms * sizeof(double)));
+    s.atomCapacity = numAtoms;
+}
+
+GpuNnEnergyState& getEnergyState(int numIn, int numHidden1, int numHidden2)
+{
+    static std::map<ArchKey, GpuNnEnergyState*> cache;
+    ArchKey key(numIn, numHidden1, numHidden2);
+    auto it = cache.find(key);
+    if (it != cache.end()) return *it->second;
+
+    int const numOut = 1;
+    size_t const connCount = (size_t)numIn * numHidden1 + numHidden1
+                            + (size_t)numHidden1 * numHidden2 + numHidden2
+                            + (size_t)numHidden2 * numOut + numOut;
+
+    GpuNnEnergyState* s = new GpuNnEnergyState();
+    s->numIn = numIn; s->numHidden1 = numHidden1; s->numHidden2 = numHidden2;
+    s->W2Thost.resize((size_t)numHidden2 * numHidden1);
+    CUDA_CHECK(cudaMalloc(&s->d_W1, (size_t)numIn * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->d_b1, (size_t)numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->d_W2, (size_t)numHidden1 * numHidden2 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->d_b2, (size_t)numHidden2 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->d_W3, (size_t)numHidden2 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->d_W2T, (size_t)numHidden2 * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->d_dEdcSum, connCount * sizeof(double)));
+    cache[key] = s;
+    return *s;
+}
+
+// --- gpuNnForceDFdcSum's persistent state ------------------------------------
+
+struct GpuNnForceState
+{
+    int numIn = 0, numHidden1 = 0, numHidden2 = 0;
+    int atomCapacity = 0;
+
+    double *d_W1 = nullptr, *d_b1 = nullptr, *d_W2 = nullptr, *d_b2 = nullptr;
+    double *d_W3 = nullptr, *d_W1T = nullptr, *d_W2T = nullptr;
+    std::vector<double> W1Thost, W2Thost;
+    double* d_dFdcSum = nullptr; // connCount-sized, fixed per architecture
+
+    double *d_G = nullptr, *d_dGdxyz = nullptr, *d_dGdxyzT = nullptr;
+    double *d_H1pre = nullptr, *d_H1 = nullptr, *d_dfdx1 = nullptr, *d_d2fdx2_1 = nullptr;
+    double *d_H2pre = nullptr, *d_H2 = nullptr, *d_dfdx2 = nullptr, *d_d2fdx2_2 = nullptr;
+    double *d_outPre = nullptr, *d_energy = nullptr;
+    double *d_v2 = nullptr, *d_v1 = nullptr, *d_v1s = nullptr, *d_d2S1 = nullptr, *d_dEdG = nullptr;
+    double *d_u = nullptr, *d_dxdG2 = nullptr, *d_tmp = nullptr, *d_jacBH2 = nullptr, *d_jacW3 = nullptr;
+    double *d_T = nullptr, *d_term1 = nullptr, *d_term2 = nullptr, *d_jacBH1 = nullptr;
+    double *d_P = nullptr, *d_Q2 = nullptr, *d_Gscaled = nullptr;
+};
+
+void ensureAtomCapacity(GpuNnForceState& s, int numAtoms)
+{
+    if (numAtoms <= s.atomCapacity) return;
+    cudaFree(s.d_G); cudaFree(s.d_dGdxyz); cudaFree(s.d_dGdxyzT);
+    cudaFree(s.d_H1pre); cudaFree(s.d_H1); cudaFree(s.d_dfdx1); cudaFree(s.d_d2fdx2_1);
+    cudaFree(s.d_H2pre); cudaFree(s.d_H2); cudaFree(s.d_dfdx2); cudaFree(s.d_d2fdx2_2);
+    cudaFree(s.d_outPre); cudaFree(s.d_energy);
+    cudaFree(s.d_v2); cudaFree(s.d_v1); cudaFree(s.d_v1s); cudaFree(s.d_d2S1); cudaFree(s.d_dEdG);
+    cudaFree(s.d_u); cudaFree(s.d_dxdG2); cudaFree(s.d_tmp); cudaFree(s.d_jacBH2); cudaFree(s.d_jacW3);
+    cudaFree(s.d_T); cudaFree(s.d_term1); cudaFree(s.d_term2); cudaFree(s.d_jacBH1);
+    cudaFree(s.d_P); cudaFree(s.d_Q2); cudaFree(s.d_Gscaled);
+
+    int const numIn = s.numIn, numHidden1 = s.numHidden1, numHidden2 = s.numHidden2;
+    CUDA_CHECK(cudaMalloc(&s.d_G, (size_t)numAtoms * numIn * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_dGdxyz, (size_t)numAtoms * numIn * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_dGdxyzT, (size_t)numIn * numAtoms * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_H1pre, (size_t)numAtoms * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_H1, (size_t)numAtoms * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_dfdx1, (size_t)numAtoms * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_d2fdx2_1, (size_t)numAtoms * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_H2pre, (size_t)numAtoms * numHidden2 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_H2, (size_t)numAtoms * numHidden2 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_dfdx2, (size_t)numAtoms * numHidden2 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_d2fdx2_2, (size_t)numAtoms * numHidden2 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_outPre, (size_t)numAtoms * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_energy, (size_t)numAtoms * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_v2, (size_t)numAtoms * numHidden2 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_v1, (size_t)numAtoms * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_v1s, (size_t)numAtoms * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_d2S1, (size_t)numAtoms * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_dEdG, (size_t)numAtoms * numIn * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_u, (size_t)numAtoms * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_dxdG2, (size_t)numAtoms * numHidden2 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_tmp, (size_t)numAtoms * numHidden2 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_jacBH2, (size_t)numAtoms * numHidden2 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_jacW3, (size_t)numAtoms * numHidden2 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_T, (size_t)numAtoms * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_term1, (size_t)numAtoms * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_term2, (size_t)numAtoms * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_jacBH1, (size_t)numAtoms * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_P, (size_t)numAtoms * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_Q2, (size_t)numAtoms * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s.d_Gscaled, (size_t)numAtoms * numIn * sizeof(double)));
+    s.atomCapacity = numAtoms;
+}
+
+GpuNnForceState& getForceState(int numIn, int numHidden1, int numHidden2)
+{
+    static std::map<ArchKey, GpuNnForceState*> cache;
+    ArchKey key(numIn, numHidden1, numHidden2);
+    auto it = cache.find(key);
+    if (it != cache.end()) return *it->second;
+
+    int const numOut = 1;
+    size_t const connCount = (size_t)numIn * numHidden1 + numHidden1
+                            + (size_t)numHidden1 * numHidden2 + numHidden2
+                            + (size_t)numHidden2 * numOut + numOut;
+
+    GpuNnForceState* s = new GpuNnForceState();
+    s->numIn = numIn; s->numHidden1 = numHidden1; s->numHidden2 = numHidden2;
+    s->W1Thost.resize((size_t)numHidden1 * numIn);
+    s->W2Thost.resize((size_t)numHidden2 * numHidden1);
+    CUDA_CHECK(cudaMalloc(&s->d_W1, (size_t)numIn * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->d_b1, (size_t)numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->d_W2, (size_t)numHidden1 * numHidden2 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->d_b2, (size_t)numHidden2 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->d_W3, (size_t)numHidden2 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->d_W1T, (size_t)numHidden1 * numIn * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->d_W2T, (size_t)numHidden2 * numHidden1 * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&s->d_dFdcSum, connCount * sizeof(double)));
+    cache[key] = s;
+    return *s;
+}
+
 } // anonymous namespace
 
 namespace nnp
@@ -195,6 +481,8 @@ void gpuNnForwardDEdG(int numAtoms, int numIn, int numHidden1, int numHidden2,
 {
     int const numOut = 1;
     cublasHandle_t handle = gpuHandle();
+    GpuNnForwardState& s = getForwardState(numIn, numHidden1, numHidden2);
+    ensureAtomCapacity(s, numAtoms);
 
     size_t off = 0;
     double const* W1 = connections + off; off += (size_t)numIn * numHidden1;
@@ -204,80 +492,43 @@ void gpuNnForwardDEdG(int numAtoms, int numIn, int numHidden1, int numHidden2,
     double const* W3 = connections + off; off += (size_t)numHidden2 * numOut;
     double const  b3 = connections[off];
 
-    std::vector<double> W1T((size_t)numHidden1 * numIn);
-    for (int j = 0; j < numIn; ++j)
-        for (int i = 0; i < numHidden1; ++i)
-            W1T[(size_t)i * numIn + j] = W1[(size_t)j * numHidden1 + i];
-    std::vector<double> W2T((size_t)numHidden2 * numHidden1);
-    for (int i = 0; i < numHidden1; ++i)
-        for (int j = 0; j < numHidden2; ++j)
-            W2T[(size_t)j * numHidden1 + i] = W2[(size_t)i * numHidden2 + j];
+    hostTransposeW1(W1, numIn, numHidden1, s.W1Thost.data());
+    hostTransposeW2(W2, numHidden1, numHidden2, s.W2Thost.data());
 
-    double *d_W1, *d_b1, *d_W2, *d_b2, *d_W3, *d_W1T, *d_W2T, *d_G;
-    CUDA_CHECK(cudaMalloc(&d_W1, (size_t)numIn * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_b1, numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_W2, (size_t)numHidden1 * numHidden2 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_b2, numHidden2 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_W3, (size_t)numHidden2 * numOut * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_W1T, (size_t)numHidden1 * numIn * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_W2T, (size_t)numHidden2 * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_G, (size_t)numAtoms * numIn * sizeof(double)));
-    CUDA_CHECK(cudaMemcpy(d_W1, W1, (size_t)numIn * numHidden1 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_b1, b1, numHidden1 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_W2, W2, (size_t)numHidden1 * numHidden2 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_b2, b2, numHidden2 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_W3, W3, (size_t)numHidden2 * numOut * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_W1T, W1T.data(), (size_t)numHidden1 * numIn * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_W2T, W2T.data(), (size_t)numHidden2 * numHidden1 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_G, G, (size_t)numAtoms * numIn * sizeof(double), cudaMemcpyHostToDevice));
-
-    double *d_H1pre, *d_H1, *d_dfdx1, *d_H2pre, *d_H2, *d_dfdx2;
-    double *d_outPre, *d_energy, *d_v2, *d_v1, *d_v1s, *d_dEdG;
-    CUDA_CHECK(cudaMalloc(&d_H1pre, (size_t)numAtoms * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_H1, (size_t)numAtoms * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_dfdx1, (size_t)numAtoms * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_H2pre, (size_t)numAtoms * numHidden2 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_H2, (size_t)numAtoms * numHidden2 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_dfdx2, (size_t)numAtoms * numHidden2 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_outPre, (size_t)numAtoms * numOut * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_energy, numAtoms * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_v2, (size_t)numAtoms * numHidden2 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_v1, (size_t)numAtoms * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_v1s, (size_t)numAtoms * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_dEdG, (size_t)numAtoms * numIn * sizeof(double)));
+    CUDA_CHECK(cudaMemcpy(s.d_W1, W1, (size_t)numIn * numHidden1 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(s.d_b1, b1, numHidden1 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(s.d_W2, W2, (size_t)numHidden1 * numHidden2 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(s.d_b2, b2, numHidden2 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(s.d_W3, W3, (size_t)numHidden2 * numOut * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(s.d_W1T, s.W1Thost.data(), (size_t)numHidden1 * numIn * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(s.d_W2T, s.W2Thost.data(), (size_t)numHidden2 * numHidden1 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(s.d_G, G, (size_t)numAtoms * numIn * sizeof(double), cudaMemcpyHostToDevice));
 
     int const blk = 256;
 
-    gemmRowMajor(handle, numAtoms, numHidden1, numIn, d_G, d_W1, d_H1pre);
+    gemmRowMajor(handle, numAtoms, numHidden1, numIn, s.d_G, s.d_W1, s.d_H1pre);
     biasTanhKernel<<<(numAtoms * numHidden1 + blk - 1) / blk, blk>>>(
-        d_H1pre, d_b1, numAtoms, numHidden1, d_H1, d_dfdx1);
+        s.d_H1pre, s.d_b1, numAtoms, numHidden1, s.d_H1, s.d_dfdx1);
 
-    gemmRowMajor(handle, numAtoms, numHidden2, numHidden1, d_H1, d_W2, d_H2pre);
+    gemmRowMajor(handle, numAtoms, numHidden2, numHidden1, s.d_H1, s.d_W2, s.d_H2pre);
     biasTanhKernel<<<(numAtoms * numHidden2 + blk - 1) / blk, blk>>>(
-        d_H2pre, d_b2, numAtoms, numHidden2, d_H2, d_dfdx2);
+        s.d_H2pre, s.d_b2, numAtoms, numHidden2, s.d_H2, s.d_dfdx2);
 
-    gemmRowMajor(handle, numAtoms, numOut, numHidden2, d_H2, d_W3, d_outPre);
-    addOutputBiasKernel<<<(numAtoms + blk - 1) / blk, blk>>>(d_outPre, b3, numAtoms, d_energy);
+    gemmRowMajor(handle, numAtoms, numOut, numHidden2, s.d_H2, s.d_W3, s.d_outPre);
+    addOutputBiasKernel<<<(numAtoms + blk - 1) / blk, blk>>>(s.d_outPre, b3, numAtoms, s.d_energy);
 
     scaleByRowKernel<<<(numAtoms * numHidden2 + blk - 1) / blk, blk>>>(
-        d_dfdx2, d_W3, numAtoms, numHidden2, d_v2);
-    gemmRowMajor(handle, numAtoms, numHidden1, numHidden2, d_v2, d_W2T, d_v1);
+        s.d_dfdx2, s.d_W3, numAtoms, numHidden2, s.d_v2);
+    gemmRowMajor(handle, numAtoms, numHidden1, numHidden2, s.d_v2, s.d_W2T, s.d_v1);
     elementwiseMulKernel<<<(numAtoms * numHidden1 + blk - 1) / blk, blk>>>(
-        d_dfdx1, d_v1, numAtoms * numHidden1, d_v1s);
-    gemmRowMajor(handle, numAtoms, numIn, numHidden1, d_v1s, d_W1T, d_dEdG);
+        s.d_dfdx1, s.d_v1, numAtoms * numHidden1, s.d_v1s);
+    gemmRowMajor(handle, numAtoms, numIn, numHidden1, s.d_v1s, s.d_W1T, s.d_dEdG);
 
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    CUDA_CHECK(cudaMemcpy(energyOut, d_energy, numAtoms * sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(dEdGOut, d_dEdG, (size_t)numAtoms * numIn * sizeof(double), cudaMemcpyDeviceToHost));
-
-    cudaFree(d_W1); cudaFree(d_b1); cudaFree(d_W2); cudaFree(d_b2);
-    cudaFree(d_W3); cudaFree(d_W1T); cudaFree(d_W2T); cudaFree(d_G);
-    cudaFree(d_H1pre); cudaFree(d_H1); cudaFree(d_dfdx1);
-    cudaFree(d_H2pre); cudaFree(d_H2); cudaFree(d_dfdx2);
-    cudaFree(d_outPre); cudaFree(d_energy);
-    cudaFree(d_v2); cudaFree(d_v1); cudaFree(d_v1s); cudaFree(d_dEdG);
+    CUDA_CHECK(cudaMemcpy(energyOut, s.d_energy, numAtoms * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(dEdGOut, s.d_dEdG, (size_t)numAtoms * numIn * sizeof(double), cudaMemcpyDeviceToHost));
 }
 
 void gpuNnEnergyDEdcSum(int numAtoms, int numIn, int numHidden1, int numHidden2,
@@ -286,6 +537,8 @@ void gpuNnEnergyDEdcSum(int numAtoms, int numIn, int numHidden1, int numHidden2,
 {
     int const numOut = 1;
     cublasHandle_t handle = gpuHandle();
+    GpuNnEnergyState& s = getEnergyState(numIn, numHidden1, numHidden2);
+    ensureAtomCapacity(s, numAtoms);
 
     size_t off = 0;
     double const* W1 = connections + off; off += (size_t)numIn * numHidden1;
@@ -304,98 +557,63 @@ void gpuNnEnergyDEdcSum(int numAtoms, int numIn, int numHidden1, int numHidden2,
     size_t const offW3 = offB2 + numHidden2;
     size_t const offB3 = offW3 + (size_t)numHidden2 * numOut;
 
-    std::vector<double> W2T((size_t)numHidden2 * numHidden1);
-    for (int i = 0; i < numHidden1; ++i)
-        for (int j = 0; j < numHidden2; ++j)
-            W2T[(size_t)j * numHidden1 + i] = W2[(size_t)i * numHidden2 + j];
+    hostTransposeW2(W2, numHidden1, numHidden2, s.W2Thost.data());
 
-    double *d_W1, *d_b1, *d_W2, *d_b2, *d_W3, *d_W2T, *d_G;
-    CUDA_CHECK(cudaMalloc(&d_W1, (size_t)numIn * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_b1, numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_W2, (size_t)numHidden1 * numHidden2 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_b2, numHidden2 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_W3, (size_t)numHidden2 * numOut * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_W2T, (size_t)numHidden2 * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_G, (size_t)numAtoms * numIn * sizeof(double)));
-    CUDA_CHECK(cudaMemcpy(d_W1, W1, (size_t)numIn * numHidden1 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_b1, b1, numHidden1 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_W2, W2, (size_t)numHidden1 * numHidden2 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_b2, b2, numHidden2 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_W3, W3, (size_t)numHidden2 * numOut * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_W2T, W2T.data(), (size_t)numHidden2 * numHidden1 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_G, G, (size_t)numAtoms * numIn * sizeof(double), cudaMemcpyHostToDevice));
-
-    double *d_H1pre, *d_H1, *d_dfdx1, *d_H2pre, *d_H2, *d_dfdx2;
-    double *d_outPre, *d_energy, *d_v2, *d_v1, *d_v1s, *d_ones, *d_dEdcSum;
-    CUDA_CHECK(cudaMalloc(&d_H1pre, (size_t)numAtoms * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_H1, (size_t)numAtoms * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_dfdx1, (size_t)numAtoms * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_H2pre, (size_t)numAtoms * numHidden2 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_H2, (size_t)numAtoms * numHidden2 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_dfdx2, (size_t)numAtoms * numHidden2 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_outPre, (size_t)numAtoms * numOut * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_energy, numAtoms * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_v2, (size_t)numAtoms * numHidden2 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_v1, (size_t)numAtoms * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_v1s, (size_t)numAtoms * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_ones, (size_t)numAtoms * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_dEdcSum, (offB3 + 1) * sizeof(double)));
+    CUDA_CHECK(cudaMemcpy(s.d_W1, W1, (size_t)numIn * numHidden1 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(s.d_b1, b1, numHidden1 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(s.d_W2, W2, (size_t)numHidden1 * numHidden2 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(s.d_b2, b2, numHidden2 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(s.d_W3, W3, (size_t)numHidden2 * numOut * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(s.d_W2T, s.W2Thost.data(), (size_t)numHidden2 * numHidden1 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(s.d_G, G, (size_t)numAtoms * numIn * sizeof(double), cudaMemcpyHostToDevice));
 
     int const blk = 256;
 
-    fillOnesKernel<<<(numAtoms + blk - 1) / blk, blk>>>(d_ones, numAtoms);
+    fillOnesKernel<<<(numAtoms + blk - 1) / blk, blk>>>(s.d_ones, numAtoms);
 
-    gemmRowMajor(handle, numAtoms, numHidden1, numIn, d_G, d_W1, d_H1pre);
+    gemmRowMajor(handle, numAtoms, numHidden1, numIn, s.d_G, s.d_W1, s.d_H1pre);
     biasTanhKernel<<<(numAtoms * numHidden1 + blk - 1) / blk, blk>>>(
-        d_H1pre, d_b1, numAtoms, numHidden1, d_H1, d_dfdx1);
+        s.d_H1pre, s.d_b1, numAtoms, numHidden1, s.d_H1, s.d_dfdx1);
 
-    gemmRowMajor(handle, numAtoms, numHidden2, numHidden1, d_H1, d_W2, d_H2pre);
+    gemmRowMajor(handle, numAtoms, numHidden2, numHidden1, s.d_H1, s.d_W2, s.d_H2pre);
     biasTanhKernel<<<(numAtoms * numHidden2 + blk - 1) / blk, blk>>>(
-        d_H2pre, d_b2, numAtoms, numHidden2, d_H2, d_dfdx2);
+        s.d_H2pre, s.d_b2, numAtoms, numHidden2, s.d_H2, s.d_dfdx2);
 
-    gemmRowMajor(handle, numAtoms, numOut, numHidden2, d_H2, d_W3, d_outPre);
-    addOutputBiasKernel<<<(numAtoms + blk - 1) / blk, blk>>>(d_outPre, b3, numAtoms, d_energy);
+    gemmRowMajor(handle, numAtoms, numOut, numHidden2, s.d_H2, s.d_W3, s.d_outPre);
+    addOutputBiasKernel<<<(numAtoms + blk - 1) / blk, blk>>>(s.d_outPre, b3, numAtoms, s.d_energy);
 
     // v2 = dfdx2 .* W3 (broadcast), v1s = dfdx1 .* (v2 . W2^T) -- identical
     // to gpuNnForwardDEdG()'s dEdG pipeline (both dEdG and dEdc reuse these
     // same intermediates, see gpu/gemm/nn_dedc_gemm_test.cu's header
     // comment), just consumed differently below.
     scaleByRowKernel<<<(numAtoms * numHidden2 + blk - 1) / blk, blk>>>(
-        d_dfdx2, d_W3, numAtoms, numHidden2, d_v2);
-    gemmRowMajor(handle, numAtoms, numHidden1, numHidden2, d_v2, d_W2T, d_v1);
+        s.d_dfdx2, s.d_W3, numAtoms, numHidden2, s.d_v2);
+    gemmRowMajor(handle, numAtoms, numHidden1, numHidden2, s.d_v2, s.d_W2T, s.d_v1);
     elementwiseMulKernel<<<(numAtoms * numHidden1 + blk - 1) / blk, blk>>>(
-        d_dfdx1, d_v1, numAtoms * numHidden1, d_v1s);
+        s.d_dfdx1, s.d_v1, numAtoms * numHidden1, s.d_v1s);
 
     // Sum over the atom axis, straight into the packed dEdc-sum output --
     // each of these contracts numAtoms via a GEMM instead of a per-atom
     // outer product plus a separate reduction.
     gemmRowMajorATransB(handle, numIn, numHidden1, numAtoms,
-                         d_G, d_v1s, d_dEdcSum + offW1);
+                         s.d_G, s.d_v1s, s.d_dEdcSum + offW1);
     gemmRowMajorATransB(handle, 1, numHidden1, numAtoms,
-                         d_ones, d_v1s, d_dEdcSum + offB1);
+                         s.d_ones, s.d_v1s, s.d_dEdcSum + offB1);
     gemmRowMajorATransB(handle, numHidden1, numHidden2, numAtoms,
-                         d_H1, d_v2, d_dEdcSum + offW2);
+                         s.d_H1, s.d_v2, s.d_dEdcSum + offW2);
     gemmRowMajorATransB(handle, 1, numHidden2, numAtoms,
-                         d_ones, d_v2, d_dEdcSum + offB2);
+                         s.d_ones, s.d_v2, s.d_dEdcSum + offB2);
     gemmRowMajorATransB(handle, 1, numHidden2, numAtoms,
-                         d_ones, d_H2, d_dEdcSum + offW3);
+                         s.d_ones, s.d_H2, s.d_dEdcSum + offW3);
     // dE/db3 summed over atoms is exactly numAtoms (each atom contributes a
     // constant 1) -- set directly on the host below, no kernel needed.
 
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    CUDA_CHECK(cudaMemcpy(energyOut, d_energy, numAtoms * sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(dEdcSumOut, d_dEdcSum, offB3 * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(energyOut, s.d_energy, numAtoms * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(dEdcSumOut, s.d_dEdcSum, offB3 * sizeof(double), cudaMemcpyDeviceToHost));
     dEdcSumOut[offB3] = (double)numAtoms;
-
-    cudaFree(d_W1); cudaFree(d_b1); cudaFree(d_W2); cudaFree(d_b2);
-    cudaFree(d_W3); cudaFree(d_W2T); cudaFree(d_G);
-    cudaFree(d_H1pre); cudaFree(d_H1); cudaFree(d_dfdx1);
-    cudaFree(d_H2pre); cudaFree(d_H2); cudaFree(d_dfdx2);
-    cudaFree(d_outPre); cudaFree(d_energy);
-    cudaFree(d_v2); cudaFree(d_v1); cudaFree(d_v1s);
-    cudaFree(d_ones); cudaFree(d_dEdcSum);
 }
 
 void gpuNnForceDFdcSum(int numAtoms, int numIn, int numHidden1, int numHidden2,
@@ -405,6 +623,8 @@ void gpuNnForceDFdcSum(int numAtoms, int numIn, int numHidden1, int numHidden2,
 {
     int const numOut = 1;
     cublasHandle_t handle = gpuHandle();
+    GpuNnForceState& s = getForceState(numIn, numHidden1, numHidden2);
+    ensureAtomCapacity(s, numAtoms);
 
     size_t off = 0;
     double const* W1 = connections + off; off += (size_t)numIn * numHidden1;
@@ -422,103 +642,49 @@ void gpuNnForceDFdcSum(int numAtoms, int numIn, int numHidden1, int numHidden2,
     size_t const offB3 = offW3 + (size_t)numHidden2 * numOut;
     size_t const connCount = offB3 + 1;
 
-    std::vector<double> W1T((size_t)numHidden1 * numIn);
-    for (int j = 0; j < numIn; ++j)
-        for (int i = 0; i < numHidden1; ++i)
-            W1T[(size_t)i * numIn + j] = W1[(size_t)j * numHidden1 + i];
-    std::vector<double> W2T((size_t)numHidden2 * numHidden1);
-    for (int i = 0; i < numHidden1; ++i)
-        for (int j = 0; j < numHidden2; ++j)
-            W2T[(size_t)j * numHidden1 + i] = W2[(size_t)i * numHidden2 + j];
+    hostTransposeW1(W1, numIn, numHidden1, s.W1Thost.data());
+    hostTransposeW2(W2, numHidden1, numHidden2, s.W2Thost.data());
 
-    double *d_W1, *d_b1, *d_W2, *d_b2, *d_W3, *d_W1T, *d_W2T, *d_G, *d_dGdxyz;
-    CUDA_CHECK(cudaMalloc(&d_W1, (size_t)numIn * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_b1, numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_W2, (size_t)numHidden1 * numHidden2 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_b2, numHidden2 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_W3, (size_t)numHidden2 * numOut * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_W1T, (size_t)numHidden1 * numIn * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_W2T, (size_t)numHidden2 * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_G, (size_t)numAtoms * numIn * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_dGdxyz, (size_t)numAtoms * numIn * sizeof(double)));
-    CUDA_CHECK(cudaMemcpy(d_W1, W1, (size_t)numIn * numHidden1 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_b1, b1, numHidden1 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_W2, W2, (size_t)numHidden1 * numHidden2 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_b2, b2, numHidden2 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_W3, W3, (size_t)numHidden2 * numOut * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_W1T, W1T.data(), (size_t)numHidden1 * numIn * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_W2T, W2T.data(), (size_t)numHidden2 * numHidden1 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_G, G, (size_t)numAtoms * numIn * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_dGdxyz, dGdxyz, (size_t)numAtoms * numIn * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(s.d_W1, W1, (size_t)numIn * numHidden1 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(s.d_b1, b1, numHidden1 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(s.d_W2, W2, (size_t)numHidden1 * numHidden2 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(s.d_b2, b2, numHidden2 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(s.d_W3, W3, (size_t)numHidden2 * numOut * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(s.d_W1T, s.W1Thost.data(), (size_t)numHidden1 * numIn * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(s.d_W2T, s.W2Thost.data(), (size_t)numHidden2 * numHidden1 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(s.d_G, G, (size_t)numAtoms * numIn * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(s.d_dGdxyz, dGdxyz, (size_t)numAtoms * numIn * sizeof(double), cudaMemcpyHostToDevice));
 
-    double *d_H1pre, *d_H1, *d_dfdx1, *d_d2fdx2_1;
-    double *d_H2pre, *d_H2, *d_dfdx2, *d_d2fdx2_2;
-    double *d_outPre, *d_energy, *d_v2, *d_v1, *d_v1s, *d_d2S1, *d_dEdG, *d_dGdxyzT;
-    CUDA_CHECK(cudaMalloc(&d_H1pre, (size_t)numAtoms * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_H1, (size_t)numAtoms * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_dfdx1, (size_t)numAtoms * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_d2fdx2_1, (size_t)numAtoms * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_H2pre, (size_t)numAtoms * numHidden2 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_H2, (size_t)numAtoms * numHidden2 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_dfdx2, (size_t)numAtoms * numHidden2 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_d2fdx2_2, (size_t)numAtoms * numHidden2 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_outPre, (size_t)numAtoms * numOut * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_energy, numAtoms * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_v2, (size_t)numAtoms * numHidden2 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_v1, (size_t)numAtoms * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_v1s, (size_t)numAtoms * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_d2S1, (size_t)numAtoms * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_dEdG, (size_t)numAtoms * numIn * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_dGdxyzT, (size_t)numIn * numAtoms * sizeof(double)));
-
-    // Per-k0 scratch, reused every loop iteration.
-    double *d_u, *d_dxdG2, *d_tmp, *d_jacBH2, *d_jacW3, *d_T;
-    double *d_term1, *d_term2, *d_jacBH1, *d_P, *d_Q2, *d_Gscaled;
-    CUDA_CHECK(cudaMalloc(&d_u, (size_t)numAtoms * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_dxdG2, (size_t)numAtoms * numHidden2 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_tmp, (size_t)numAtoms * numHidden2 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_jacBH2, (size_t)numAtoms * numHidden2 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_jacW3, (size_t)numAtoms * numHidden2 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_T, (size_t)numAtoms * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_term1, (size_t)numAtoms * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_term2, (size_t)numAtoms * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_jacBH1, (size_t)numAtoms * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_P, (size_t)numAtoms * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_Q2, (size_t)numAtoms * numHidden1 * sizeof(double)));
-    CUDA_CHECK(cudaMalloc(&d_Gscaled, (size_t)numAtoms * numIn * sizeof(double)));
-
-    double* d_dFdcSum;
-    CUDA_CHECK(cudaMalloc(&d_dFdcSum, connCount * sizeof(double)));
-    CUDA_CHECK(cudaMemset(d_dFdcSum, 0, connCount * sizeof(double)));
+    CUDA_CHECK(cudaMemset(s.d_dFdcSum, 0, connCount * sizeof(double)));
 
     int const blk = 256;
 
     // --- Precompute once, batched over atoms, no k0 dependence yet -------
-    gemmRowMajor(handle, numAtoms, numHidden1, numIn, d_G, d_W1, d_H1pre);
+    gemmRowMajor(handle, numAtoms, numHidden1, numIn, s.d_G, s.d_W1, s.d_H1pre);
     biasTanhD2Kernel<<<(numAtoms * numHidden1 + blk - 1) / blk, blk>>>(
-        d_H1pre, d_b1, numAtoms, numHidden1, d_H1, d_dfdx1, d_d2fdx2_1);
+        s.d_H1pre, s.d_b1, numAtoms, numHidden1, s.d_H1, s.d_dfdx1, s.d_d2fdx2_1);
 
-    gemmRowMajor(handle, numAtoms, numHidden2, numHidden1, d_H1, d_W2, d_H2pre);
+    gemmRowMajor(handle, numAtoms, numHidden2, numHidden1, s.d_H1, s.d_W2, s.d_H2pre);
     biasTanhD2Kernel<<<(numAtoms * numHidden2 + blk - 1) / blk, blk>>>(
-        d_H2pre, d_b2, numAtoms, numHidden2, d_H2, d_dfdx2, d_d2fdx2_2);
+        s.d_H2pre, s.d_b2, numAtoms, numHidden2, s.d_H2, s.d_dfdx2, s.d_d2fdx2_2);
 
-    gemmRowMajor(handle, numAtoms, numOut, numHidden2, d_H2, d_W3, d_outPre);
-    addOutputBiasKernel<<<(numAtoms + blk - 1) / blk, blk>>>(d_outPre, b3, numAtoms, d_energy);
+    gemmRowMajor(handle, numAtoms, numOut, numHidden2, s.d_H2, s.d_W3, s.d_outPre);
+    addOutputBiasKernel<<<(numAtoms + blk - 1) / blk, blk>>>(s.d_outPre, b3, numAtoms, s.d_energy);
 
     // v2/v1/v1s/dEdG: identical to gpuNnForwardDEdG()'s pipeline (this
     // function needs it->energy/it->dEdG populated correctly too, since
     // Mode::calculateForces() reads them afterward).
     scaleByRowKernel<<<(numAtoms * numHidden2 + blk - 1) / blk, blk>>>(
-        d_dfdx2, d_W3, numAtoms, numHidden2, d_v2);
-    gemmRowMajor(handle, numAtoms, numHidden1, numHidden2, d_v2, d_W2T, d_v1);
+        s.d_dfdx2, s.d_W3, numAtoms, numHidden2, s.d_v2);
+    gemmRowMajor(handle, numAtoms, numHidden1, numHidden2, s.d_v2, s.d_W2T, s.d_v1);
     elementwiseMulKernel<<<(numAtoms * numHidden1 + blk - 1) / blk, blk>>>(
-        d_dfdx1, d_v1, numAtoms * numHidden1, d_v1s);
+        s.d_dfdx1, s.d_v1, numAtoms * numHidden1, s.d_v1s);
     elementwiseMulKernel<<<(numAtoms * numHidden1 + blk - 1) / blk, blk>>>(
-        d_d2fdx2_1, d_v1, numAtoms * numHidden1, d_d2S1);
-    gemmRowMajor(handle, numAtoms, numIn, numHidden1, d_v1s, d_W1T, d_dEdG);
+        s.d_d2fdx2_1, s.d_v1, numAtoms * numHidden1, s.d_d2S1);
+    gemmRowMajor(handle, numAtoms, numIn, numHidden1, s.d_v1s, s.d_W1T, s.d_dEdG);
 
     transposeKernel<<<(numAtoms * numIn + blk - 1) / blk, blk>>>(
-        d_dGdxyz, numAtoms, numIn, d_dGdxyzT);
+        s.d_dGdxyz, numAtoms, numIn, s.d_dGdxyzT);
 
     // --- Host-side loop over each input (cheap: numIn is at most a few
     // dozen for any real dataset) -- see nn_dfdc_gemm_test.cu's header
@@ -528,76 +694,64 @@ void gpuNnForceDFdcSum(int numAtoms, int numIn, int numHidden1, int numHidden2,
     // ever needed -- see GpuNeuralNetwork.h's doc comment).
     for (int k0 = 0; k0 < numIn; ++k0)
     {
-        double const* W1row = d_W1 + (size_t)k0 * numHidden1;
-        double const* dGk0 = d_dGdxyzT + (size_t)k0 * numAtoms;
+        double const* W1row = s.d_W1 + (size_t)k0 * numHidden1;
+        double const* dGk0 = s.d_dGdxyzT + (size_t)k0 * numAtoms;
 
         scaleByRowKernel<<<(numAtoms * numHidden1 + blk - 1) / blk, blk>>>(
-            d_dfdx1, W1row, numAtoms, numHidden1, d_u);
-        gemmRowMajor(handle, numAtoms, numHidden2, numHidden1, d_u, d_W2, d_dxdG2);
+            s.d_dfdx1, W1row, numAtoms, numHidden1, s.d_u);
+        gemmRowMajor(handle, numAtoms, numHidden2, numHidden1, s.d_u, s.d_W2, s.d_dxdG2);
         elementwiseMulKernel<<<(numAtoms * numHidden2 + blk - 1) / blk, blk>>>(
-            d_d2fdx2_2, d_dxdG2, numAtoms * numHidden2, d_tmp);
+            s.d_d2fdx2_2, s.d_dxdG2, numAtoms * numHidden2, s.d_tmp);
         scaleByRowKernel<<<(numAtoms * numHidden2 + blk - 1) / blk, blk>>>(
-            d_tmp, d_W3, numAtoms, numHidden2, d_jacBH2);
+            s.d_tmp, s.d_W3, numAtoms, numHidden2, s.d_jacBH2);
         elementwiseMulKernel<<<(numAtoms * numHidden2 + blk - 1) / blk, blk>>>(
-            d_dfdx2, d_dxdG2, numAtoms * numHidden2, d_jacW3);
+            s.d_dfdx2, s.d_dxdG2, numAtoms * numHidden2, s.d_jacW3);
 
-        gemmRowMajor(handle, numAtoms, numHidden1, numHidden2, d_jacBH2, d_W2T, d_T);
+        gemmRowMajor(handle, numAtoms, numHidden1, numHidden2, s.d_jacBH2, s.d_W2T, s.d_T);
         elementwiseMulKernel<<<(numAtoms * numHidden1 + blk - 1) / blk, blk>>>(
-            d_dfdx1, d_T, numAtoms * numHidden1, d_term1);
+            s.d_dfdx1, s.d_T, numAtoms * numHidden1, s.d_term1);
         scaleByRowKernel<<<(numAtoms * numHidden1 + blk - 1) / blk, blk>>>(
-            d_d2S1, W1row, numAtoms, numHidden1, d_term2);
+            s.d_d2S1, W1row, numAtoms, numHidden1, s.d_term2);
         elementwiseAddKernel<<<(numAtoms * numHidden1 + blk - 1) / blk, blk>>>(
-            d_term1, d_term2, numAtoms * numHidden1, d_jacBH1);
+            s.d_term1, s.d_term2, numAtoms * numHidden1, s.d_jacBH1);
 
         // Sum-reductions over the atom axis, accumulating (beta=1) across
         // every k0 iteration directly into the packed dFdc-sum output.
         gemmRowMajorATransBAcc(handle, 1, numHidden2, numAtoms, -1.0,
-                                dGk0, d_jacW3, 1.0, d_dFdcSum + offW3);
+                                dGk0, s.d_jacW3, 1.0, s.d_dFdcSum + offW3);
         gemmRowMajorATransBAcc(handle, 1, numHidden2, numAtoms, -1.0,
-                                dGk0, d_jacBH2, 1.0, d_dFdcSum + offB2);
+                                dGk0, s.d_jacBH2, 1.0, s.d_dFdcSum + offB2);
         gemmRowMajorATransBAcc(handle, 1, numHidden1, numAtoms, -1.0,
-                                dGk0, d_jacBH1, 1.0, d_dFdcSum + offB1);
+                                dGk0, s.d_jacBH1, 1.0, s.d_dFdcSum + offB1);
 
         scaleByColKernel<<<(numAtoms * numHidden1 + blk - 1) / blk, blk>>>(
-            d_H1, dGk0, numAtoms, numHidden1, d_P);
+            s.d_H1, dGk0, numAtoms, numHidden1, s.d_P);
         scaleByColKernel<<<(numAtoms * numHidden1 + blk - 1) / blk, blk>>>(
-            d_u, dGk0, numAtoms, numHidden1, d_Q2);
+            s.d_u, dGk0, numAtoms, numHidden1, s.d_Q2);
         gemmRowMajorATransBAcc(handle, numHidden1, numHidden2, numAtoms, -1.0,
-                                d_P, d_jacBH2, 1.0, d_dFdcSum + offW2);
+                                s.d_P, s.d_jacBH2, 1.0, s.d_dFdcSum + offW2);
         gemmRowMajorATransBAcc(handle, numHidden1, numHidden2, numAtoms, -1.0,
-                                d_Q2, d_v2, 1.0, d_dFdcSum + offW2);
+                                s.d_Q2, s.d_v2, 1.0, s.d_dFdcSum + offW2);
 
         scaleByColKernel<<<(numAtoms * numIn + blk - 1) / blk, blk>>>(
-            d_G, dGk0, numAtoms, numIn, d_Gscaled);
+            s.d_G, dGk0, numAtoms, numIn, s.d_Gscaled);
         gemmRowMajorATransBAcc(handle, numIn, numHidden1, numAtoms, -1.0,
-                                d_Gscaled, d_jacBH1, 1.0, d_dFdcSum + offW1);
+                                s.d_Gscaled, s.d_jacBH1, 1.0, s.d_dFdcSum + offW1);
 
         // calculateDFdc's "deltaTerm": row k0 (only) of dFdc's W1 block
         // additionally gets -= sum_atom v1s[atom,:]*dGk0[atom], on top of
         // whatever the accumulation just above already wrote there.
         gemmRowMajorATransBAcc(handle, 1, numHidden1, numAtoms, -1.0,
-                                dGk0, d_v1s, 1.0,
-                                d_dFdcSum + offW1 + (size_t)k0 * numHidden1);
+                                dGk0, s.d_v1s, 1.0,
+                                s.d_dFdcSum + offW1 + (size_t)k0 * numHidden1);
     }
 
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    CUDA_CHECK(cudaMemcpy(energyOut, d_energy, numAtoms * sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(dEdGOut, d_dEdG, (size_t)numAtoms * numIn * sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(dFdcSumOut, d_dFdcSum, connCount * sizeof(double), cudaMemcpyDeviceToHost));
-
-    cudaFree(d_W1); cudaFree(d_b1); cudaFree(d_W2); cudaFree(d_b2);
-    cudaFree(d_W3); cudaFree(d_W1T); cudaFree(d_W2T); cudaFree(d_G); cudaFree(d_dGdxyz);
-    cudaFree(d_H1pre); cudaFree(d_H1); cudaFree(d_dfdx1); cudaFree(d_d2fdx2_1);
-    cudaFree(d_H2pre); cudaFree(d_H2); cudaFree(d_dfdx2); cudaFree(d_d2fdx2_2);
-    cudaFree(d_outPre); cudaFree(d_energy);
-    cudaFree(d_v2); cudaFree(d_v1); cudaFree(d_v1s); cudaFree(d_d2S1);
-    cudaFree(d_dEdG); cudaFree(d_dGdxyzT);
-    cudaFree(d_u); cudaFree(d_dxdG2); cudaFree(d_tmp); cudaFree(d_jacBH2);
-    cudaFree(d_jacW3); cudaFree(d_T); cudaFree(d_term1); cudaFree(d_term2);
-    cudaFree(d_jacBH1); cudaFree(d_P); cudaFree(d_Q2); cudaFree(d_Gscaled);
-    cudaFree(d_dFdcSum);
+    CUDA_CHECK(cudaMemcpy(energyOut, s.d_energy, numAtoms * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(dEdGOut, s.d_dEdG, (size_t)numAtoms * numIn * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(dFdcSumOut, s.d_dFdcSum, connCount * sizeof(double), cudaMemcpyDeviceToHost));
 }
 
 } // namespace nnp

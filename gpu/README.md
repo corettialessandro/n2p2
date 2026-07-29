@@ -1198,3 +1198,67 @@ benchmark under MPS to confirm the `1.45×` holds up over a full training
 run, not just one epoch; extend all three dispatches above from
 `HDNNP_2G` to `HDNNP_4G` (needs the extra charge input neuron and
 electrostatics coupling handled).
+
+### Follow-up: made the three dispatch functions reuse device state -- didn't help `F_err`, and that's a useful negative result
+
+With `F_err` (the force-Jacobian dispatch) now `95%` of the GPU epoch even
+with MPS enabled, the obvious hypothesis was the same one that motivated
+`GpuKalmanFilter`'s whole design: all three functions in
+`GpuNeuralNetwork.cu` were stateless, `cudaMalloc`-everything/
+`cudaFree`-everything-every-call (`gpuNnForceDFdcSum()` alone allocated
+and freed roughly three dozen buffers per call), at a calling frequency
+(once per update candidate, ~300+ times/epoch) similar to Kalman's.
+`cudaMalloc`/`cudaFree` carry real fixed driver overhead independent of
+buffer size, so this looked like the same problem with the same fix.
+
+**Implemented**: all three functions (`gpuNnForwardDEdG`,
+`gpuNnEnergyDEdcSum`, `gpuNnForceDFdcSum`) now cache a persistent,
+per-architecture device state, keyed by `(numIn, numHidden1, numHidden2)`
+-- in practice one entry per element (H, O, ...), created lazily on first
+use. Weight-dependent buffers are allocated once and only re-uploaded
+(`cudaMemcpy`, not `cudaMalloc`) every call, since their VALUES change
+every Kalman update even though their SIZE never does; atom-dependent
+buffers grow on demand (never shrink), the same `ensureMCapacity()`
+pattern `GpuKalmanFilter.cu` already used. The public API is completely
+unchanged -- `Mode.cpp`/`Training.cpp` needed no edits at all.
+
+**Validated correct**: `gpu/gemm/libnnpgpu_test.cu`/`libnnpgpu_dedc_test.cu`/
+`libnnpgpu_dfdc_test.cu` were all rewritten to call their function
+*repeatedly*, with fresh random weights and a varying (growing/shrinking)
+atom count every call, instead of once -- a single-shot test can't catch a
+stale-state-reuse or capacity-growth bug. All three: `ALL PASS`, `~1e-13`
+to `~1e-15` against the real `NeuralNetwork` class, across every
+architecture and call in the sequence.
+
+**But the real end-to-end measurement told a different story than
+expected**: rerunning the same MPS comparison with this change in place,
+`F_err` did not improve -- `104.4s → 108.9s` (within run-to-run noise on a
+shared cluster, arguably slightly worse), and the overall epoch was
+likewise flat (`109.4s → 113.2s`). **The hypothesis was wrong**: allocator
+churn was not the dominant remaining cost after all (it may have
+contributed a little, given `F_com` did drop further, `1.24s → 0.44s`,
+but that's a small piece of a `~110s` total). The persistent-state design
+is still kept -- it's strictly better practice regardless (no more
+allocator churn, matches the pattern already validated for Kalman, zero
+downside once validated correct) -- but it does not explain `F_err`'s
+cost, and this section is left in as an honest record of a fix that
+didn't work, not removed to make the narrative cleaner.
+
+**Best remaining guess, not yet confirmed**: `gpuNnForceDFdcSum()`'s
+inner loop runs once per input (`numIn`, up to ~40 for this project's
+real elements) and issues on the order of 15-20 kernel/cuBLAS launches
+per iteration -- roughly 600-800 total GPU launches in a single call, all
+serialized on one stream. Kernel/cuBLAS launch dispatch carries its own
+fixed host-side latency, separate from allocation; at that call count, an
+otherwise-small per-launch overhead could plausibly dominate the wall
+time in a way persistent buffers can't fix, since every one of those
+launches still has to happen. This is a guess, not a measurement --
+confirming it needs actual GPU profiling (`nsys`/`ncu`) to see where the
+time in one real call actually goes, which hasn't been done yet.
+
+Next steps (not yet done): profile a single real `gpuNnForceDFdcSum()`
+call with `nsys`/`ncu` to find out where the `~185ms`/call is actually
+going, rather than guessing a third time; if launch count is confirmed as
+the driver, consider restructuring the `k0` loop to batch multiple
+inputs' worth of work into fewer, larger launches instead of one
+GEMM/kernel set per input.

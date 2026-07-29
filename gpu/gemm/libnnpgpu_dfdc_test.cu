@@ -9,6 +9,14 @@
 // Ground truth: the real nnp::NeuralNetwork::propagate()/calculateDEdG()/
 // calculateDFdc(), the latter summed by hand over all atoms. Also exercises
 // a non-25/25 architecture (30/20) as every other libnnpgpu_*_test.cu does.
+//
+// Each case calls gpuNnForceDFdcSum() repeatedly, with FRESH random weights
+// and a VARYING atom count each iteration (mirroring real training),
+// exercising the persistent, per-architecture device state added after
+// this function stopped cudaMalloc/cudaFree-ing roughly three dozen
+// buffers on every call (see GpuNeuralNetwork.cu's header comment) -- this
+// was the specific call site whose real end-to-end contribution to
+// nnp-train's epoch time (F_err in timing.out) motivated the change.
 
 #include "../../src/libnnpgpu/GpuNeuralNetwork.h"
 #include "NeuralNetwork.h"
@@ -24,74 +32,82 @@
 using namespace nnp;
 using namespace std;
 
-static bool runCase(char const* label, int numAtoms, int numIn,
-                     int numHidden1, int numHidden2, unsigned seed)
+static bool runCase(char const* label, vector<int> const& atomsSchedule,
+                     int numIn, int numHidden1, int numHidden2, unsigned seed)
 {
-    printf("--- %s (numIn=%d, hidden=%d/%d) ---\n", label, numIn, numHidden1, numHidden2);
+    printf("--- %s (numIn=%d, hidden=%d/%d, %zu calls) ---\n",
+           label, numIn, numHidden1, numHidden2, atomsSchedule.size());
 
     int const numOut = 1, numLayers = 4;
     NeuralNetwork::ActivationFunction af[4] = {
         NeuralNetwork::AF_IDENTITY, NeuralNetwork::AF_TANH,
         NeuralNetwork::AF_TANH, NeuralNetwork::AF_IDENTITY};
     int layers[4] = {numIn, numHidden1, numHidden2, numOut};
-    NeuralNetwork nn(numLayers, layers, af);
-    nn.initializeConnectionsRandomUniform(seed);
-    vector<double> conn(nn.getNumConnections());
-    nn.getConnections(conn.data());
-    size_t const connCount = (size_t)nn.getNumConnections();
-
-    if (!nn.hasGpuCompatibleArchitecture())
-    {
-        printf("  hasGpuCompatibleArchitecture() returned false unexpectedly\n");
-        return false;
-    }
 
     mt19937 rng(seed + 1000);
     uniform_real_distribution<double> dist(-1.0, 1.0);
-    vector<double> G((size_t)numAtoms * numIn), dGdxyz((size_t)numAtoms * numIn);
-    for (auto& v : G) v = dist(rng);
-    for (auto& v : dGdxyz) v = dist(rng);
-
-    // --- CPU reference: real NeuralNetwork::propagate()/calculateDEdG()/
-    // calculateDFdc(), the latter summed by hand over all atoms. ----------
-    vector<double> energyCpu(numAtoms), dEdGCpu((size_t)numAtoms * numIn);
-    vector<double> dFdcSumCpu(connCount, 0.0);
-    for (int t = 0; t < numAtoms; ++t)
-    {
-        nn.setInput(&G[(size_t)t * numIn]);
-        nn.propagate();
-        nn.calculateDEdG(&dEdGCpu[(size_t)t * numIn]);
-        nn.getOutput(&energyCpu[t]);
-        vector<double> dFdc(connCount, 0.0);
-        nn.calculateDFdc(dFdc.data(), &dGdxyz[(size_t)t * numIn]);
-        for (size_t j = 0; j < connCount; ++j) dFdcSumCpu[j] += dFdc[j];
-    }
-
-    // --- New library function -------------------------------------------
-    vector<double> energyGpu(numAtoms), dEdGGpu((size_t)numAtoms * numIn);
-    vector<double> dFdcSumGpu(connCount);
-    gpuNnForceDFdcSum(numAtoms, numIn, numHidden1, numHidden2,
-                      conn.data(), G.data(), dGdxyz.data(),
-                      energyGpu.data(), dEdGGpu.data(), dFdcSumGpu.data());
 
     double maxErrE = 0.0, maxErrDEdG = 0.0, maxErrDFdc = 0.0;
-    for (int t = 0; t < numAtoms; ++t)
+    for (size_t call = 0; call < atomsSchedule.size(); ++call)
     {
-        maxErrE = max(maxErrE, fabs(energyGpu[t] - energyCpu[t]));
-        for (int k = 0; k < numIn; ++k)
+        int const numAtoms = atomsSchedule[call];
+
+        NeuralNetwork nn(numLayers, layers, af);
+        nn.initializeConnectionsRandomUniform(seed + (unsigned)call);
+        vector<double> conn(nn.getNumConnections());
+        nn.getConnections(conn.data());
+        size_t const connCount = (size_t)nn.getNumConnections();
+
+        if (!nn.hasGpuCompatibleArchitecture())
         {
-            size_t idx = (size_t)t * numIn + k;
-            maxErrDEdG = max(maxErrDEdG, fabs(dEdGGpu[idx] - dEdGCpu[idx]));
+            printf("  hasGpuCompatibleArchitecture() returned false unexpectedly\n");
+            return false;
         }
+
+        vector<double> G((size_t)numAtoms * numIn), dGdxyz((size_t)numAtoms * numIn);
+        for (auto& v : G) v = dist(rng);
+        for (auto& v : dGdxyz) v = dist(rng);
+
+        // --- CPU reference: real NeuralNetwork::propagate()/calculateDEdG()/
+        // calculateDFdc(), the latter summed by hand over all atoms. ----------
+        vector<double> energyCpu(numAtoms), dEdGCpu((size_t)numAtoms * numIn);
+        vector<double> dFdcSumCpu(connCount, 0.0);
+        for (int t = 0; t < numAtoms; ++t)
+        {
+            nn.setInput(&G[(size_t)t * numIn]);
+            nn.propagate();
+            nn.calculateDEdG(&dEdGCpu[(size_t)t * numIn]);
+            nn.getOutput(&energyCpu[t]);
+            vector<double> dFdc(connCount, 0.0);
+            nn.calculateDFdc(dFdc.data(), &dGdxyz[(size_t)t * numIn]);
+            for (size_t j = 0; j < connCount; ++j) dFdcSumCpu[j] += dFdc[j];
+        }
+
+        // --- Library function (persistent per-architecture GPU state) -----
+        vector<double> energyGpu(numAtoms), dEdGGpu((size_t)numAtoms * numIn);
+        vector<double> dFdcSumGpu(connCount);
+        gpuNnForceDFdcSum(numAtoms, numIn, numHidden1, numHidden2,
+                          conn.data(), G.data(), dGdxyz.data(),
+                          energyGpu.data(), dEdGGpu.data(), dFdcSumGpu.data());
+
+        for (int t = 0; t < numAtoms; ++t)
+        {
+            maxErrE = max(maxErrE, fabs(energyGpu[t] - energyCpu[t]));
+            for (int k = 0; k < numIn; ++k)
+            {
+                size_t idx = (size_t)t * numIn + k;
+                maxErrDEdG = max(maxErrDEdG, fabs(dEdGGpu[idx] - dEdGCpu[idx]));
+            }
+        }
+        for (size_t j = 0; j < connCount; ++j)
+            maxErrDFdc = max(maxErrDFdc, fabs(dFdcSumGpu[j] - dFdcSumCpu[j]));
+
+        printf("  call %2zu: atoms=%4d  connCount=%zu  max|E|=%.3E  max|dEdG|=%.3E  max|dFdcSum|=%.3E\n",
+               call, numAtoms, connCount, maxErrE, maxErrDEdG, maxErrDFdc);
     }
-    for (size_t j = 0; j < connCount; ++j)
-        maxErrDFdc = max(maxErrDFdc, fabs(dFdcSumGpu[j] - dFdcSumCpu[j]));
 
-    printf("  atoms=%d  connCount=%zu\n", numAtoms, connCount);
-    printf("  max|E_gpu-E_cpu|=%.3E  max|dEdG_gpu-dEdG_cpu|=%.3E  "
-           "max|dFdcSum_gpu-dFdcSum_cpu|=%.3E\n",
+    printf("  max over all calls: max|E|=%.3E  max|dEdG|=%.3E  max|dFdcSum|=%.3E\n",
            maxErrE, maxErrDEdG, maxErrDFdc);
-
     bool pass = maxErrE < 1e-9 && maxErrDEdG < 1e-9 && maxErrDFdc < 1e-6;
     printf("  %s\n\n", pass ? "PASS" : "FAIL");
     return pass;
@@ -108,12 +124,18 @@ int main()
     printf("Device 0: %s (SM %d.%d)\n\n", prop.name, prop.major, prop.minor);
 
     bool ok = true;
-    // H2O_2G's real architecture (35/42 inputs, 25/25 hidden).
-    ok &= runCase("H2O_2G-like H", 420, 35, 25, 25, 44);
-    ok &= runCase("H2O_2G-like O", 210, 42, 25, 25, 45);
+    // H2O_2G's real architecture (35/42 inputs, 25/25 hidden), called
+    // repeatedly with a varying (growing/shrinking) atom count, exercising
+    // the persistent state's capacity growth logic.
+    ok &= runCase("H2O_2G-like H", {420, 420, 100, 420, 500, 420, 420},
+                  35, 25, 25, 44);
+    ok &= runCase("H2O_2G-like O", {210, 50, 210, 210, 300, 210},
+                  42, 25, 25, 45);
     // A genuinely different architecture (Anisole_SCAN's 30/20 hidden,
-    // asymmetric hidden-layer sizes) -- proves this isn't hardcoded 25/25.
-    ok &= runCase("Anisole_SCAN-like", 300, 50, 30, 20, 46);
+    // asymmetric hidden-layer sizes) -- proves this isn't hardcoded 25/25,
+    // and that its persistent state doesn't collide with the H2O_2G-like
+    // cases above.
+    ok &= runCase("Anisole_SCAN-like", {300, 300, 150, 300}, 50, 30, 20, 46);
 
     printf("%s\n", ok ? "ALL PASS" : "SOME FAILED");
     return ok ? 0 : 1;
