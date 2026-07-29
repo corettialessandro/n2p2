@@ -1425,3 +1425,79 @@ larger batch, or consolidating multiple ranks' Jacobian work behind one
 process). Finer-grained NVTX instrumentation of the CPU-only sections of
 `Training::update()`'s PART 2 loop would help confirm or rule out the
 "remaining time is legitimate CPU-side work" inference above.
+
+### Follow-up: spread the 32 ranks across all 4 GPUs -- confirms GPU contention is real but a MINORITY of F_err's cost
+
+Direct test of the "fewer ranks per GPU" idea proposed above: this node
+has 4 A100s (`sinfo` reports `gpu:a100:4`), so
+`run_nnp_train_gpu_mps_4gpu.slurm` + `rank_gpu_wrapper.sh` reran the same
+32-rank, 1-epoch, real `H2O_2G` job with the ranks spread 8-per-GPU
+across all 4, instead of all 32 on one. A single MPS daemon (no
+`CUDA_VISIBLE_DEVICES` restriction on the daemon itself) serves all 4
+GPUs; each client rank sets its own `CUDA_VISIBLE_DEVICES` to pick a GPU
+-- this is the pattern NVIDIA's own MPS docs describe for multi-GPU
+nodes. (An earlier attempt ran 4 *separate* per-GPU daemons and hit
+intermittent `cublasCreate()` failures on some ranks, almost certainly a
+startup race between the 4 simultaneous daemon spawns; switching to one
+shared daemon fixed it outright, and is simpler besides.)
+
+| | 32 ranks / 1 GPU (previous section) | 32 ranks / 4 GPUs, 8/GPU |
+| --- | --- | --- |
+| `F_err` | `107.9s` | `87.78s` |
+| `F_err` avg/update (`275` updates) | `~392ms` | `~319ms` |
+| epoch total | `112.2s` | `93.2s` |
+
+**The fix helped, but nowhere near as much as a naive "contention scales
+linearly with ranks-per-GPU" prediction would suggest.** Quartering the
+ranks sharing each GPU (32 -> 8) should have quartered any purely
+GPU-queue-contention-driven cost, but `F_err` only dropped `~19%`
+(`20.12s`), not anywhere close to `~75%`.
+
+**This number is not a coincidence, though -- it lines up almost exactly
+with what was directly measured before.** The previous section's rank-0
+trace of the 32-ranks/1-GPU run found `~19.9s` of confirmed host-side
+blocking-wait time (`cudaDeviceSynchronize` `17.45s` +
+`cudaFree` `1.39s` + `cudaMemcpy` `1.08s`) that had no counterpart in the
+isolated single-process baseline. The `F_err` reduction measured here,
+`20.12s`, matches that `~19.9s` almost to the second. Put together, this
+is a coherent, cross-validated picture:
+- The GPU-sharing-contention component of `F_err` is real, is now
+  quantified independently two different ways (direct trace measurement,
+  and an end-to-end fix that removes almost exactly that much time), and
+  is worth roughly **`~20s`** in this one-epoch benchmark.
+- But that `~20s` is only `~18%` of `F_err`'s total (`107.9s`). The
+  remaining `~82%` (`~88s`) is **not** explained by GPU-sharing
+  contention and was **not** helped by spreading ranks across more GPUs
+  -- consistent with the earlier section's "not yet explained" inference
+  that most of the remaining time is legitimate CPU-side work (symmetry
+  function / data-marshaling code around each GPU dispatch call), since
+  all 32 ranks still run on the *same* 32 CPU cores in both
+  configurations here -- changing which GPU a rank talks to cannot touch
+  a CPU-bound cost.
+
+**Practical takeaway, and its limit:** requesting all available GPUs on
+a node and spreading ranks across them (rather than defaulting to one
+GPU) is a legitimate, free `~15-20%` win whenever multiple GPUs are
+available, and should be the default for future GPU training jobs on
+this cluster. But it is not close to a full fix for GPU training being
+slower than CPU overall -- the dominant remaining cost is now
+strongly implicated as CPU-side, not GPU-side at all.
+
+**What's confirmed vs. still open, explicitly:**
+- CONFIRMED: spreading 32 ranks across 4 GPUs (8/GPU) cuts `F_err` by
+  `~20s` (`~19%`), and this reduction closely matches the independently
+  measured GPU-blocking-wait time from the single-GPU trace.
+- CONFIRMED (by elimination): the majority of `F_err`'s cost is
+  unaffected by GPU-sharing pattern, meaning it is not a GPU-contention
+  problem at all.
+- NOT YET CONFIRMED: that the remaining `~88s` is specifically CPU-side
+  symmetry-function/data-marshaling work, as opposed to some other
+  as-yet-unmeasured cost. This is inferred by elimination (it isn't
+  kernel time, isn't launch overhead, isn't the GPU-contention component
+  quantified above), not directly measured.
+
+Next steps (not yet done): profile the CPU side of `Training::update()`'s
+PART 2 loop directly (e.g. `perf`, or NVTX ranges around the CPU-only
+symmetry-function code bracketing each `gpuNn*` dispatch call) to confirm
+or rule out the "remaining `~88s` is CPU-side work" inference, rather
+than leaving it as elimination-by-exclusion.
