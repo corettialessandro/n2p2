@@ -1053,7 +1053,8 @@ production data** — the most important lesson from this whole call site:
   compound over the ~310 real updates in a way that's intrinsic to the
   algorithm, not a sign of a remaining bug.
 - **Honest performance finding — a real win that doesn't show up net,
-  and why**: the `update()` step itself measurably sped up — `timing.out`'s
+  and why** (resolved two follow-ups down, via NVIDIA MPS — read on):
+  the `update()` step itself measurably sped up — `timing.out`'s
   `F_upd` column (the force-branch Kalman update time, which dominates
   since force candidates vastly outnumber energy candidates) dropped from
   `12.14s` (CPU) to `0.39s` (GPU), a genuine `~31×`. But the *energy*-branch
@@ -1128,25 +1129,72 @@ against one physical GPU with no MPS configured contend for the device
 regardless of whether the work is redundant or not), just without an
 easy fix, since the parallel work itself is real and necessary.
 
-**Bottom line**: the `PM_TRAIN_RK0` fix is a genuine, low-risk correctness
-improvement (matches documented behavior, verified safe, measurably helps
-what it targets) and is kept regardless of the net epoch-time outcome.
-But it revealed that this cluster's "32 ranks, 1 shared GPU, no MPS"
-resource allocation is the more fundamental bottleneck for this
-workload's calling pattern (many small, frequent GPU calls from many
-concurrent processes) — realizing a net `nnp-train` speedup from any of
-these three call sites likely needs either NVIDIA MPS enabled for the
-job, or far fewer, larger GPU calls (e.g. batching multiple ranks' work
-through one process), rather than further changes to the call sites
-themselves. This is still a single epoch's measurement on a shared
-cluster, not a controlled multi-run study — the exact multipliers should
-be taken as directional, not definitive.
+**Bottom line at this point**: the `PM_TRAIN_RK0` fix is a genuine,
+low-risk correctness improvement (matches documented behavior, verified
+safe, measurably helps what it targets) and is kept regardless of the net
+epoch-time outcome. But it revealed that this cluster's "32 ranks, 1
+shared GPU, no MPS" resource allocation was the more fundamental
+bottleneck for this workload's calling pattern (many small, frequent GPU
+calls from many concurrent processes).
 
-Next steps (not yet done): investigate whether NVIDIA MPS is available on
-this cluster and whether enabling it closes the `F_err`/`F_com`
-contention gap; extend all three dispatches above from `HDNNP_2G` to
-`HDNNP_4G` (needs the extra charge input neuron and electrostatics
-coupling handled); and only revisit a full multi-epoch `nnp-train`
-wall-clock benchmark once the contention question above is actually
-resolved, rather than measuring a foregone "faster" that this session's
-data doesn't yet support.
+### Follow-up: NVIDIA MPS resolves the remaining contention — a real net win
+
+`nvidia-smi` on a compute node confirms `nvidia-cuda-mps-control`/
+`nvidia-cuda-mps-server` are installed and the GPU (A100-SXM-64GB, compute
+capability 8.0) is in `Default` compute mode — MPS works without needing
+`EXCLUSIVE_PROCESS` mode on Volta+, and needs no elevated privileges to
+start as a regular user. **One real gotcha**: MPS's control channel is a
+UNIX domain socket, so `CUDA_MPS_PIPE_DIRECTORY`/`CUDA_MPS_LOG_DIRECTORY`
+must point at a node-local filesystem -- a first attempt pointing them at
+the NFS/parallel-filesystem-backed project directory failed silently
+(`nvidia-cuda-mps-control -d` exited 1, both log files empty); pointing
+them at `/tmp` on the compute node instead worked immediately (confirmed
+via `control.log`).
+
+`gpu/e2e_train_check/run_nnp_train_gpu_mps.slurm` builds the real GPU
+`nnp-train` binary once and runs the exact same one-epoch, 32-rank,
+real-`H2O_2G` job twice — without MPS, then with the control daemon
+started first — and compares. Correctness first: `learning-curve.out`
+matches **exactly**, `0.000E+00` max abs diff, between the MPS and
+no-MPS runs (MPS only changes scheduling, never results, as expected).
+Performance:
+
+| column | CPU | GPU, no MPS | GPU + MPS | MPS vs no-MPS | **MPS vs CPU** |
+|---|---|---|---|---|---|
+| epoch (total) | `158.8s` | `209.7s` | `109.4s` | `1.92×` | **`1.45×`** |
+| `Ftrain` | `153.3s` | `200.4s` | `106.0s` | `1.89×` | `1.45×` |
+| `F_err` (force-Jacobian dispatch) | `137.4s` | `185.5s` | `104.4s` | `1.78×` | `1.32×` |
+| `F_com` (MPI wait) | `3.58s` | `14.50s` | `1.24s` | `11.7×` | `2.88×` |
+| `Etrain` | `1.85s` | `5.56s` | `0.22s` | `24.9×` | `8.31×` |
+| `E_err` (energy-Jacobian dispatch) | `0.24s` | `5.43s` | `0.17s` | `31.5×` | `1.41×` |
+| `F_upd`/`E_upd` (Kalman update) | `12.31s`/`1.60s` | `0.39s`/`0.05s` | `0.34s`/`0.04s` | ~flat | `36.6×`/`43.2×` |
+
+With MPS enabled, **every single column beats the CPU baseline** —
+including `F_err`/`E_err`, the two Jacobian dispatches that looked like an
+unfixable, fundamental bottleneck in the finding above. That confirms the
+diagnosis was right: the underlying GPU work was always fast (as the
+standalone, single-process benchmarks throughout this port always
+showed); it was specifically 32 concurrent CUDA contexts serializing
+against each other with no MPS that made it look slow in the full
+MPI job. `nnp-train`'s real epoch time drops from `158.8s` to `109.4s`,
+a genuine **`1.45×` end-to-end speedup** — the first time in this whole
+port that a full `nnp-train` run, not just an isolated kernel or a single
+call site, is honestly faster on the GPU than on the CPU.
+
+This is still a single epoch on a shared, unreserved cluster node, not a
+controlled multi-run statistical study — but going from "consistently
+~1.3-1.9× slower without MPS" to "consistently faster with it, across
+every single timing column" is a large, consistent enough swing not to
+be sampling noise. MPS is not yet wired into the routine validation
+scripts (`run_nnp_train_gpu_vs_cpu.slurm` doesn't start it); a real
+production job would need to start `nvidia-cuda-mps-control -d` (pointed
+at a node-local, e.g. `/tmp`, pipe/log directory) before `mpirun`, and
+stop it afterward.
+
+Next steps (not yet done): fold MPS startup/teardown into
+`run_nnp_train_gpu_vs_cpu.slurm` (and any real production job script) so
+it's the default rather than a separate one-off test; run a multi-epoch
+benchmark under MPS to confirm the `1.45×` holds up over a full training
+run, not just one epoch; extend all three dispatches above from
+`HDNNP_2G` to `HDNNP_4G` (needs the extra charge input neuron and
+electrostatics coupling handled).
