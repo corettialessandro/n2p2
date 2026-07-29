@@ -952,24 +952,144 @@ structure contributes `calculateDFdc()`'s per-connection output (using
   substantial force-driven update happened (not a degenerate/no-op
   comparison).
 
-### Not yet done: `KalmanFilter::update()`
+### Follow-up: `KalmanFilter::update()` — the third and last call site
 
-The two dominant `O(N²·m)` GEMMs inside `KalmanFilter::update()` (`X = P.H`
-and the `K.Hᵀ` term of `P -= K.Xᵀ`) are already validated standalone
-(`gemm/kalman_gemm_test.cu`, `1.22×`/`1.39×` at the real `N=3327, m=32`
-production size — a modest win, since the existing naive kernel there
-already has a reasonably efficient memory-access pattern). Unlike the two
-Jacobian passes above, this hasn't been wired into any real call site yet
-— `KalmanFilter`/`Updater`'s actual weight-update bookkeeping wasn't
-investigated as part of this pass, so it needs its own research pass
-before attempting the wiring, the same way `Training.cpp`'s Jacobian
-branches each needed their own read-through first.
+The last of Phase 4's three profiled GPU cost centers to reach a real
+binary. Unlike the two Jacobian branches above (called from
+`Training.cpp`, stateless per call), `KalmanFilter::update()` needed its
+own design: `P` is a persistent `~89 MB` (`N=3327`) matrix carried across
+*every* weight update for the life of a training run, so the natural
+"upload state, compute, download result" pattern used everywhere else in
+this port doesn't apply here without erasing the entire win.
 
-Next steps (not yet done): wire in `KalmanFilter::update()`'s GEMMs (the
-one piece of Phase 4's profiled cost centers still sitting entirely on
-`gemm/`'s standalone benchmark, not in any real binary); extend both
-Jacobian dispatches above from `HDNNP_2G` to `HDNNP_4G` (needs the extra
-charge input neuron and electrostatics coupling handled in both); and, with
-`Ftrain`'s dominant cost now GPU-accelerated, measuring actual `nnp-train`
-wall-clock speedup finally becomes a meaningful exercise rather than a
-foregone small number.
+**What's wired in**: only the two genuinely dominant `O(N²·m)` steps —
+`X = P.H` and the `K.Xᵀ` term of the covariance downdate `P -= K.Xᵀ` — via
+two new library functions, `gpuKalmanComputeX()`/`gpuKalmanUpdateP()`
+(`src/libnnpgpu/GpuKalmanFilter.h/.cu`), `KT_STANDARD` only (the only mode
+`input.nn` actually configures, same scoping `gpu/kalman/kalman_test.cu`
+already chose). `P` lives on the GPU for the lifetime of one
+`KalmanFilter` object (created lazily on first use); only `H` (uploaded),
+`X` (downloaded once), and `K` (uploaded once) cross the PCIe bus per
+call — all small relative to `P`. **Deliberately not ported**: `A = HᵀX +
+R`, the `m×m` inverse, `K = X.Ainv`, and `w += K.ξ` all stay on the host,
+using the exact same Eigen expressions `KalmanFilter::update()` always
+used — this is `O(N·m²)`, under 1% of the flops, and (see below) porting
+it turned out to be a real correctness trap, not just an unnecessary one.
+
+**Two real bugs found and fixed here, both only visible on real
+production data** — the most important lesson from this whole call site:
+
+1. **Hand-rolled GPU matrix inverse vs. Eigen's LU inverse.** The first
+   version of this integration also ported the `m×m` inverse to a
+   hand-rolled GPU Gauss-Jordan kernel (mirroring `gpu/kalman/
+   kalman_test.cu`'s already-validated standalone benchmark). A standalone
+   test with synthetic random `H`/`ξ` data passed cleanly. But a real
+   end-to-end `nnp-train` run (one full epoch, the real `H2O_2G` dataset,
+   32 MPI ranks) diverged by **~10 orders of magnitude** after that one
+   epoch. Root cause: Gauss-Jordan with partial pivoting and Eigen's
+   `PartialPivLU`-based `.inverse()` are *different algorithms* — both
+   correct for a well-conditioned matrix, but not numerically
+   interchangeable for a near-singular one, and real, correlated
+   production Jacobian data can produce a far more ill-conditioned `A`
+   than uncorrelated random test data ever would by construction. Fixed
+   by removing the GPU inverse entirely and moving `A`/inverse/`K`/`w`
+   back to the host with Eigen, as described above — this also simplified
+   the library (no Gauss-Jordan kernel, no `A`/`Ainv` device buffers at
+   all).
+2. **`P`'s implicit symmetry.** The real code computes
+   `X = P.selfadjointView<Lower>() * H` — Eigen deliberately reads *only*
+   `P`'s lower triangle and mirrors it, rather than trusting the full
+   stored matrix. This matters because the *other* update,
+   `P.noalias() -= K * X.transpose()`, is a plain dense operation with no
+   re-symmetrization, so `P` can and does accumulate genuine
+   floating-point asymmetry over many `update()` calls (the class's own
+   commented-out diagnostic, `"Max. deviation of symmetric form of P"`,
+   is a hint the original authors were aware of this). The CPU path
+   "self-heals" every single call by only ever reading the lower
+   triangle; a first fix of bug 1 left `gpuKalmanComputeX()`'s GEMM
+   reading the *full* stored `P` (both triangles) via a plain
+   `cublasDgemm`, which doesn't self-heal and instead reads back whatever
+   asymmetry has built up. This fix alone took the real end-to-end
+   divergence from ~10 orders of magnitude down to ~4-5 orders — much
+   better, but still a real, visible divergence, not noise. Fixed by
+   switching to `cublasDsymm` (`CUBLAS_SIDE_LEFT`/`CUBLAS_FILL_MODE_LOWER`)
+   — the direct GPU equivalent of `selfadjointView<Lower>()`.
+   - Neither bug was, or could have been, caught by the standalone
+     synthetic-data test alone: bug 1 needs a real ill-conditioned matrix
+     (random test data is never ill-conditioned by construction) and bug 2
+     needs *many* real update() calls compounding real asymmetry (the
+     standalone test's own reference path doesn't use `selfadjointView`
+     either, so it can't see this class of bug regardless of iteration
+     count). Both were only caught by a real, full end-to-end `nnp-train`
+     run — a second, independent confirmation (after the earlier
+     stale-`libnnp.a` crash) that this project's "validate the real
+     binary, not just the synthetic microbenchmark" discipline matters.
+- **Validated standalone** (`gpu/gemm/libnnpgpu_kalman_test.cu`,
+  `run_libnnpgpu_kalman.slurm`): drives the actual persistent-state API
+  across many iterations (unlike `gemm/kalman_gemm_test.cu`, which called
+  the GEMM pipeline directly with everything freshly allocated each time),
+  cross-checked against both an independent from-scratch CPU reference and
+  the real `nnp::KalmanFilter` class. Four cases: small, production-sized
+  (`N=3327, m=32`, 20 updates), the *real* `H2O_2G` production schedule
+  (real `kalman_epsilon`/`q0`/`qtau`/`qmin`/`eta`/`etatau`/`etamax` values
+  from `input.nn`, normalized by the real ~310 updates/epoch this dataset
+  produces — see `temp/H2O_2G/updater.000.out`), and a varying-`m` case
+  exercising the growable scratch-buffer logic. All four: `max|P_gpu-P_cpu|
+  ≤ 1.1E-13`, `max|w_gpu-w_real| ≤ 3.4E-14`, PASS.
+- **The real end-to-end deliverable**: `gpu/e2e_train_check/run_nnp_train_
+  gpu_vs_cpu.slurm` (unchanged from the Jacobian rounds) now exercises all
+  three GPU call sites together. Result, after both fixes above:
+  `learning-curve.out`'s energy/force RMSE values agree to **4-5
+  significant figures** between CPU and GPU (e.g. `6.98988453E-06` vs
+  `6.98888908E-06`), and the post-epoch-1 weights (3327 connections total)
+  differ by at most `~1.5E-3` absolute — small, physically reasonable
+  numbers, not a divergence, but *not* bit-identical either, unlike the two
+  Jacobian call sites. That distinction is expected and not a red flag:
+  the Jacobian branches are single-pass, embarrassingly-parallel
+  reductions (bit-identical results whenever the same numbers are summed
+  in the same order); the Kalman recursion is an iterative feedback loop
+  where `P` from one call feeds the next, so small floating-point
+  differences from a different GEMM implementation's summation order
+  compound over the ~310 real updates in a way that's intrinsic to the
+  algorithm, not a sign of a remaining bug.
+- **Honest performance finding — a real win that doesn't show up net,
+  and why**: the `update()` step itself measurably sped up — `timing.out`'s
+  `F_upd` column (the force-branch Kalman update time, which dominates
+  since force candidates vastly outnumber energy candidates) dropped from
+  `12.14s` (CPU) to `0.39s` (GPU), a genuine `~31×`. But the *energy*-branch
+  update column, `E_upd`, got **slower** (`1.58s → 5.37s`), and — more
+  importantly — `F_com` (MPI communication time for the force branch)
+  ballooned from `2.96s` to `50.45s`, and the **overall epoch got slower
+  overall** (`156.0s → 211.2s`, about `1.35×` slower), even though the
+  piece of code this pass actually touched got dramatically faster in
+  isolation. The likely explanation: this cluster's job allocates a
+  **single physical GPU shared by all 32 MPI ranks** (`--gres=gpu:1`,
+  `--ntasks-per-node=32`, no MPS configured) — each rank runs the *exact
+  same* redundant Kalman computation (by design: every rank
+  independently recomputes the identical update from identical
+  `MPI_Allgatherv`'d data, avoiding a separate broadcast step), so 32
+  separate CUDA contexts now contend for one device far more often per
+  epoch than either Jacobian call site did. `MPI_Allgatherv`'s wall time
+  is set by whichever rank is slowest to arrive, so uneven GPU-context
+  scheduling delays across ranks plausibly show up as inflated
+  "communication" time even though the actual payload didn't change. This
+  is a single epoch's measurement, not a scientifically thorough timing
+  study, but the direction is clear enough not to overclaim: correctness
+  is solid, but realizing this call site's speedup as a net `nnp-train`
+  win likely needs a different execution model (e.g. only rank 0
+  computing the update and broadcasting `w`, instead of 32-way redundant
+  GPU computation) rather than more of what worked for the embarrassingly
+  parallel Jacobian branches.
+
+Next steps (not yet done): investigate the MPI/GPU-contention effect above
+properly (multi-epoch timing to separate one-time CUDA context setup from
+a recurring per-call cost; consider a rank-0-computes-and-broadcasts
+redesign for the Kalman step specifically, since redundant 32-way
+computation is what turns "32 processes, 1 GPU" from a non-issue into a
+bottleneck at this call site's calling frequency); extend all three
+dispatches above from `HDNNP_2G` to `HDNNP_4G` (needs the extra charge
+input neuron and electrostatics coupling handled); and, now that all three
+of Phase 4's profiled cost centers are wired into the real binary, a
+proper multi-epoch wall-clock benchmark of `nnp-train` as a whole would
+be a meaningful exercise — though per the finding above, the answer isn't
+a foregone "faster" until the GPU-contention question is resolved.

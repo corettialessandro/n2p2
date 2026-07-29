@@ -150,7 +150,7 @@ clean-libnnpgpu:
 # libnnptrain #
 ###############
 libnnptrain: libnnp
-	cd $@ && $(MAKE) COMP=$(COMP) MODE=$(MODE)
+	cd $@ && $(MAKE) COMP=$(COMP) MODE=$(MODE) GPU=$(GPU)
 
 clean-libnnptrain: LIBDIR=$(subst clean-,,$@)
 clean-libnnptrain:

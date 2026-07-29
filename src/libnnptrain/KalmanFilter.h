@@ -27,6 +27,13 @@
 namespace nnp
 {
 
+#ifdef N2P2_GPU
+// Opaque, forward-declared only -- see src/libnnpgpu/GpuKalmanFilter.h.
+// Kept out of this header's actual type so ordinary (non-GPU) builds of
+// this class need no CUDA-aware include at all.
+struct GpuKalmanFilterState;
+#endif
+
 /// Implementation of the Kalman filter method.
 class KalmanFilter : public Updater
 {
@@ -229,11 +236,28 @@ private:
     /// Derivative matrix.
     Eigen::Map<Eigen::MatrixXd const>* H;
     /// Error covariance matrix.
+#ifdef N2P2_GPU
+    // mutable: status() (a const method) syncs this from #gpuState on
+    // demand when GPU-accelerated updates are active -- a cache refresh,
+    // not a logical state change from the caller's point of view.
+    mutable Eigen::MatrixXd             P;
+#else
     Eigen::MatrixXd                    P;
+#endif
     /// Kalman gain matrix.
     Eigen::MatrixXd                    K;
     /// Intermediate result X = P . H.
     Eigen::MatrixXd                    X;
+#ifdef N2P2_GPU
+    /// GPU-resident P state (src/libnnpgpu/GpuKalmanFilter.h), created
+    /// lazily on the first GPU-accelerated update() call (KT_STANDARD
+    /// only). While active, this -- not #P above -- is authoritative for
+    /// P; status() syncs #P back from it on demand for diagnostics. #K/#X
+    /// remain always up to date on the host regardless (computed there in
+    /// update() either way -- only the two dominant GEMMs move to the
+    /// GPU, see GpuKalmanFilter.h).
+    GpuKalmanFilterState*              gpuState;
+#endif
 };
 
 //////////////////////////////////

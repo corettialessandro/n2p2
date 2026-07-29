@@ -16,6 +16,9 @@
 
 #include "KalmanFilter.h"
 #include "utility.h"
+#ifdef N2P2_GPU
+#include "GpuKalmanFilter.h"
+#endif
 #include <Eigen/LU>
 #include <iostream>
 #include <stdexcept>
@@ -44,6 +47,9 @@ KalmanFilter::KalmanFilter(size_t const sizeState,
     w              (NULL),
     xi             (NULL),
     H              (NULL)
+#ifdef N2P2_GPU
+    , gpuState     (NULL)
+#endif
 {
     if (!(type == KT_STANDARD ||
           type == KT_FADINGMEMORY))
@@ -71,6 +77,9 @@ KalmanFilter::KalmanFilter(size_t const sizeState,
 
 KalmanFilter::~KalmanFilter()
 {
+#ifdef N2P2_GPU
+    if (gpuState) gpuKalmanDestroy(gpuState);
+#endif
 }
 
 void KalmanFilter::setSizeObservation(size_t const size)
@@ -126,6 +135,77 @@ void KalmanFilter::update()
 void KalmanFilter::update(size_t const sizeObservation)
 {
     sw[prefix].start(timingReset);
+
+#ifdef N2P2_GPU
+    // Phase 6 follow-up (GPU_PORTING_PLAN.md): KT_STANDARD only -- the
+    // only mode this project's production input.nn actually uses (same
+    // scoping gpu/kalman/kalman_test.cu already chose). Only the two
+    // dominant O(N^2*m) steps (X=P.H, the K.X^T term of P-=K.X^T) run on
+    // the GPU, via a lazily-created persistent GpuKalmanFilterState
+    // (src/libnnpgpu/GpuKalmanFilter.h) that keeps P device-resident
+    // across every call -- re-uploading/downloading all of P (N x N,
+    // ~89 MB at production size) every single call would very plausibly
+    // erase the GEMM speedup entirely, since this update() is called far
+    // more often per epoch than the Jacobian call sites above. Everything
+    // else (A=H^T.X+R, the m x m inverse, K=X.Ainv, w+=K.xi) stays exactly
+    // as the original CPU code below, using #X/#K's normal Eigen storage
+    // -- deliberately NOT reimplemented on the GPU: it's O(N*m^2), under
+    // 1% of the flops, and an earlier version of this code that DID port
+    // the inverse to a hand-rolled GPU Gauss-Jordan kernel diverged
+    // catastrophically (~1e10) on real production data despite passing a
+    // synthetic-random-data standalone test, because Gauss-Jordan isn't
+    // numerically interchangeable with Eigen's LU-based .inverse() on a
+    // real, sometimes ill-conditioned m x m matrix. status() below
+    // downloads P from this state on demand, since #P goes stale once
+    // it's active; #K never goes stale since it's computed on the host
+    // below exactly as always.
+    if (type == KT_STANDARD)
+    {
+        if (!gpuState)
+        {
+            gpuState = gpuKalmanCreate((int)sizeState, P.data());
+        }
+
+        X.resize(sizeState, sizeObservation);
+        gpuKalmanComputeX(gpuState, (int)sizeObservation, H->data(), X.data());
+
+        // Calculate scaling matrix.
+        // A = H^T . X
+        MatrixXd A = H->transpose() * X;
+
+        // Increase learning rate.
+        // eta(n) = eta(0) * exp(n * tau)
+        if (eta < etamax) eta *= exp(etatau);
+
+        // Add measurement noise.
+        // A = A + R
+        A.diagonal() += VectorXd::Constant(sizeObservation, 1.0 / eta);
+
+        // Calculate Kalman gain matrix.
+        // K = X . A^-1
+        K.resize(sizeState, sizeObservation);
+        K = X * A.inverse();
+
+        // Update error covariance matrix.
+        // P = P - K . X^T; P = P + Q
+        gpuKalmanUpdateP(gpuState, (int)sizeObservation, K.data(), q);
+
+        // Update state vector.
+        // w = w + K . xi
+        (*w) += K * (*xi);
+
+        // Anneal process noise.
+        // q(n) = q(0) * exp(-n * tau)
+        if (q > qmin) q *= exp(-qtau);
+
+        numUpdates++;
+
+        if (timingReset) timingReset = false;
+        sw[prefix].stop();
+
+        return;
+    }
+#endif
 
     X.resize(sizeState, sizeObservation);
 
@@ -242,6 +322,16 @@ void KalmanFilter::setParametersFadingMemory(double const epsilon,
 
 string KalmanFilter::status(size_t epoch) const
 {
+#ifdef N2P2_GPU
+    // #P is stale (never touched on the host) once GPU-accelerated updates
+    // are active -- sync the current device-resident value in before using
+    // it for diagnostics below. #K needs no such sync: it's always
+    // computed on the host in update() regardless of GPU acceleration.
+    if (gpuState)
+    {
+        gpuKalmanGetP(gpuState, P.data());
+    }
+#endif
 
     double Pasym = 0.5 * (P - P.transpose()).array().abs().mean();
     double Pdiag = P.diagonal().array().abs().sum();
