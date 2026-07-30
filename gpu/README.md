@@ -1580,3 +1580,144 @@ whether `calculateForces()` is worth GPU-porting given it is `~84%` of
 raise the `rmse_threshold_trials` trade-off with whoever owns the
 training recipe, since it directly multiplies PART 1's cost independent
 of any GPU work.
+
+### Follow-up: GPU-ported `calculateForces()` -- two failed attempts, then a real ~12x win
+
+Went after the higher-value target identified above. First confirmed
+`calculateForces()` really had never been touched by this port: only one
+commit on this branch (`1fe973a`) edits `Mode.cpp` for GPU work, and its
+diff is entirely inside `calculateAtomicNeuralNetworks()`, nowhere near
+`calculateForces()` (verified via `git show`/`git log` on `Mode.cpp`, not
+just a assumption).
+
+**The math**: `Mode::calculateForces()` sums, for every atom `i`, a self
+term (`-sum_k dEdG_i[k] * dGdr_i[k]`, no cross-atom dependency) plus a
+pair term contributed by every neighbor `j` whose own symmetry functions
+depend on `i`'s position (`-dEdG_j[table] * dGdr_j-wrt-i`). The CPU code
+computes the pair term **atom-`i`-centric with an inner search**: for
+each `i`, loop its unique neighbors `j`, then search `j`'s *own* neighbor
+list for the entry pointing back to `i`. Reformulating this
+**owner-`j`-centric** instead -- one direct pass over each atom's own
+neighbor list, scatter-adding each contribution straight into the
+*target* atom's accumulator -- computes the exact same sum without the
+inner search, and is naturally a GPU-friendly edge list: one thread per
+edge, `atomicAdd` into the target atom's force. Two kernels
+(`src/libnnpgpu/GpuForces.cu`): `selfForceKernel` (one thread/atom, no
+atomics needed) and `pairForceKernel` (one thread/edge, atomic scatter).
+
+**Validated correct** against the real `Mode::calculateForces()` (not a
+reimplementation) via `gpu/gemm/libnnpgpu_forces_test.cu`, using real
+`H2O_2G` structures read through the actual `Prediction` class. Building
+this test surfaced a real, previously-undetected, unrelated bug: `Atom::
+toPhysicalUnits()`/`toNormalizedUnits()` (`src/libnnp/Atom.cpp`) has a
+loop, over each atom's neighbor list, that's supposed to convert *the
+neighbor's* `dGdr` but instead re-multiplies *the atom's own* `dGdr` by
+`convLength` once per neighbor entry -- with ~100+ neighbors this
+produces `convLength^100`-scale garbage (`~1e180`+ in an early test run).
+It's dormant in ordinary `nnp-predict` usage since nothing reads `dGdr`
+after that conversion runs; this test is a new consumer that does, so it
+hit the bug immediately. Worked around it by calling `evaluateNNP()`
+directly instead of `predict()` (skips the buggy conversion entirely,
+compares everything in the NNP's native normalized units, which is all
+this test needs) rather than touching `Atom.cpp` -- flagging the bug
+here as a real, separate finding, not fixing it as part of this
+GPU-porting work.
+
+**Attempt 1 (stateless, rebuild-and-reupload-every-call) measured
+WORSE, not better.** This mirrors the exact phased approach that worked
+fine for `GpuNeuralNetwork.cu`'s three dispatch functions -- but real
+end-to-end measurement (same 32-ranks/1-GPU/MPS/1-epoch/real-`H2O_2G`
+scenario used throughout this file) showed `F_err` going from
+`104-110s` to **`136.3s`**, and the whole training loop `130s -> 221.7s`.
+Root cause: `calculateForces()`'s edge list is one to two orders of
+magnitude bigger than anything the NN dispatch functions ever moved (up
+to `~1.68M` entries for one real structure, tens of MB per call), called
+up to 4x per force update (`SM_THRESHOLD`'s 3 trials + 1 final PART 2
+call), under the same 32-way MPS contention that the rank-0 profiling
+section above already showed makes `cudaMalloc`/`cudaMemcpy`/`cudaFree`
+themselves become blocking, multi-millisecond-to-second stalls.
+Correctness was unaffected (`learning-curve.out` matched prior runs) --
+only speed regressed.
+
+**Attempt 2: persistent per-structure topology cache -- correct, but ran
+out of GPU memory.** Unlike the NN dispatch functions' weight/`G`/`dGdxyz`
+inputs (which genuinely change every call), `calculateForces()`'s
+topology (`dEdGOffset`, `dGdrSelf`, the whole edge list) is **purely
+geometric** and never changes during training -- only `dEdG` does (it
+depends on the NN's current weights). Split the API into
+`gpuForcesUploadTopology()` (called once per structure, keyed by
+`Structure::index`) and `gpuForcesCompute()` (called every time,
+re-uploads only the small `dEdG` array). Validated correct --
+`libnnpgpu_forces_test.cu` was extended to upload topology once per
+structure then call `gpuForcesCompute()` repeatedly with *manually
+perturbed* `dEdG` (simulating repeated weight updates against fixed
+geometry), each compared against a fresh real `Mode::calculateForces()`
+call for that exact perturbed `dEdG` -- `ALL PASS`, `~2e-14`. But the
+real 32-ranks/1-GPU/MPS run crashed: **`out of memory`** on multiple
+ranks. Each structure's cached edge list is `~54MB` (`H2O_2G`,
+`~1.68M` edges x 32 bytes/edge); each rank caches roughly `35-40`
+distinct structures over an epoch (`~1129` train structures / 32 ranks);
+`32` ranks x `~2GB`/rank far exceeds what one A100 can hold once
+everything else sharing that GPU is accounted for.
+
+**Fix: combine with the earlier 4-GPU-spread finding.** Rather than add
+a memory-bounded eviction policy (real added complexity, and its benefit
+shrinks whenever eviction churn is high -- a live option if ever
+revisited), spread the same 32 ranks 8-per-GPU across this node's 4
+A100s (reusing `rank_gpu_wrapper.sh` and the single shared MPS daemon
+pattern from the earlier MPS-contention follow-up section) --
+`run_nnp_train_gpu_forces_4gpu.slurm`. This cuts the aggregate cached
+memory per GPU to `~8` ranks x `~2GB` = `~16GB`, comfortably within one
+A100's capacity.
+
+**Result: a real, clean, apples-to-apples ~12x win.**
+
+| | CPU `calculateForces()`, 4-GPU spread (earlier section) | GPU `calculateForces()` (cached), 4-GPU spread (this run) |
+| --- | --- | --- |
+| `F_err` | `87.78s` | **`7.12s`** |
+| epoch total | `93.19s` | **`8.11s`** |
+| training loop total | (not recorded) | `29.09s` |
+
+`F_err`: **`12.3x`** faster. Epoch: **`11.5x`** faster. Against the very
+first CPU-forces/1-GPU/32-rank baseline this whole investigation started
+from (`F_err = 107.9s`), that's **`15.2x`**. `learning-curve.out`'s
+energy/force RMSEs match every prior run almost exactly (e.g.
+`E_train = 6.98885538E-06` here vs. `6.98889E-06`/`6.98908E-06` in
+earlier runs) -- correctness held throughout every attempt, including
+the two that regressed on speed.
+
+**What's confirmed vs. still open, explicitly:**
+- CONFIRMED: `gpuForcesUploadTopology()`/`gpuForcesCompute()` compute the
+  exact same result as the real CPU `Mode::calculateForces()`, including
+  across repeated calls with varying `dEdG` against fixed, cached
+  topology.
+- CONFIRMED: the real end-to-end `~12x` `F_err` speedup, measured
+  against the closest available clean baseline (same 4-GPU-spread
+  infrastructure, only `calculateForces()` differs).
+- CONFIRMED (separate, incidental finding): `Atom::toPhysicalUnits()`/
+  `toNormalizedUnits()` has a real bug (converts the wrong `dGdr` inside
+  its neighbor loop) -- dormant today, but worth fixing or at least
+  tracking separately from this GPU-porting work.
+- NOT YET DONE: this measurement combines two changes (the
+  `calculateForces()` GPU port itself, and the 4-GPU spread it now
+  requires for memory reasons) -- both were independently validated
+  before combining (the 4-GPU spread's own effect was already measured
+  in isolation in the earlier section, `~19%` on the old CPU-forces
+  code), but a fully isolated "GPU forces on exactly 1 GPU" number isn't
+  available since that configuration doesn't fit in memory.
+- NOT YET DONE: no memory-bounded eviction policy exists for the
+  topology cache -- it currently grows unboundedly per rank for as many
+  distinct structures as that rank visits over training. This was
+  sufficient here (with the 4-GPU spread), but would need revisiting for
+  larger datasets, more ranks per GPU, or bigger structures.
+- NOT YET DONE: multi-epoch validation (this is still a 1-epoch
+  benchmark, matching every other measurement in this file) and
+  extending beyond `HDNNP_2G`.
+
+Next steps (not yet done): run a multi-epoch benchmark to confirm the
+`~12x` holds over a full training run, not just one epoch; consider
+whether the `Atom::toPhysicalUnits()`/`toNormalizedUnits()` bug found
+along the way should be fixed given it's now known to be real, even
+though dormant; decide whether a memory-bounded eviction policy is
+worth the complexity if future datasets/configurations need more ranks
+per GPU than this one comfortably supports.

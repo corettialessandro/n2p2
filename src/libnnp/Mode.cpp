@@ -20,6 +20,7 @@
 #include "version.h"
 #ifdef N2P2_GPU
 #include "GpuNeuralNetwork.h"
+#include "GpuForces.h"
 #endif
 #include <cmath>
 #ifdef _OPENMP
@@ -35,6 +36,9 @@
 #include <limits>    // std::numeric_limits
 #include <stdexcept> // std::runtime_error
 #include <utility>   // std::piecewise_construct, std::forward_as_tuple
+#ifdef N2P2_GPU
+#include <set>       // std::set (calculateForces()'s GPU topology cache)
+#endif
 
 using namespace std;
 using namespace nnp;
@@ -1958,6 +1962,131 @@ void Mode::calculateForces(Structure& structure) const
         throw runtime_error("WARNING: Forces are not implemented yet.\n");
         return;
     }
+
+#ifdef N2P2_GPU
+#ifndef N2P2_FULL_SFD_MEMORY
+    // gpu/README.md's "F_err is ~84% calculateForces(), not GPU dispatch"
+    // follow-up: this whole-structure, O(atoms x neighbors) force
+    // computation -- not the NN forward/backward pass -- turned out to be
+    // the dominant real cost, so it gets its own GPU port
+    // (GpuForces.h/.cu), independent of and orthogonal to the three
+    // NN-architecture-dependent dispatch functions in GpuNeuralNetwork.h.
+    // HDNNP_4G is out of scope (its extra electrostatics force
+    // contributions below are untouched either way); N2P2_FULL_SFD_MEMORY
+    // stores dGdxia per-atom rather than in the shared #dGdxia scratch
+    // member this port's CPU-side data extraction assumes, also out of
+    // scope (and off by default, see src/makefile.gnu).
+    //
+    // A first, stateless pass (rebuild AND re-upload topology every call)
+    // measured WORSE end-to-end (104-110s -> 136.3s) -- the edge list
+    // here is one to two orders of magnitude bigger than anything the
+    // three NN dispatch functions ever moved, and re-uploading it up to
+    // 4x per force update under 32-way MPS contention dominated. Fix:
+    // topology (dEdGOffset/dGdrSelf/edge list) is purely geometric and
+    // never changes during training, so it's uploaded to the GPU exactly
+    // ONCE per structure (gpuForcesUploadTopology(), keyed by
+    // structure.index) and cached there; only the small dEdG array is
+    // rebuilt and re-uploaded every call (gpuForcesCompute()).
+    if (nnpType == NNPType::HDNNP_2G)
+    {
+        static set<size_t> gpuForceTopologyUploaded;
+        bool const firstCallForThisStructure =
+            gpuForceTopologyUploaded.insert(structure.index).second;
+
+        int const numAtoms = (int)structure.atoms.size();
+        vector<int> dEdGOffset(numAtoms + 1, 0);
+        for (int i = 0; i < numAtoms; ++i)
+        {
+            dEdGOffset[i + 1] = dEdGOffset[i]
+                + (int)structure.atoms.at(i).numSymmetryFunctions;
+        }
+        int const numValues = dEdGOffset[numAtoms];
+
+        if (firstCallForThisStructure)
+        {
+            // Build the (purely geometric, weight-independent) topology
+            // -- CSR self-term dGdrSelf and the owner-centric pair-term
+            // edge list -- see GpuForces.h's header comment for the
+            // derivation, already validated in
+            // gpu/gemm/libnnpgpu_forces_test.cu against the real CPU
+            // computation, including across repeated calls with varying
+            // dEdG.
+            vector<double> dGdrSelf((size_t)numValues * 3);
+            for (int i = 0; i < numAtoms; ++i)
+            {
+                Atom const& a = structure.atoms.at(i);
+                int const off = dEdGOffset[i];
+                for (size_t k = 0; k < a.numSymmetryFunctions; ++k)
+                {
+                    dGdrSelf[3 * (off + k) + 0] = a.dGdr.at(k).r[0];
+                    dGdrSelf[3 * (off + k) + 1] = a.dGdr.at(k).r[1];
+                    dGdrSelf[3 * (off + k) + 2] = a.dGdr.at(k).r[2];
+                }
+            }
+
+            vector<int> edgeTarget;
+            vector<int> edgeOwnerDEdGIndex;
+            vector<double> edgeDGdr;
+            for (int j = 0; j < numAtoms; ++j)
+            {
+                Atom const& aj = structure.atoms.at(j);
+                vector<vector<size_t>> const& tableFull =
+                    elements.at(aj.element).getSymmetryFunctionTable();
+                size_t const numNeighbors =
+                    aj.getStoredMinNumNeighbors(maxCutoffRadius);
+                for (size_t k = 0; k < numNeighbors; ++k)
+                {
+                    Atom::Neighbor const& n = aj.neighbors.at(k);
+                    vector<size_t> const& table = tableFull.at(n.element);
+                    for (size_t m = 0; m < n.dGdr.size(); ++m)
+                    {
+                        edgeTarget.push_back((int)n.index);
+                        edgeOwnerDEdGIndex.push_back(dEdGOffset[j]
+                                                    + (int)table.at(m));
+                        edgeDGdr.push_back(n.dGdr.at(m).r[0]);
+                        edgeDGdr.push_back(n.dGdr.at(m).r[1]);
+                        edgeDGdr.push_back(n.dGdr.at(m).r[2]);
+                    }
+                }
+            }
+            int const numEdges = (int)edgeTarget.size();
+
+            gpuForcesUploadTopology((int)structure.index, numAtoms,
+                                    dEdGOffset.data(), dGdrSelf.data(),
+                                    numEdges, edgeTarget.data(),
+                                    edgeOwnerDEdGIndex.data(),
+                                    edgeDGdr.data());
+        }
+
+        // dEdG changes every call (depends on the NN's current weights)
+        // -- always rebuilt, but this is cheap: O(atoms x
+        // numSymmetryFunctions), not O(edges).
+        vector<double> dEdG(numValues);
+        for (int i = 0; i < numAtoms; ++i)
+        {
+            Atom const& a = structure.atoms.at(i);
+            int const off = dEdGOffset[i];
+            for (size_t k = 0; k < a.numSymmetryFunctions; ++k)
+            {
+                dEdG[off + k] = a.dEdG.at(k);
+            }
+        }
+
+        vector<double> force((size_t)numAtoms * 3);
+        gpuForcesCompute((int)structure.index, dEdG.data(), force.data());
+
+        for (int i = 0; i < numAtoms; ++i)
+        {
+            Atom& a = structure.atoms.at(i);
+            a.f.r[0] = force[3 * i + 0];
+            a.f.r[1] = force[3 * i + 1];
+            a.f.r[2] = force[3 * i + 2];
+        }
+
+        return;
+    }
+#endif
+#endif
 
     // Loop over all atoms, center atom i (ai).
 #ifdef _OPENMP
