@@ -1501,3 +1501,82 @@ PART 2 loop directly (e.g. `perf`, or NVTX ranges around the CPU-only
 symmetry-function code bracketing each `gpuNn*` dispatch call) to confirm
 or rule out the "remaining `~88s` is CPU-side work" inference, rather
 than leaving it as elimination-by-exclusion.
+
+### Follow-up: instrumented `Training::update()`'s PART 1/PART 2 directly -- found the real answer, and it's not the GPU dispatch at all
+
+Rather than guess a third time, added *temporary* `Stopwatch` timers
+directly in `src/libnnptrain/Training.cpp` (reverted afterward -- not
+part of any commit) bracketing every substantial call inside the
+`k == "force"` code path, and printed their per-epoch totals as a
+`DEBUG` line from `printEpoch()`. Ran the same 32-ranks/1-GPU/MPS,
+1-epoch, real `H2O_2G` job (`run_nnp_train_cpu_breakdown.slurm`).
+
+The first pass only instrumented PART 2 (`collectDGdxia` +
+`gpuNnForceDFdcSum` + PART 2's own `calculateForces()` call) and left
+`~70s` of `F_err` still unexplained. Reading through PART 1 ("Find
+update candidate") explained why: `H2O_2G`'s `input.nn` sets
+`selection_mode 2` (`SM_THRESHOLD`) with `rmse_threshold_trials 3` --
+meaning **PART 1 itself, before PART 2's GPU-accelerated Jacobian step
+even runs, loops up to 3 times per selected update**, and each trial
+calls `calculateSymmetryFunctionGroups()`, `calculateAtomicNeuralNetworks()`,
+and **`calculateForces()`** (the same whole-structure, O(atoms x
+neighbors), OpenMP-only, entirely CPU force loop in `Mode.cpp` --
+`calculateSelfForceShort()`/`calculatePairForceShort()` over every atom
+and its unique neighbors) to decide whether that candidate's RMSE
+exceeds the threshold. Added three more timers there
+(`trial_symfunc`/`trial_nn`/`trial_forces`) and reran.
+
+**Full breakdown of `F_err` (`82.87s` this run), accounting for
+essentially all of it (`82.57s` measured, `~0.3s` unattributed):**
+
+| Component | Time | Share of `F_err` |
+| --- | --- | --- |
+| `trial_forces` -- PART 1's `SM_THRESHOLD` loop's `calculateForces()`, up to 3x/update | **`61.16s`** | **`~74%`** |
+| `force_calcforces` -- PART 2's own (single) `calculateForces()` call | `8.46s` | `~10%` |
+| `force_gpu` -- the actual GPU Jacobian dispatch (`gpuNnForceDFdcSum`), this whole investigation's original focus | `11.67s` | `~14%` |
+| `trial_nn` -- PART 1's `calculateAtomicNeuralNetworks()` | `1.04s` | `~1%` |
+| `force_collect` / `trial_symfunc` | `~0.25s` / `~0.00s` | `~0%` |
+
+`trial_symfunc` being essentially free confirms `memorize_symfunc_results`
+(set in `H2O_2G`'s `input.nn`) is doing its job -- symmetry functions are
+cached, not recomputed. But **`calculateForces()`, called up to 4 times
+per force-update (3 `SM_THRESHOLD` trials + 1 final PART 2 call), is
+entirely CPU-only, was never GPU-ported at any point in this project, and
+accounts for `~84%` of `F_err`'s total cost.** The GPU Jacobian dispatch
+this entire investigation (rank-0 profiling, 4-GPU spread) focused on is
+real, measurable, and was optimized correctly -- but it was only ever
+`~14%` of the problem.
+
+**This reframes the whole investigation.** Every prior follow-up in this
+file (MPS, persistent GPU state, launch-count profiling, rank-0 tracing,
+multi-GPU spreading) was legitimate, correctly executed, and honestly
+reported -- but all of it targeted the smaller of two costs.
+`calculateForces()` was never a suspect until it was directly measured,
+because nothing about GPU contention or launch counts pointed at it --
+it doesn't call into `src/libnnpgpu` at all, in either PART 1's trial
+loop or PART 2.
+
+**What's confirmed vs. still open, explicitly:**
+- CONFIRMED (directly measured, accounts for ~100% of `F_err`, not
+  elimination-by-exclusion this time): `calculateForces()` calls,
+  driven by `SM_THRESHOLD`'s trial mechanism, are `~84%` of `F_err`'s
+  cost; the GPU dispatch is `~14%`.
+- NOT YET DONE: `calculateForces()` has no GPU implementation at all --
+  `src/libnnpgpu` doesn't touch it. Whether it's a good GPU-porting
+  target (it's an O(atoms x neighbors) pairwise sum, structurally similar
+  in shape to symmetry function evaluation, which was out of scope for
+  this whole `HDNNP_2G`-dispatch-focused port) is an open question, not
+  yet assessed.
+- WORTH CHECKING SEPARATELY: `rmse_threshold_trials 3` is a training
+  hyperparameter, not a performance one -- reducing it would cut PART 1's
+  trial cost roughly proportionally but changes training dynamics
+  (fewer candidates considered before accepting one), so it is a
+  trade-off to discuss with whoever owns the training recipe, not a free
+  performance win to just apply.
+
+Next steps (not yet done, and now the clearly higher-value ones): decide
+whether `calculateForces()` is worth GPU-porting given it is `~84%` of
+`F_err` versus the already-GPU-accelerated dispatch's `~14%`; separately,
+raise the `rmse_threshold_trials` trade-off with whoever owns the
+training recipe, since it directly multiplies PART 1's cost independent
+of any GPU work.
