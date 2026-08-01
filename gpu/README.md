@@ -1721,3 +1721,119 @@ along the way should be fixed given it's now known to be real, even
 though dormant; decide whether a memory-bounded eviction policy is
 worth the complexity if future datasets/configurations need more ranks
 per GPU than this one comfortably supports.
+
+### Follow-up: a real 100-epoch run -- 17.8x, and the persistent cache doesn't leak
+
+Ran the "not yet done" item above for real: `run_nnp_train_100ep_{cpu,gpu}.slurm`,
+100 epochs, real `H2O_2G`, `normal` QOS (`1-00:00:00` limit -- a 100-epoch
+CPU-only run doesn't fit in the debug queue's 30 minutes). Each build now
+happens in its own isolated `git worktree`
+(`git worktree add --detach n2p2_devel_100ep_{cpu,gpu} gpu-portability`),
+**not** the shared main checkout -- running two concurrent `make clean &&
+make ...` cycles against the same `src/lib/bin` tree is exactly the
+build-race failure mode documented in the `nnp-dataset` fix below, and
+this was the first time in the whole project two long training builds
+were deliberately run at the same time.
+
+**Result:**
+
+| | CPU | GPU (4-GPU spread, cached topology) |
+| --- | --- | --- |
+| 100-epoch wall time | `3.97h` (`14300s`) | **`13.4min`** (`802.5s`) |
+| steady-state epoch time | `~142s` | **`~7.8s`**, flat for all 100 epochs |
+
+**`17.8x`** end to end -- better than the `~12.3x`/`~11.5x` single-epoch
+numbers above, and, importantly, the GPU epoch time does not drift
+upward over 100 epochs. That was a real risk worth checking: the
+persistent per-structure topology cache (`GpuForces.cu`) grows as new
+structures are visited across an epoch, and this is the first time it
+was exercised over many repeated epochs rather than one -- a slow
+memory/time leak would have shown up as the per-epoch time creeping up
+over the run. It didn't; `~7.6-7.8s` the entire way.
+
+**Correctness across 100 epochs, checked two ways, and one of them was
+initially misleading in a way worth documenting.** The raw per-epoch
+*training*-candidate RMSE in `learning-curve.out` diverges hugely
+between the two runs by epoch 10 (500%+ relative difference at some
+epochs) despite an identical fixed random seed (`random_seed 12345`).
+That number is a red herring, not a correctness signal: it reflects
+whichever specific candidates got sampled that epoch, and Kalman-filter
+training is a recursive, chaotically-sensitive process where tiny
+floating-point order-of-operation differences between CPU and GPU math
+compound fast over many sequential updates -- expected, and it would
+happen between any two nominally-identical runs whose arithmetic order
+differs even slightly (different rank count, different BLAS, etc.), not
+something specific to this GPU port.
+
+The metric that actually answers "did both models learn the same
+thing" is **test-set RMSE**, evaluated fresh on the same 118 held-out
+structures every epoch -- and there the two runs track each other
+closely the entire way (epoch 0 and 1 match to near machine precision;
+by epoch 100, energy test RMSEpa `2.77e-6` (CPU) vs `2.32e-6` (GPU),
+force test RMSE `3.865e-4` (CPU) vs `3.862e-4` (GPU)). Cross-checked
+independently with `nnp-dataset` (see below) on the final epoch-100
+weights against the same `test.data`: energy RMSE `1.742e-3` (CPU) vs
+`1.462e-3` (GPU), force RMSE `3.865e-4` (CPU) vs `3.862e-4` (GPU),
+matching the training loop's own periodic test evaluation almost
+exactly -- both a correctness confirmation and a sanity check that the
+two independent measurement paths (training-loop test eval vs. a
+separate `nnp-dataset` run reading the saved weights) agree.
+
+### Follow-up: nnp-dataset had never been run in this whole project -- fixed a real usability gap, and hit a build-race heisenbug along the way
+
+Wanted to use `nnp-dataset` for the energy/force parity comparison
+above, but it had literally never been compiled or run in this project
+before. `Dataset::distributeStructures()` already took an optional
+`fileName` parameter (default `"input.data"`), but `nnp-dataset.cpp`'s
+`main()` never exposed it -- no way to point the tool at a held-out
+`test.data` split directly, only ever a file literally named
+`input.data`. Added an optional second CLI argument,
+`nnp-dataset <shuffle> [<data_file>]`, fully backward compatible
+(verified: default 2-arg output is byte-identical to explicit
+3-arg output pointed at a same-content, differently-named file).
+
+**This surfaced a real, very confusing bug during validation that had
+nothing to do with the patch.** An early test run segfaulted inside
+`SymGrpExpRad::calculate()` -- non-reproducibly: it crashed on some
+runs and not others with the *exact same* command, the *exact same*
+weights, the *exact same* input, sometimes fixed by adding unrelated
+debug print statements. That pattern -- fixed by changes that shouldn't
+matter -- is the signature of memory-layout-sensitive undefined
+behavior, not a logic bug, and the actual root cause turned out to be
+exactly that: two of this session's jobs were running `make clean &&
+make ...` in the *same shared* `src/lib/bin` tree at overlapping times,
+and one job's `make clean` deleting `.o` files while another job's
+`make` was mid-compile/link produced a silently corrupted binary. A
+clean, non-concurrent rebuild made the "bug" vanish completely, with
+zero source changes. Confirmed via a careful decision tree (isolated
+`-np 1` vs `-np 2`, growing dataset sizes, `gdb` -- which couldn't even
+parse this binary's debug sections -- then `-fsanitize=address`, which
+also couldn't reach the fault before a debug-queue timeout, before
+simply re-running the *exact* prior command and having it pass clean).
+Fixed going forward the same way the 100-epoch runs above do: isolate
+concurrent builds into separate git worktrees rather than trust the
+shared tree to serialize itself.
+
+**What's confirmed vs. still open, explicitly:**
+- CONFIRMED: the `17.8x` 100-epoch speedup, with no per-epoch drift
+  over the full run.
+- CONFIRMED: CPU- and GPU-trained models are statistically
+  indistinguishable in test-set quality throughout training, cross-checked
+  two independent ways (the training loop's own periodic test
+  evaluation, and a separate `nnp-dataset` run against the saved
+  weights).
+- CONFIRMED (documented as a real, separate finding): concurrent
+  `make clean && make ...` against a shared `src/lib/bin` tree from
+  multiple jobs is a genuine build-race hazard in this project's build
+  system, not hypothetical -- it was hit for real, and cost real
+  debugging time before being correctly attributed.
+- NOT YET DONE: `nnp-dataset`'s new argument and the git-worktree
+  isolation pattern are both new; neither has been exercised outside
+  this one investigation yet.
+
+Next steps (not yet done): apply the same git-worktree isolation
+pattern by default any time two builds might run concurrently in this
+repo, not just for the 100-epoch scripts; consider whether
+`nnp-dataset`'s test-set comparison is worth adding as a standard
+post-training step in future benchmark scripts, given how directly
+useful it was here.
