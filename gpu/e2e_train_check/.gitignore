@@ -1,0 +1,4 @@
+# Run outputs (weights, timing/learning-curve logs, data splits, comparison
+# data) are large and reproducible from the scripts in this directory --
+# not tracked in git.
+results/

@@ -44,7 +44,8 @@ cd "$CHK"
 # NOT cleaned up afterward -- weights.*.out/test.data/train.data are
 # needed later for nnp-dataset energy/force comparisons.
 
-rm -rf run-100ep-gpu && mkdir run-100ep-gpu && cd run-100ep-gpu
+mkdir -p results
+rm -rf results/run-100ep-gpu && mkdir results/run-100ep-gpu && cd results/run-100ep-gpu
 cp "$TEMP/input.data" "$TEMP/scaling.data" .
 sed 's/^epochs.*/epochs                          100            # Number of training epochs./' \
     "$TEMP/input.nn" > input.nn

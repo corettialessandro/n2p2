@@ -31,7 +31,8 @@ TEMP="$N2P2_ORIG/temp/H2O_2G"
 CHK="$N2P2_ORIG/gpu/e2e_train_check"
 cd "$CHK"
 
-rm -rf run-100ep-dcgp-32 && mkdir run-100ep-dcgp-32 && cd run-100ep-dcgp-32
+mkdir -p results
+rm -rf results/run-100ep-dcgp-32 && mkdir results/run-100ep-dcgp-32 && cd results/run-100ep-dcgp-32
 cp "$TEMP/input.data" "$TEMP/scaling.data" .
 sed 's/^epochs.*/epochs                          100            # Number of training epochs./' \
     "$TEMP/input.nn" > input.nn
