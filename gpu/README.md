@@ -1837,3 +1837,72 @@ repo, not just for the 100-epoch scripts; consider whether
 `nnp-dataset`'s test-set comparison is worth adding as a standard
 post-training step in future benchmark scripts, given how directly
 useful it was here.
+
+### Follow-up: the honest GPU speedup, against a real CPU-class node, is ~5.6x -- not 17.8x
+
+Every CPU baseline in this file so far ran on `boost_usr_prod` (Leonardo's
+GPU partition) -- 32-core Intel Xeon Platinum 8358 (Ice Lake) nodes,
+chosen only because that's where the GPU comparison also had to run
+(same node, for a fair same-hardware A/B). Leonardo has a separate,
+dedicated CPU partition, `dcgp_usr_prod` -- 112-core Intel Xeon Platinum
+8480+ (Sapphire Rapids) nodes, two full CPU generations newer, 2 sockets
+x 56 cores, `AMX`/`avx512_bf16`/`avx_vnni` Ice Lake doesn't have, 105MB
+L3 vs. 48MB. Raised as a direct concern: is the `17.8x` headline number
+overstating the real GPU win because Booster's CPUs are the weak side of
+the comparison, not a representative CPU baseline?
+
+**Yes, partially.** Ran the same 100-epoch CPU-only `H2O_2G` benchmark
+on `dcgp_usr_prod` at 32, 64, and 112 (full node) cores, each in its own
+isolated git worktree (the three ran concurrently, alongside the
+build-race lesson from the section above):
+
+| Config | 100-epoch total | Epoch time | vs. `802.5s` GPU |
+| --- | --- | --- | --- |
+| Booster CPU, 32 cores (this file's baseline so far) | `3.97h` | `143.0s` | `17.8x` |
+| DCGP CPU, 32 cores (same core count, newer silicon) | `3.14h` | `113.2s` | `14.1x` |
+| DCGP CPU, 64 cores | `1.87h` | `67.2s` | `8.4x` |
+| **DCGP CPU, 112 cores (full node)** | **`1.25h`** | **`44.9s`** | **`5.6x`** |
+
+Two separate effects, both real:
+1. **Same core count, different CPU generation**: 32 DCGP cores beat 32
+   Booster cores by `1.26x` on identical settings -- Sapphire Rapids is
+   genuinely faster than Ice Lake for this workload, not just a core-count
+   story.
+2. **DCGP has 3.5x the cores per node** (112 vs. 32) -- scaling
+   32->64->112 cores gave `84%`/`85%` parallel efficiency per doubling-ish
+   step, `72%` overall 32->112, consistent with this project's very
+   first Phase 0 profiling flagging MPI communication/rank-count
+   overhead as a real, separate cost.
+
+Combined, the **honest GPU speedup against the strongest CPU
+configuration actually tested (a full 112-core DCGP node) is `~5.6x`,
+not `17.8x`**. `17.8x` was a correct, honestly-measured number for what
+it actually compared (GPU vs. one specific 32-core Ice Lake
+configuration) -- but quoting it as "the" GPU speedup without the
+CPU-partition caveat overstates the real win by roughly `3x`. This
+correction was requested and run *after* the `17.8x` number had already
+been shared externally; this section exists so the record is accurate
+going forward, not to retract what was already said in good faith with
+the data available at the time.
+
+**What's confirmed vs. still open, explicitly:**
+- CONFIRMED: `1.26x` same-core-count CPU generation gap (Sapphire
+  Rapids vs. Ice Lake) for this exact workload.
+- CONFIRMED: real GPU speedup vs. the best CPU baseline tested so far
+  (112-core DCGP) is `~5.6x`.
+- NOT YET DONE: DCGP nodes allow up to 16 nodes/job
+  (`MaxNodes=16` on `dcgp_usr_prod`) -- multi-node CPU scaling (beyond
+  one 112-core node) hasn't been tested, so `~5.6x` is the speedup
+  against the best *single-node* CPU config, not necessarily the best
+  possible CPU config on this cluster.
+- NOT YET DONE: the GPU side of this comparison is still the same
+  4-GPU/32-rank Booster configuration used throughout this file --
+  worth asking whether a like-for-like "1 node's worth of GPU vs. 1
+  node's worth of CPU" framing changes anything, though 4 GPUs on 1
+  Booster node already *is* that framing on the GPU side.
+
+Next steps (not yet done): consider whether multi-node DCGP CPU scaling
+is worth measuring before treating `~5.6x` as the final word; when
+reporting GPU speedups from this port going forward, quote the CPU
+baseline's hardware explicitly (partition, CPU model, core count)
+rather than a bare multiplier.
