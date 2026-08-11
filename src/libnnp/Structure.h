@@ -25,6 +25,7 @@
 #include "ScreeningFunction.h"
 #include "Vec3D.h"
 #include <Eigen/Core> // MatrixXd, VectorXd
+#include <Eigen/QR>   // ColPivHouseholderQR
 #include <cstddef>    // std::size_t
 #include <fstream>    // std::ofstream
 #include <map>        // std::map
@@ -124,6 +125,12 @@ struct Structure
     /// constants (external field) instead of unknowns. Identical to #A if
     /// no atom in this structure has a fixed charge.
     Eigen::MatrixXd          AConstrained;
+    /// Factorization of #AConstrained, computed once in
+    /// calculateElectrostaticEnergy() and reused by every later solve
+    /// against the same #AConstrained (calculateDQdChi, calculateDQdJ,
+    /// calculateDQdr, calculateForceLambdaTotal/Elec) instead of each of
+    /// them refactorizing #AConstrained from scratch.
+    Eigen::ColPivHouseholderQR<Eigen::MatrixXd> AConstrainedQr;
     /// If A matrix of this structure is currently stored.
     bool                     hasAMatrix;
     /// Number of atoms of each element in this structure.

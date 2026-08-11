@@ -766,7 +766,13 @@ double Structure::calculateElectrostaticEnergy(
 
     //TODO: sometimes only recalculation of A matrix is needed, because
     //      Qs are stored.
-    Q = AConstrained.colPivHouseholderQr().solve(bConstrained);
+    // Factorize AConstrained once and keep it (AConstrainedQr) for every
+    // later solve against this same AConstrained (calculateDQdChi,
+    // calculateDQdJ, calculateDQdr, calculateForceLambdaTotal/Elec) --
+    // avoids refactorizing an (numAtoms+1)x(numAtoms+1) dense matrix from
+    // scratch in each of them.
+    AConstrainedQr.compute(AConstrained);
+    Q = AConstrainedQr.solve(bConstrained);
 #ifdef _OPENMP
     }
 #endif
@@ -1067,7 +1073,7 @@ void Structure::calculateDQdChi(vector<Eigen::VectorXd> &dQdChi)
         // AConstrained (identity at row/column i) will correctly propagate
         // dQ_i/dchi_i = 0.
         if (!atoms.at(i).chargeIsFixed) b(i) = -1.;
-        dQdChi.push_back(AConstrained.colPivHouseholderQr().solve(b).head(numAtoms));
+        dQdChi.push_back(AConstrainedQr.solve(b).head(numAtoms));
     }
     return;
 }
@@ -1089,7 +1095,7 @@ void Structure::calculateDQdJ(vector<Eigen::VectorXd> &dQdJ)
             if (aj.chargeIsFixed) continue;
             if (i == aj.element) b(j) = -aj.charge;
         }
-        dQdJ.push_back(AConstrained.colPivHouseholderQr().solve(b).head(numAtoms));
+        dQdJ.push_back(AConstrainedQr.solve(b).head(numAtoms));
     }
     return;
 }
@@ -1134,7 +1140,7 @@ void Structure::calculateDQdr(  vector<size_t> const&   atomIndices,
                                        tableFull)[compIndices[i]];
             b(j) -= a.dAdrQ.at(j)[compIndices[i]];
         }
-        VectorXd dQdr = AConstrained.colPivHouseholderQr().solve(b).head(numAtoms);
+        VectorXd dQdr = AConstrainedQr.solve(b).head(numAtoms);
         for (size_t j = 0; j < numAtoms; ++j)
         {
             a.dQdr.at(j)[compIndices[i]] = dQdr(j);
@@ -1262,7 +1268,7 @@ VectorXd const Structure::calculateForceLambdaTotal() const
         dEdQ(i) = ai.chargeIsFixed ? 0.0 : (ai.dEelecdQ + ai.dEdG.back());
     }
     dEdQ(numAtoms) = 0;
-    VectorXd const lambdaTotal = AConstrained.colPivHouseholderQr().solve(-dEdQ);
+    VectorXd const lambdaTotal = AConstrainedQr.solve(-dEdQ);
     return lambdaTotal;
 }
 
@@ -1276,7 +1282,7 @@ VectorXd const Structure::calculateForceLambdaElec() const
         dEelecdQ(i) = ai.chargeIsFixed ? 0.0 : ai.dEelecdQ;
     }
     dEelecdQ(numAtoms) = 0;
-    VectorXd const lambdaElec = AConstrained.colPivHouseholderQr().solve(-dEelecdQ);
+    VectorXd const lambdaElec = AConstrainedQr.solve(-dEelecdQ);
     return lambdaElec;
 }
 
