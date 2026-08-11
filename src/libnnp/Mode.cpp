@@ -30,12 +30,12 @@
 #include <algorithm> // std::min, std::max, std::remove_if
 #include <cstdlib>   // atoi, atof
 #include <fstream>   // std::ifstream
-#ifndef N2P2_NO_SF_CACHE
-#include <map>       // std::multimap
-#endif
+#include <map>       // std::map, std::multimap
 #include <limits>    // std::numeric_limits
 #include <stdexcept> // std::runtime_error
 #include <utility>   // std::piecewise_construct, std::forward_as_tuple
+#include <cstdio>    // std::rename
+#include <unistd.h>  // getpid
 #ifdef N2P2_GPU
 #include <set>       // std::set (calculateForces()'s GPU topology cache)
 #endif
@@ -409,12 +409,57 @@ void Mode::setupElectrostatics(bool   initialHardness,
         string actualFileNameFormat = directoryPrefix + fileNameFormat;
         log << strpr("Atomic hardness file name format: %s\n",
                      actualFileNameFormat.c_str());
+
+        // Fall back to "initial_hardness" from the settings file for any
+        // element whose hardness.*.data file is missing, and write that
+        // file so subsequent runs find it directly.
+        map<string, double> initialHardnessBySymbol;
+        settings::Settings::KeyRange r =
+            settings.getValues("initial_hardness");
+        for (settings::Settings::KeyMap::const_iterator it = r.first;
+             it != r.second; ++it)
+        {
+            vector<string> args = split(reduce(it->second.first));
+            initialHardnessBySymbol[args.at(0)] = atof(args.at(1).c_str());
+        }
+
         for (size_t i = 0; i < numElements; ++i)
         {
             string fileName = strpr(actualFileNameFormat.c_str(),
                                     elements.at(i).getAtomicNumber());
+            string symbol = elements.at(i).getSymbol();
+            ifstream test(fileName.c_str());
+            if (!test.is_open())
+            {
+                map<string, double>::const_iterator it2 =
+                    initialHardnessBySymbol.find(symbol);
+                if (it2 == initialHardnessBySymbol.end())
+                {
+                    throw runtime_error(
+                        strpr("ERROR: Atomic hardness file \"%s\" not "
+                              "found and no \"initial_hardness\" keyword "
+                              "for element %2s in settings file.\n",
+                              fileName.c_str(), symbol.c_str()));
+                }
+                log << strpr("Atomic hardness file \"%s\" not found, "
+                             "generating it from \"initial_hardness\" in "
+                             "the settings file.\n", fileName.c_str());
+                // Under MPI every rank reaches this point independently.
+                // Write to a per-process temporary file and rename() it
+                // into place (atomic at the filesystem level) so no rank
+                // can ever observe a partially written target file,
+                // regardless of write order or interleaving.
+                string tmpFileName = strpr("%s.tmp%d", fileName.c_str(),
+                                           (int)getpid());
+                ofstream file(tmpFileName.c_str());
+                file << it2->second << "\n";
+                file.close();
+                rename(tmpFileName.c_str(), fileName.c_str());
+            }
+            else test.close();
+
             log << strpr("Atomic hardness for element %2s from file %s: ",
-                         elements.at(i).getSymbol().c_str(),
+                         symbol.c_str(),
                          fileName.c_str());
             vector<double> const data = readColumnsFromFile(fileName,
                                                             {0}).at(0);
