@@ -30,6 +30,8 @@
 #include <limits>    // std::numeric_limits
 #include <stdexcept> // std::runtime_error
 #include <utility>   // std::piecewise_construct, std::forward_as_tuple
+#include <cstdio>    // std::rename
+#include <unistd.h>  // getpid
 
 using namespace std;
 using namespace nnp;
@@ -435,9 +437,17 @@ void Mode::setupElectrostatics(bool   initialHardness,
                 log << strpr("Atomic hardness file \"%s\" not found, "
                              "generating it from \"initial_hardness\" in "
                              "the settings file.\n", fileName.c_str());
-                ofstream file(fileName.c_str());
+                // Under MPI every rank reaches this point independently.
+                // Write to a per-process temporary file and rename() it
+                // into place (atomic at the filesystem level) so no rank
+                // can ever observe a partially written target file,
+                // regardless of write order or interleaving.
+                string tmpFileName = strpr("%s.tmp%d", fileName.c_str(),
+                                           (int)getpid());
+                ofstream file(tmpFileName.c_str());
                 file << it2->second << "\n";
                 file.close();
+                rename(tmpFileName.c_str(), fileName.c_str());
             }
             else test.close();
 
