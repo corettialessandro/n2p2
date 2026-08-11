@@ -2741,30 +2741,48 @@ void Training::update(string const& property)
                 if (QErrorNorm != 0)
                 {
                     // Finally sum up Jacobian.
-                    for (size_t i = 0; i < s.numAtoms; ++i)
+                    //
+                    // dChidc[k][j] (and the hardness factor below) do not
+                    // depend on i, so
+                    //   sum_i QError(i) * dQdChi[k](i) * dChidc[k][j]
+                    // = dChidc[k][j] * sum_i QError(i) * dQdChi[k](i)
+                    // = dChidc[k][j] * QError.dot(dQdChi[k])
+                    // Factoring the i-sum out of the innermost loop (i.e.
+                    // swapping loop order: k outer, i only inside the dot
+                    // product) turns this from
+                    // O(numAtoms^2 * numWeightsPerElement) into
+                    // O(numAtoms^2) (the dot products, one per atom, each
+                    // using Eigen's vectorized VectorXd::dot()) +
+                    // O(numAtoms * numWeightsPerElement) (the final
+                    // scatter) -- found while profiling this as the
+                    // biggest remaining stage-1 cost (~60% of epoch time)
+                    // before any GPU work, see gpu/README.md. Same
+                    // reassociation for the hardness term. Mathematically
+                    // identical to the original triple loop; NOT
+                    // bit-identical (reassociates a floating-point sum,
+                    // unlike the earlier AConstrainedQr factorize-once fix
+                    // which reused the exact same operations) -- verified
+                    // to agree to float64 precision against real
+                    // production data.
+                    for (size_t k = 0; k < s.numAtoms; ++k)
                     {
-                        // weights
-                        for (size_t k = 0; k < s.numAtoms; ++k)
+                        size_t l = s.atoms.at(k).element;
+                        double const Sk = QError.dot(dQdChi.at(k))
+                                        / QErrorNorm;
+                        for (size_t j = 0; j < dChidc.at(k).size(); ++j)
                         {
-                            size_t l = s.atoms.at(k).element;
-                            for (size_t j = 0; j < dChidc.at(k).size(); ++j)
-                            {
-                                // 1 / QErrorNorm * (Q-Qref) * dQ/dChi * dChi/dc
-                                pu.jacobian.at(0).at(offset.at(l) + j) +=
-                                    1.0 / QErrorNorm * QError(i)
-                                    * dQdChi.at(k)(i) * dChidc.at(k).at(j);
-                            }
+                            pu.jacobian.at(0).at(offset.at(l) + j) +=
+                                Sk * dChidc.at(k).at(j);
                         }
-                        // hardness (actually h, where J=h^2)
-                        for (size_t k = 0; k < numElements; ++k)
-                        {
-                            size_t n = elements.at(k).neuralNetworks.at(nnId)
-                                       .getNumConnections();
-                            pu.jacobian.at(0).at(offset.at(k) + n) +=
-                                        1.0 / QErrorNorm
-                                        * QError(i) * dQdJ.at(k)(i) * 2
-                                        * sqrt(elements.at(k).getHardness());
-                        }
+                    }
+                    for (size_t k = 0; k < numElements; ++k)
+                    {
+                        size_t n = elements.at(k).neuralNetworks.at(nnId)
+                                   .getNumConnections();
+                        double const Sk = QError.dot(dQdJ.at(k))
+                                        / QErrorNorm;
+                        pu.jacobian.at(0).at(offset.at(k) + n) +=
+                                    Sk * 2 * sqrt(elements.at(k).getHardness());
                     }
                 }
             }
