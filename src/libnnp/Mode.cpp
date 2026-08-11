@@ -21,6 +21,7 @@
 #ifdef N2P2_GPU
 #include "GpuNeuralNetwork.h"
 #include "GpuForces.h"
+#include "GpuElecForces.h"
 #endif
 #include <cmath>
 #ifdef _OPENMP
@@ -2196,32 +2197,177 @@ void Mode::calculateForces(Structure& structure) const
         VectorXd lambdaTotal = s.calculateForceLambdaTotal();
         VectorXd lambdaElec = s.calculateForceLambdaElec();
 
-#ifdef _OPENMP
-        #pragma omp for
-#endif
-        // OpenMP 4.0 doesn't support range based loops
-        for (size_t i = 0; i < s.numAtoms; ++i)
+        bool doneOnGpu = false;
+#ifdef N2P2_GPU
+#ifndef N2P2_FULL_SFD_MEMORY
+        // GPU port of this block's O(numAtoms^2 x avgNeighbors) double
+        // loop below -- see GpuElecForces.h's header comment and
+        // gpu/README.md's 4G electrostatics section for the profiling
+        // that motivated porting THIS, not the two calculateForceLambda*()
+        // solves above (confirmed cheap, <1ms/call combined, thanks to
+        // the earlier factorize-once fix -- this loop was ~148ms/call).
         {
-            auto &ai = s.atoms[i];
-            ai.f -= ai.pEelecpr;
-            ai.fElec = -ai.pEelecpr;
+            static set<size_t> gpuElecForcesTopologyUploaded;
+            bool const firstCallForThisStructure =
+                gpuElecForcesTopologyUploaded.insert(s.index).second;
 
-            for (size_t j = 0; j < s.numAtoms; ++j)
+            int const numAtoms = (int)s.numAtoms;
+            vector<int> dChidGOffset(numAtoms + 1, 0);
+            for (int i = 0; i < numAtoms; ++i)
             {
-                Atom const &aj = s.atoms.at(j);
+                dChidGOffset[i + 1] = dChidGOffset[i]
+                    + (int)s.atoms.at(i).numSymmetryFunctions;
+            }
+            int const numValues = dChidGOffset[numAtoms];
+
+            if (firstCallForThisStructure)
+            {
+                // Purely geometric (weight-independent) topology,
+                // uploaded exactly once per structure -- see
+                // GpuForces.h's header comment for why (a first,
+                // stateless rebuild-and-reupload-every-call pass for
+                // the analogous short-range edge list measured WORSE
+                // end-to-end).
+                vector<double> dGdrSelf((size_t)numValues * 3);
+                for (int i = 0; i < numAtoms; ++i)
+                {
+                    Atom const& a = s.atoms.at(i);
+                    int const off = dChidGOffset[i];
+                    for (size_t k = 0; k < a.numSymmetryFunctions; ++k)
+                    {
+                        dGdrSelf[3 * (off + k) + 0] = a.dGdr.at(k).r[0];
+                        dGdrSelf[3 * (off + k) + 1] = a.dGdr.at(k).r[1];
+                        dGdrSelf[3 * (off + k) + 2] = a.dGdr.at(k).r[2];
+                    }
+                }
+
+                vector<int> edgeTarget;
+                vector<int> edgeOwnerIndex;
+                vector<double> edgeDGdr;
+                for (int j = 0; j < numAtoms; ++j)
+                {
+                    Atom const& aj = s.atoms.at(j);
+                    vector<vector<size_t>> const& tableFull =
+                        elements.at(aj.element).getSymmetryFunctionTable();
+                    size_t const numNeighbors =
+                        aj.getStoredMinNumNeighbors(maxCutoffRadius);
+                    for (size_t k = 0; k < numNeighbors; ++k)
+                    {
+                        Atom::Neighbor const& n = aj.neighbors.at(k);
+                        vector<size_t> const& table = tableFull.at(n.element);
+                        for (size_t m = 0; m < n.dGdr.size(); ++m)
+                        {
+                            edgeTarget.push_back((int)n.index);
+                            edgeOwnerIndex.push_back(dChidGOffset[j]
+                                                    + (int)table.at(m));
+                            edgeDGdr.push_back(n.dGdr.at(m).r[0]);
+                            edgeDGdr.push_back(n.dGdr.at(m).r[1]);
+                            edgeDGdr.push_back(n.dGdr.at(m).r[2]);
+                        }
+                    }
+                }
+                int const numEdges = (int)edgeTarget.size();
+
+                gpuElecForcesUploadTopology((int)s.index, numAtoms,
+                                            dChidGOffset.data(),
+                                            dGdrSelf.data(), numEdges,
+                                            edgeTarget.data(),
+                                            edgeOwnerIndex.data(),
+                                            edgeDGdr.data());
+            }
+
+            // Everything below changes every call (depends on the
+            // elec-NN's current weights and/or current charges) --
+            // always rebuilt and re-uploaded.
+            vector<double> dChidGFlat(numValues);
+            for (int i = 0; i < numAtoms; ++i)
+            {
+                Atom const& a = s.atoms.at(i);
+                int const off = dChidGOffset[i];
+                for (size_t k = 0; k < a.numSymmetryFunctions; ++k)
+                {
+                    dChidGFlat[off + k] = a.dChidG.at(k);
+                }
+            }
+
+            vector<double> dAdrQFlat((size_t)numAtoms * numAtoms * 3);
+            vector<double> pEelecprFlat((size_t)numAtoms * 3);
+            for (int i = 0; i < numAtoms; ++i)
+            {
+                Atom const& ai = s.atoms.at(i);
+                pEelecprFlat[3 * i + 0] = ai.pEelecpr.r[0];
+                pEelecprFlat[3 * i + 1] = ai.pEelecpr.r[1];
+                pEelecprFlat[3 * i + 2] = ai.pEelecpr.r[2];
+                for (int j = 0; j < numAtoms; ++j)
+                {
+                    size_t const idx = 3 * ((size_t)i * numAtoms + j);
+                    dAdrQFlat[idx + 0] = ai.dAdrQ[j].r[0];
+                    dAdrQFlat[idx + 1] = ai.dAdrQ[j].r[1];
+                    dAdrQFlat[idx + 2] = ai.dAdrQ[j].r[2];
+                }
+            }
+
+            vector<double> lambdaTotalFlat(numAtoms), lambdaElecFlat(numAtoms);
+            for (int j = 0; j < numAtoms; ++j)
+            {
+                lambdaTotalFlat[j] = lambdaTotal(j);
+                lambdaElecFlat[j] = lambdaElec(j);
+            }
+
+            vector<double> forceOut((size_t)numAtoms * 3);
+            vector<double> forceElecOut((size_t)numAtoms * 3);
+            gpuElecForcesCompute((int)s.index, dChidGFlat.data(),
+                                 dAdrQFlat.data(), pEelecprFlat.data(),
+                                 lambdaTotalFlat.data(), lambdaElecFlat.data(),
+                                 forceOut.data(), forceElecOut.data());
+
+#ifdef _OPENMP
+            #pragma omp for
+#endif
+            for (size_t i = 0; i < s.numAtoms; ++i)
+            {
+                auto &ai = s.atoms[i];
+                ai.f.r[0] += forceOut[3 * i + 0];
+                ai.f.r[1] += forceOut[3 * i + 1];
+                ai.f.r[2] += forceOut[3 * i + 2];
+                ai.fElec.r[0] = forceElecOut[3 * i + 0];
+                ai.fElec.r[1] = forceElecOut[3 * i + 1];
+                ai.fElec.r[2] = forceElecOut[3 * i + 2];
+            }
+
+            doneOnGpu = true;
+        }
+#endif
+#endif
+        if (!doneOnGpu)
+        {
+#ifdef _OPENMP
+            #pragma omp for
+#endif
+            // OpenMP 4.0 doesn't support range based loops
+            for (size_t i = 0; i < s.numAtoms; ++i)
+            {
+                auto &ai = s.atoms[i];
+                ai.f -= ai.pEelecpr;
+                ai.fElec = -ai.pEelecpr;
+
+                for (size_t j = 0; j < s.numAtoms; ++j)
+                {
+                    Atom const &aj = s.atoms.at(j);
 
 #ifndef N2P2_FULL_SFD_MEMORY
-                vector<vector<size_t> > const &tableFull
-                        = elements.at(aj.element).getSymmetryFunctionTable();
-                Vec3D dChidr = aj.calculateDChidr(ai.index,
-                                                  maxCutoffRadius,
-                                                  &tableFull);
+                    vector<vector<size_t> > const &tableFull
+                            = elements.at(aj.element).getSymmetryFunctionTable();
+                    Vec3D dChidr = aj.calculateDChidr(ai.index,
+                                                      maxCutoffRadius,
+                                                      &tableFull);
 #else
-                Vec3D dChidr = aj.calculateDChidr(ai.index,
-                                                  maxCutoffRadius);
+                    Vec3D dChidr = aj.calculateDChidr(ai.index,
+                                                      maxCutoffRadius);
 #endif
-                ai.f -= lambdaTotal(j) * (ai.dAdrQ[j] + dChidr);
-                ai.fElec -= lambdaElec(j) * (ai.dAdrQ[j] + dChidr);
+                    ai.f -= lambdaTotal(j) * (ai.dAdrQ[j] + dChidr);
+                    ai.fElec -= lambdaElec(j) * (ai.dAdrQ[j] + dChidr);
+                }
             }
         }
     }
