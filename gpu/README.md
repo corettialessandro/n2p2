@@ -2099,3 +2099,40 @@ Net effect of all three stage-1/stage-2 fixes this section covers,
 stage 1 specifically: `270s -> 26.6s -> 8.6s` per epoch on the real
 dataset -- roughly `31x` from the original O(N^4) bug through to here,
 entirely on the CPU side, before any GPU code touched stage 1 at all.
+
+### Follow-up: profiled the remaining stage-1 "error" phase -- 32.6% of epoch time, no code change needed at all
+
+The Jacobian-assembly fix above left `Q_err` at `91.2%` of a smaller
+epoch, but `printEpoch()`'s own `TIMING` line already reported a
+SEPARATE `error` phase (`calculateErrorEpoch()`, computes the
+train/test RMSE that actually gets written to `learning-curve.out` --
+distinct from `Training::update()`'s per-candidate work) at `32.6%` of
+epoch time, unexplained by anything measured so far. Same temporary-
+Stopwatch methodology, this time bracketing `calculateErrorEpoch()`'s
+per-structure loop (`Training.cpp:1422-1492`): two components,
+`chargeEquilibration()` (`~0.90s/epoch`, same dense Qeq-solve cost
+already characterized elsewhere in this section) and
+`calculateSymmetryFunctionGroups()` (`~1.46s/epoch`, `53%` of the
+error phase on its own) -- together `85%` of the phase, the rest file
+I/O and MPI reduction.
+
+The symmetry-function recomputation is the interesting one: every
+`calculateErrorEpoch()` call frees each structure's `G`/`dGdr` right
+after use (`Training.cpp:1494`, `if (freeMemory) it->freeAtoms(...)`)
+and `freeMemory` is set from a single existing n2p2 keyword --
+`freeMemory = !settings.keywordExists("memorize_symfunc_results")`
+(`Training.cpp:936`) -- **already present, commented out, in
+`temp/H2O_4G/input.nn`** (`#memorize_symfunc_results`). No source
+change needed at all; just uncomment it.
+
+Verified with the flag enabled (real `temp/H2O_4G` data, otherwise
+identical setup): epoch time `8.6s -> ~4.9s` (a further `~1.75x`),
+`learning-curve.out.stage-1` bit-identical to the flag-disabled run.
+Stacking every stage-1 fix in this section: `270s -> 26.6s -> 8.6s ->
+~4.9s` per epoch, `~55x`, with the last step being a one-line
+config change rather than a code change. The obvious tradeoff --
+memory: with the flag on, every structure's symmetry-function data
+stays resident for the whole run instead of being freed between uses,
+so this is a real memory-for-speed trade whose cost scales with
+dataset size (not yet measured at the full 1254-structure production
+scale) -- worth deciding deliberately, not enabling blindly.
