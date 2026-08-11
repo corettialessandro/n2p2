@@ -2303,6 +2303,14 @@ void Training::update(string const& property)
         size_t* posCandidates = NULL; // position of sub or update candidate.
         size_t indexBest = 0; // Index of best update candidate so far.
         double rmseFractionBest = 0.0; // RMSE of best update candidate so far.
+        // For HDNNP_4G force training (useSubCandidates), every trial below
+        // reuses the same structure and the same (not-yet-updated) "short"
+        // NN weights -- only which atom/component subcandidate is being
+        // checked changes. calculateForces() (two dense solves plus an
+        // O(numAtoms^2) loop for HDNNP_4G) is therefore identical across
+        // trials of the same b and only needs to run once here. Declared
+        // fresh per b so it never survives past an actual weight update.
+        bool forcesValid = false;
 
         // For SM_THRESHOLD need to loop until candidate's RMSE is above
         // threshold. Other modes don't loop here.
@@ -2401,8 +2409,12 @@ void Training::update(string const& property)
                             calculateAtomicNeuralNetworks(s, derivatives, "elec");
                             chargeEquilibration(s, derivatives);
                         }
-                        calculateAtomicNeuralNetworks(s, derivatives, "short");
-                        calculateForces(s);
+                        if (!forcesValid)
+                        {
+                            calculateAtomicNeuralNetworks(s, derivatives, "short");
+                            calculateForces(s);
+                            forcesValid = true;
+                        }
                         Atom const& a = s.atoms.at(sC->a);
                         currentRmseFraction.at(b) =
                             fabs(a.fRef[sC->c]
