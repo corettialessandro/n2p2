@@ -2057,3 +2057,45 @@ staleness from *outside* by pattern-matching caller code -- a more
 invasive change than fits as a quick follow-up, left for a dedicated
 pass. `dAdrQ`'s per-call re-upload cost stands as the next real
 optimization target, just not solved yet.
+
+### Follow-up: stage-1's Jacobian-assembly loop -- the biggest remaining cost, and it didn't need GPU at all
+
+Went back to what was actually still unaddressed from the original
+stage-1/stage-2 profiling: the Jacobian-assembly loop (`"Finally sum up
+Jacobian"` in `Training.cpp`'s `k == "charge"` branch), ~60% of
+stage-1 epoch time (`15.86s` of `~26.6s`), never ported or fixed --
+the two CPU bugs earlier in this section fixed the dense solves and
+the redundant-`calculateForces()` cost, not this.
+
+Before reaching for CUDA, looked at the loop itself: `i` (atoms) x `k`
+(atoms) x `j` (weight connections for atom `k`'s element), accumulating
+`jacobian[offset[l]+j] += (1/QErrorNorm) * QError(i) * dQdChi[k](i) * dChidc[k][j]`.
+`dChidc[k][j]` doesn't depend on `i` at all -- so the `i`-sum factors
+out algebraically:
+`dChidc[k][j] * sum_i QError(i)*dQdChi[k](i) = dChidc[k][j] * QError.dot(dQdChi[k])`.
+Swapping loop order (`k` outer, `i` only inside a dot product) turns
+`O(numAtoms^2 * numWeightsPerElement)` into `O(numAtoms^2)` (the dot
+products, one per atom, using Eigen's vectorized `VectorXd::dot()`) +
+`O(numAtoms * numWeightsPerElement)` (the final scatter) -- the same
+reassociation applies to the hardness term. A pure CPU refactor, no
+GPU code at all, and a much bigger win than a straight GPU port of the
+original triple loop would likely have delivered for the same effort
+-- this project's "measure before porting" rule paying off again, this
+time by finding there was nothing left to port once the algorithm
+itself was fixed.
+
+Verified on the same real `temp/H2O_4G` 60-structure/630-atom dataset,
+same config as the earlier `AConstrainedQr` fix: epoch time
+`26.6s -> 8.6s` (`~3.1x`), and -- better than expected, since
+reassociating a floating-point sum isn't generally bit-exact --
+`learning-curve.out.stage-1` came out **bit-identical** across every
+epoch and every column, not just agreeing to float64 precision.
+Within the new epoch time, `Q_err` (the phase this loop lives in) went
+from `22.6s` (`97.5%` of epoch) to `5.2s` (`91.2%`) -- still the
+dominant phase, but the loop itself is no longer the outsized cost it
+was.
+
+Net effect of all three stage-1/stage-2 fixes this section covers,
+stage 1 specifically: `270s -> 26.6s -> 8.6s` per epoch on the real
+dataset -- roughly `31x` from the original O(N^4) bug through to here,
+entirely on the CPU side, before any GPU code touched stage 1 at all.
