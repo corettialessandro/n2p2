@@ -18,6 +18,9 @@
 #include "Structure.h"
 #include "Vec3D.h"
 #include "utility.h"
+#ifdef N2P2_GPU
+#include "GpuQeqSolver.h"
+#endif
 #include <Eigen/Dense> // MatrixXd, VectorXd
 #include <algorithm>   // std::max
 #include <cmath>       // fabs, erf
@@ -766,13 +769,24 @@ double Structure::calculateElectrostaticEnergy(
 
     //TODO: sometimes only recalculation of A matrix is needed, because
     //      Qs are stored.
-    // Factorize AConstrained once and keep it (AConstrainedQr) for every
-    // later solve against this same AConstrained (calculateDQdChi,
-    // calculateDQdJ, calculateDQdr, calculateForceLambdaTotal/Elec) --
-    // avoids refactorizing an (numAtoms+1)x(numAtoms+1) dense matrix from
-    // scratch in each of them.
+    // Factorize AConstrained once and keep it (AConstrainedQr, or its GPU
+    // equivalent -- see GpuQeqSolver.h) for every later solve against
+    // this same AConstrained (calculateDQdChi, calculateDQdJ,
+    // calculateDQdr, calculateForceLambdaTotal/Elec) -- avoids
+    // refactorizing an (numAtoms+1)x(numAtoms+1) dense matrix from
+    // scratch in each of them. Unconditional every call (unlike
+    // GpuForces' topology cache) since AConstrained depends on the
+    // current per-element hardness (a trainable weight), not just
+    // geometry.
+#ifdef N2P2_GPU
+    gpuQeqFactorize(index, (int)(numAtoms + 1), AConstrained.data());
+    Q.resize(numAtoms + 1);
+    gpuQeqSolve(index, (int)(numAtoms + 1), 1, bConstrained.data(),
+                Q.data());
+#else
     AConstrainedQr.compute(AConstrained);
     Q = AConstrainedQr.solve(bConstrained);
+#endif
 #ifdef _OPENMP
     }
 #endif
@@ -1063,6 +1077,28 @@ void Structure::calculateDQdChi(vector<Eigen::VectorXd> &dQdChi)
 {
     dQdChi.clear();
     dQdChi.reserve(numAtoms);
+#ifdef N2P2_GPU
+    // Batched into ONE multi-RHS gpuQeqSolve() call rather than numAtoms
+    // separate ones -- see GpuQeqSolver.h's header comment for why this
+    // is required, not optional (GpuForces.cu's documented first-pass
+    // MPS-contention regression from many small GPU calls).
+    int const n = (int)(numAtoms + 1);
+    MatrixXd B = MatrixXd::Zero(n, (Index)numAtoms);
+    for (size_t i = 0; i < numAtoms; ++i)
+    {
+        // If atom i's charge is externally fixed it does not depend on
+        // its own (or any) electronegativity, so its perturbation is
+        // zero and AConstrained (identity at row/column i) will
+        // correctly propagate dQ_i/dchi_i = 0.
+        if (!atoms.at(i).chargeIsFixed) B(i, (Index)i) = -1.;
+    }
+    MatrixXd X(n, (Index)numAtoms);
+    gpuQeqSolve(index, n, (int)numAtoms, B.data(), X.data());
+    for (size_t i = 0; i < numAtoms; ++i)
+    {
+        dQdChi.push_back(X.col((Index)i).head(numAtoms));
+    }
+#else
     for (size_t i = 0; i < numAtoms; ++i)
     {
         // Including Lagrange multiplier equation.
@@ -1075,6 +1111,7 @@ void Structure::calculateDQdChi(vector<Eigen::VectorXd> &dQdChi)
         if (!atoms.at(i).chargeIsFixed) b(i) = -1.;
         dQdChi.push_back(AConstrainedQr.solve(b).head(numAtoms));
     }
+#endif
     return;
 }
 
@@ -1082,6 +1119,29 @@ void Structure::calculateDQdJ(vector<Eigen::VectorXd> &dQdJ)
 {
     dQdJ.clear();
     dQdJ.reserve(numElements);
+#ifdef N2P2_GPU
+    // Batched into ONE multi-RHS gpuQeqSolve() call -- see
+    // calculateDQdChi() above / GpuQeqSolver.h for why.
+    int const n = (int)(numAtoms + 1);
+    MatrixXd B = MatrixXd::Zero(n, (Index)numElements);
+    for (size_t i = 0; i < numElements; ++i)
+    {
+        for (size_t j = 0; j < numAtoms; ++j)
+        {
+            Atom const &aj = atoms.at(j);
+            // A fixed atom's charge does not depend on any element's
+            // hardness, so its row of the perturbation stays zero.
+            if (aj.chargeIsFixed) continue;
+            if (i == aj.element) B((Index)j, (Index)i) = -aj.charge;
+        }
+    }
+    MatrixXd X(n, (Index)numElements);
+    gpuQeqSolve(index, n, (int)numElements, B.data(), X.data());
+    for (size_t i = 0; i < numElements; ++i)
+    {
+        dQdJ.push_back(X.col((Index)i).head(numAtoms));
+    }
+#else
     for (size_t i = 0; i < numElements; ++i)
     {
         // Including Lagrange multiplier equation.
@@ -1097,6 +1157,7 @@ void Structure::calculateDQdJ(vector<Eigen::VectorXd> &dQdJ)
         }
         dQdJ.push_back(AConstrainedQr.solve(b).head(numAtoms));
     }
+#endif
     return;
 }
 
@@ -1140,7 +1201,14 @@ void Structure::calculateDQdr(  vector<size_t> const&   atomIndices,
                                        tableFull)[compIndices[i]];
             b(j) -= a.dAdrQ.at(j)[compIndices[i]];
         }
+#ifdef N2P2_GPU
+        VectorXd dQdrFull(numAtoms + 1);
+        gpuQeqSolve(index, (int)(numAtoms + 1), 1, b.data(),
+                    dQdrFull.data());
+        VectorXd dQdr = dQdrFull.head(numAtoms);
+#else
         VectorXd dQdr = AConstrainedQr.solve(b).head(numAtoms);
+#endif
         for (size_t j = 0; j < numAtoms; ++j)
         {
             a.dQdr.at(j)[compIndices[i]] = dQdr(j);
@@ -1268,7 +1336,14 @@ VectorXd const Structure::calculateForceLambdaTotal() const
         dEdQ(i) = ai.chargeIsFixed ? 0.0 : (ai.dEelecdQ + ai.dEdG.back());
     }
     dEdQ(numAtoms) = 0;
+#ifdef N2P2_GPU
+    VectorXd const negDEdQ = -dEdQ;
+    VectorXd lambdaTotal(numAtoms + 1);
+    gpuQeqSolve(index, (int)(numAtoms + 1), 1, negDEdQ.data(),
+                lambdaTotal.data());
+#else
     VectorXd const lambdaTotal = AConstrainedQr.solve(-dEdQ);
+#endif
     return lambdaTotal;
 }
 
@@ -1282,7 +1357,14 @@ VectorXd const Structure::calculateForceLambdaElec() const
         dEelecdQ(i) = ai.chargeIsFixed ? 0.0 : ai.dEelecdQ;
     }
     dEelecdQ(numAtoms) = 0;
+#ifdef N2P2_GPU
+    VectorXd const negDEelecdQ = -dEelecdQ;
+    VectorXd lambdaElec(numAtoms + 1);
+    gpuQeqSolve(index, (int)(numAtoms + 1), 1, negDEelecdQ.data(),
+                lambdaElec.data());
+#else
     VectorXd const lambdaElec = AConstrainedQr.solve(-dEelecdQ);
+#endif
     return lambdaElec;
 }
 

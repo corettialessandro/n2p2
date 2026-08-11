@@ -35,7 +35,7 @@ PROJECT_LDFLAGS_BLAS=-lopenblas -lgsl -lgslcblas
 PROJECT_NVCC=nvcc
 PROJECT_CUDA_ARCH=sm_80
 PROJECT_CUDA_HOME=${CUDA_HOME}
-PROJECT_LDFLAGS_GPU=-L$(PROJECT_CUDA_HOME)/lib64 -lcudart -lcublas
+PROJECT_LDFLAGS_GPU=-L$(PROJECT_CUDA_HOME)/lib64 -lcudart -lcublas -lcusolver
 
 ###############################################################################
 # COMPILE-TIME OPTIONS

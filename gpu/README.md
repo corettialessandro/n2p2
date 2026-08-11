@@ -2136,3 +2136,128 @@ stays resident for the whole run instead of being freed between uses,
 so this is a real memory-for-speed trade whose cost scales with
 dataset size (not yet measured at the full 1254-structure production
 scale) -- worth deciding deliberately, not enabling blindly.
+
+### Follow-up: `memorize_symfunc_results` at full production scale -- ~2.4GB, enabled
+
+The memory tradeoff flagged above was measured directly rather than
+guessed: full `temp/H2O_4G` dataset (1254 structures, 790,020 atoms
+total, 630 atoms/structure average), 64 ranks, one dcgp node,
+`sacct` cgroup-wide peak RSS across the whole job (`nnp-scaling` +
+`nnp-train 1`, both `memorize` on and off).
+
+| | epoch time | peak RSS |
+|---|---|---|
+| `memorize` off (baseline) | 48.99s | 194.5 GB |
+| `memorize` on | 27.8-27.95s | 196.9 GB |
+
+Extra memory: **~2.4GB, ~1.2% over baseline** -- far smaller than
+expected; the per-atom `G`/`dGdr`/neighbor-cache arrays this setting
+keeps resident turn out to be a rounding error next to the dataset's
+baseline footprint (dominated by neighbor lists and the dense
+electrostatics matrices, both always resident regardless of this
+flag). Speedup held at full scale too: `~1.76x`, matching the
+subset-60 measurement almost exactly. Given a node has 500GB+
+available and the cost is ~2.4GB, `memorize_symfunc_results` is now
+**enabled in the real `temp/H2O_4G/input.nn`** (single line
+uncommented, not git-tracked -- `temp/` is gitignored).
+
+### Follow-up: `GpuQeqSolver` -- the dense charge-equilibration solve family, `~2.06x` epoch / `~2.32x` train phase
+
+With `memorize_symfunc_results` eliminating the symmetry-function
+recompute cost, re-profiling stage 1's `Training::update("charge")`
+(same temporary-Stopwatch methodology as this section's earlier
+entries, `sf`/`fwd`/`qeq`/`dq`/`jac` brackets around the "charge"
+branch and the candidate-selection loop's `calculateSymmetryFunctionGroups()`
+call) found `chargeEquilibration()` + `calculateDQdChi()`/`calculateDQdJ()`
+(`qeq`+`dq`) now **44.3% of epoch time** -- `sf` collapsed to ~0
+(confirming the fix above), `dq` 25.7%, `qeq` 18.6%, `fwd` (the chi
+forward-pass loop, originally the suspected target) only 7.5%.
+
+All five of `Structure::AConstrainedQr`'s downstream solve call sites
+(`calculateDQdChi`, `calculateDQdJ`, `calculateDQdr`,
+`calculateForceLambdaTotal`, `calculateForceLambdaElec`) share one
+factorization per `calculateElectrostaticEnergy()` call -- and the
+last two are stage-2 call sites, so this port helps both stages, not
+just stage 1 like `GpuElecForces` above.
+
+**Numerical safety, checked before writing any CUDA** (the discipline
+that would have caught the Kalman-filter GPU regression earlier in
+this file): cuSOLVER's fast solvers are LU-based (`getrf`/`getrs`),
+not Eigen's rank-revealing `ColPivHouseholderQR` used today.
+- Condition number on real `AConstrained` matrices (60 real 631x631
+  structures from `temp/H2O_4G`): `cond ~ 3.27e5`, essentially
+  identical across all 60 (consistent with same-density MD snapshots
+  -- the extremal singular values are dominated by aggregate
+  hardness/density, not fine geometry).
+- Direct QR-vs-LU solve comparison, first with Eigen
+  `ColPivHouseholderQR` vs `PartialPivLU` as a CPU stand-in, then with
+  the actual `cusolverDnDgetrf`/`getrs` API (`gpu/gemm/qeq_solver_test.cu`,
+  validated against the same real matrices, dumped via a temporary
+  `N2P2_DUMP_QEQ` hook in `Structure.cpp`, reverted after use): relative
+  error in the solved charges **~1e-15, worst case ~7.6e-14** -- float64
+  machine precision, no measurable accuracy loss from switching to LU.
+
+**Design** (`src/libnnpgpu/GpuQeqSolver.h/.cu`): a `static`
+`unordered_map<size_t, State>` cache keyed by `Structure::index`,
+exactly like `GpuForces.h`/`GpuElecForces.h`'s topology cache --
+*not* a `Structure`-owned handle, because `calculateForceLambdaTotal()`/
+`calculateForceLambdaElec()` are `const` member functions and
+`Structure` has no user-defined destructor/copy-constructor (adding
+one to manage a raw GPU handle risks a shallow-copy/double-free bug
+when the training-set `vector<Structure>` reallocates). A `static`
+cache sidesteps this entirely -- it's freely mutable from `const`
+methods since staticness bypasses the enclosing object's constness.
+Unlike `GpuForces`' topology (purely geometric, cached forever),
+`AConstrained` depends on the current per-element `hardness` (a
+trainable weight), so `gpuQeqFactorize()` refactorizes unconditionally
+every `calculateElectrostaticEnergy()` call, exactly like the CPU
+code's unconditional `AConstrainedQr.compute()` today -- only the
+device buffer allocation and LU factors are reused, not the
+factorization result across calls.
+
+`calculateDQdChi()`/`calculateDQdJ()` originally called `.solve()` in
+a loop (`numAtoms`=630 times, `numElements`=2 times). Batched into
+**one** multi-RHS `gpuQeqSolve()` call each instead -- doing 630
+separate small GPU round trips would very plausibly have repeated
+`GpuForces.cu`'s documented first-pass MPS-contention regression (see
+above in this file). `calculateDQdr()`/`calculateForceLambdaTotal()`/
+`calculateForceLambdaElec()` stay `nrhs=1` (their actual call sites
+only ever pass one right-hand side) -- `GpuElecForces` already proved
+small unbatched per-call GPU round trips are an acceptable, real net
+win in this exact codebase.
+
+**Correctness caught something real, and it wasn't a bug.** End-to-end
+multi-epoch verification (isolated worktree, `GPU=1` build,
+`temp/H2O_4G` subsets, `nnp-scaling` + `nnp-train 1` *and* `2`):
+stage 1's `learning-curve.out.stage-1` came out **bit-identical**
+between CPU and GPU builds. Stage 2 did not -- `learning-curve.out.stage-2`
+diverged by up to ~2x in RMSE from epoch 1 onward, while epoch 0 (a
+deterministic evaluation pass, no Kalman recursion yet) matched
+exactly. Rather than assume this away as "expected Kalman chaos"
+(the same phrase that would have rationalized away a real bug), added
+a live cross-check: temporarily ran the CPU `AConstrainedQr` solve
+*alongside* the GPU one during an actual `N2P2_QEQ_XCHECK`-gated stage-2
+run and diffed every call. All 60 live per-call relative errors came
+back `~1e-15` to `~1e-18` -- matching the standalone fixture validation
+exactly, confirming every individual GPU solve agrees with CPU to
+machine precision during real training, not just in isolation. The
+~2x aggregate RMSE divergence is therefore the Kalman filter's
+already-documented chaotic sensitivity to floating-point order (a
+~1e-15 per-call perturbation compounding through ~673 recursive
+updates/epoch) amplifying a machine-precision difference, not a
+correctness defect -- confirmed by measurement, not assumed.
+Instrumentation reverted after use.
+
+**Wall-clock, real data, MPS** (60-structure/630-atom subset, 8 ranks
+sharing 1 GPU, stage 1):
+
+| | epoch | train phase |
+|---|---|---|
+| CPU | 4.94s | 3.78s |
+| GPU (`GpuQeqSolver`) | 2.40s | 1.63s |
+
+`~2.06x` epoch, `~2.32x` on the `train` phase specifically (where
+`qeq`/`dq` live) -- no MPS-contention regression, and a substantially
+bigger win than `GpuElecForces`' ~12%, consistent with `qeq`+`dq`
+having been the single largest remaining cost (44.3% of epoch) before
+this port.
