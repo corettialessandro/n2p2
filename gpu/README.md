@@ -1998,3 +1998,62 @@ keeps charges frozen across many calls per `Structure::hasAMatrix`'s
 existing validity window (same reasoning that already justifies caching
 the electrostatics solve itself) -- caching `dAdrQ` the same way is the
 natural next step, not yet done.
+
+### Follow-up: tried caching `dChidG`/`dAdrQ`/`pEelecpr` too -- found a real correctness bug via the exact discipline this file keeps preaching, reverted
+
+Attempted the natural next step above: split `GpuElecForces`'s upload
+into two tiers (`gpuElecForcesUpdateChargeData()` for `dChidG`/`dAdrQ`/
+`pEelecpr`, called only when they'd actually changed, vs.
+`gpuElecForcesCompute()`'s per-call `lambdaTotal`/`lambdaElec` upload).
+Staleness was tracked with a `Mode.cpp`-file-scope `set<size_t>`,
+marked in `Mode::chargeEquilibration()` whenever its `derivativesElec`
+block runs (the only place these three are actually recomputed) and
+consumed in `Mode::calculateForces()`'s GPU block. Verified every call
+site in `Training.cpp` pairs the elec-NN forward pass with
+`chargeEquilibration(..., true)` under the same flag -- a real,
+grep-confirmed invariant, not a guess.
+
+First end-to-end run already looked suspicious: raw training-candidate
+RMSE diverged from the CPU baseline by more than the already-known
+Kalman-chaos noise floor (`1.84e-2` vs. the `1.50e-2`/`1.56e-2` range
+every other GPU/CPU comparison in this file has shown). Per this
+project's standing rule (verify against real data, don't trust a
+number that merely looks plausible -- the exact lesson `GpuKalmanFilter`
+already paid for once), added a temporary debug cross-check: on every
+`calculateForces()` call, recompute the CPU-reference `f`/`fElec` from
+the structure's *current* live data and diff against the GPU result,
+printing `structureId`/`needChargeDataUpload`/max-abs-diff.
+
+**Confirmed real, not noise.** Every call with `needChargeDataUpload=1`
+(fresh upload) matched to float noise (`~1e-18`), as expected. Calls
+with `needChargeDataUpload=0` (cache reuse) matched too -- for the
+*first* reuse after each upload -- then diverged, and the divergence
+**settled into a fixed, per-structure constant** rather than growing
+unboundedly (e.g. structure 3's `fElec` error sat at exactly
+`2.722e-06` across dozens of later calls, `f`'s error scaled with the
+still-fresh, still-correctly-uploaded `lambdaTotal`). That shape --
+one missed refresh, then a stable offset -- points at `pEelecpr`
+specifically (added directly, unscaled by any lambda, so a fixed delta
+in it shows up as a fixed delta in the output) going stale through a
+path the `derivativesElec`-only marker doesn't see: `chargeEquilibration()`
+also gets called with `derivativesElec=false` from the energy-training
+branch (`Training.cpp`, gated on `!s.hasCharges`, not `!s.hasAMatrix`),
+which still flips `hasAMatrix` true (`calculateElectrostaticEnergy()`
+sets it unconditionally) without refreshing `pEelecpr`/`dAdrQ`/`dChidG`
+-- a cross-k-branch interaction a single-function staleness marker
+can't safely observe from outside.
+
+**Reverted the caching change entirely** (`Mode.cpp`,
+`GpuElecForces.h/.cu` back to the always-reupload version this section
+already validated correct) rather than ship a partial fix without being
+certain -- training on silently-wrong forces is a far worse outcome
+than a missed 12%-ish-more-of-a-modest-win. A safe version of this
+optimization needs a staleness signal that can't be fooled by
+cross-branch mutation, which really means `Structure` itself exposing
+an explicit, incrementing generation counter for `dChidG`/`dAdrQ`/
+`pEelecpr` (bumped at their one real write site, immune to guessing
+which call sites might indirectly trigger it) rather than inferring
+staleness from *outside* by pattern-matching caller code -- a more
+invasive change than fits as a quick follow-up, left for a dedicated
+pass. `dAdrQ`'s per-call re-upload cost stands as the next real
+optimization target, just not solved yet.
