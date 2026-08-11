@@ -1906,3 +1906,95 @@ is worth measuring before treating `~5.6x` as the final word; when
 reporting GPU speedups from this port going forward, quote the CPU
 baseline's hardware explicitly (partition, CPU model, core count)
 rather than a bare multiplier.
+
+### Follow-up: 4G-HDNNP -- two CPU bugs (~10x, ~24%) before any GPU work, then a GPU port of what was actually slow
+
+Everything above is `HDNNP_2G` (short-range only). Porting `HDNNP_4G`
+(electrostatics + non-local charge transfer) started with real
+profiling on a real periodic dataset (`temp/H2O_4G`, 1254 structures,
+630 atoms/structure) rather than assuming the electrostatics/charge
+equilibration math was the natural GPU target -- a good thing, since
+the two dominant costs found were both plain CPU algorithmic bugs, not
+GPU-shaped problems at all.
+
+**Bug 1, stage 1 (charge NN training):** `Structure::calculateDQdChi()`
+(and four sibling functions -- `calculateDQdJ`, `calculateDQdr`,
+`calculateForceLambdaTotal`, `calculateForceLambdaElec`) each called
+`A.colPivHouseholderQr()` fresh for every solve against the same
+`(numAtoms+1)x(numAtoms+1)` charge-equilibration matrix, instead of
+factorizing once and reusing it -- turning an `O(N^3)` solve into an
+`O(N^4)` one (`calculateDQdChi` alone loops over every atom in the
+structure). Fixed by adding a persistent `Structure::AConstrainedQr`
+member, factorized once in `calculateElectrostaticEnergy()` and reused
+via `.solve()` everywhere else. Measured on the real dataset: stage-1
+epoch time `270s -> 26.6s` (`~10x`), `calculateDQdChi` itself
+`250s -> 2.0s` (`~126x`), `learning-curve.out.stage-1` bit-identical
+before/after.
+
+**Bug 2, stage 2 (force training):** `Mode::calculateForces()` was
+being recomputed from scratch on every `SM_THRESHOLD` trial of the same
+update candidate (up to `rmse_threshold_trials` times), even though
+trials share the same structure and the same not-yet-updated weights --
+the electrostatics half of this exact redundancy already had a cache
+(`Structure::hasAMatrix`); the short-NN-forward + `calculateForces()`
+pair had no equivalent guard. Fixed with a per-candidate `forcesValid`
+flag, declared fresh inside the batch loop (never a persistent
+`Structure`-level flag, since forces genuinely go stale between
+different candidates -- each one applies a real Kalman filter update).
+`~24%` faster, bit-identical results, smaller win than bug 1 because
+most `SM_THRESHOLD` candidates apparently resolve in one trial already.
+
+**Then, and only then, GPU work.** Fine-grained profiling of what was
+left (temporary `Stopwatch` brackets around `Mode.cpp`'s `HDNNP_4G`
+force block and `Training.cpp`'s `calculateDQdr`/`calculateForces` call
+sites, same throwaway-instrumentation methodology as the `F_err`
+investigation above) found: `calculateForceLambdaTotal()`/`Elec()` --
+two more solves against the now-cached factorization -- cost under 1ms
+per call combined; `calculateDQdr()` cost `0.05s` per epoch on rank 0.
+Meanwhile the whole `calculateForces()` call cost `~17.3s` per epoch on
+that same rank -- a `346x` gap. The difference: an `O(numAtoms^2 x
+avgNeighbors)` double loop in `calculateForces()`'s `HDNNP_4G` block
+that calls `Atom::calculateDChidr()` for every atom pair, which
+internally does a **linear neighbor-list search per pair** -- the same
+shape of cost (dense linear algebra is cheap, an unported O(N^2) pair
+loop is not) that made the 2G `calculateForces()` port worth `~12x`
+above.
+
+Design: `lambdaTotal(j)`/`lambdaElec(j)` are constant per *owner* atom
+`j`, so pre-multiplying them into `dChidG_j[k]` once per call turns the
+whole computation into the exact same self-term + owner-centric-edge-
+list shape `GpuForces.cu` already uses for the 2G short-range port,
+plus one extra embarrassingly-parallel dense `O(numAtoms^2)` reduction
+for the `dAdrQ` term. No factorization anywhere in this particular
+port -- it's a pure reduction/scatter -- so none of `GpuKalmanFilter`'s
+"GPU LU/inverse silently disagrees with Eigen's on real ill-conditioned
+data" risk applies here; still validated against real production data
+anyway (`gpu/gemm/elecforces_test.cu`, real `fElec` dumped from an
+actual `nnp-train` stage-2 run, max abs diff `1.1e-19`) rather than
+relying on that argument alone.
+
+New module: `src/libnnpgpu/GpuElecForces.h/.cu`, same conventions as
+`GpuForces.h/.cu` (persistent per-structure topology keyed by
+`Structure::index`, `CUDA_CHECK` macro, plain-C++ header). Wired into
+`Mode::calculateForces()`'s `HDNNP_4G` block behind `#ifdef N2P2_GPU` /
+`!N2P2_FULL_SFD_MEMORY`, guarded by a `doneOnGpu` flag so the original
+CPU loop is untouched as the fallback.
+
+**End-to-end result, honestly:** correctness holds -- epoch 0 (a
+deterministic full-dataset evaluation with no Kalman-filter candidate
+selection involved) is bit-identical GPU vs. CPU; epochs 1-2 diverge in
+raw per-epoch training-candidate RMSE by an amount consistent with the
+Kalman filter's already-documented chaotic sensitivity to
+floating-point reduction order (see this file's very first 2G
+`learning-curve` discussion), not a correctness problem. But the speed
+win is modest: total training-loop time `262.8s -> 234.6s` (`~12%`,
+with an MPS daemon for the 4 ranks sharing 1 GPU in this small
+5-structure test; `247.5s` without MPS) -- far short of what the
+isolated kernel's cost share suggested. Most likely cause, not yet
+fixed: `dAdrQ` (`9.5MB` for this 630-atom structure) is re-uploaded via
+`cudaMemcpy` on **every single call**, unlike the topology, which is
+genuinely cached. `dAdrQ` only changes when charges do, and stage 2
+keeps charges frozen across many calls per `Structure::hasAMatrix`'s
+existing validity window (same reasoning that already justifies caching
+the electrostatics solve itself) -- caching `dAdrQ` the same way is the
+natural next step, not yet done.
