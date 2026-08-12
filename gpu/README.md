@@ -2261,3 +2261,125 @@ sharing 1 GPU, stage 1):
 bigger win than `GpuElecForces`' ~12%, consistent with `qeq`+`dq`
 having been the single largest remaining cost (44.3% of epoch) before
 this port.
+
+### Follow-up: full production-scale comparison (1254 structures) -- CPU core-count scaling vs 4-GPU, and a self-inflicted MPS bug
+
+Requested comparison: CPU wall time on `dcgp_usr_prod` (32/64/112
+cores) vs the fully GPU-ported path on all 4 A100s of one
+`boost_usr_prod` node, on the **real, full** `temp/H2O_4G` dataset
+(1254 structures, 790,020 atoms), 1 epoch, `memorize_symfunc_results`
+on.
+
+**CPU baseline, real 4G code as it stands today** (i.e. with every
+CPU-side fix from this whole effort already included -- the O(N^4)
+charge-equilibration fix, the Jacobian-assembly fix, the SM_THRESHOLD
+redundant-`calculateForces()` fix, `memorize_symfunc_results` -- *not*
+a "before this session" baseline, since building that would have meant
+rebuilding from a commit predating all of the above just for this
+comparison):
+
+| dcgp cores | Stage 1 epoch | Stage 2 epoch |
+|---|---|---|
+| 32 | 23.51s | 2686s (44.8 min) |
+| 64 | 12.97s | 1859s (31.0 min) |
+| 112 | 9.39s | 1121s (18.7 min) |
+
+**First GPU attempt: 32 ranks spread across all 4 GPUs, one MPS control
+daemon PER GPU (each started with its own `CUDA_VISIBLE_DEVICES`
+restriction).** This is a legitimate MPS topology in principle -- but
+on this cluster it hard-failed: every rank bound to GPU 1/2/3 got
+`no CUDA-capable device is detected`, only GPU 0's daemon ever accepted
+connections. A serialized-startup diagnostic (`gpu/gemm/run_mps_serialized_diag.slurm`
+-- each daemon started alone, 3s apart, with an immediate single-process
+connectivity test right after each) ruled out a startup race: GPU 1/2/3
+failed even in total isolation, with no other daemon or client anywhere
+near them. Falling back to plain `CUDA_VISIBLE_DEVICES` rank binding
+with **no MPS at all** (`gpu/gemm/run_nomps_gpu_diag.slurm`) worked
+cleanly on all 4 GPUs, so that's what the first full-scale run used --
+giving 32-ranks/1-GPU=21.48s and 32-ranks/4-GPUs(8/GPU)=15.63s for
+stage 1 (a real but modest `~1.37x` from spreading across GPUs, far
+from the `~4x` naive scaling would suggest) and a disappointing
+**2658s** for stage 2 -- barely different from the 32-core CPU number.
+
+**The mistake, found by checking this file first.** Multi-GPU MPS had
+already been solved for the 2G port, earlier in this same document (the
+"spread the 32 ranks across all 4 GPUs" section above): **one single,
+UNRESTRICTED MPS control daemon serving all 4 GPUs**, with each
+*client* rank picking its own GPU via its own `CUDA_VISIBLE_DEVICES` --
+the pattern NVIDIA's own docs describe as the default for multi-GPU
+nodes, and already implemented in `gpu/e2e_train_check/rank_gpu_wrapper.sh`.
+That section even already documents hitting the *same* per-GPU-daemon
+failure once before ("An earlier attempt ran 4 *separate* per-GPU
+daemons and hit intermittent `cublasCreate()` failures on some ranks
+... switching to one shared daemon fixed it outright"). This 4G
+investigation re-discovered the identical failure mode from scratch
+before checking whether it had already been solved -- a real process
+mistake, not a new cluster limitation. Re-verified via
+`gpu/gemm/run_single_daemon_mps_diag.slurm` (one unrestricted daemon,
+8 ranks across all 4 GPUs, 2/GPU): clean success on every rank.
+
+**Corrected result, same full-scale run, single shared MPS daemon**
+(`gpu/gemm/gpu_rank_wrapper.sh`, `RANKS_PER_GPU=8`):
+
+| Config | Stage 1 epoch | Stage 2 epoch |
+|---|---|---|
+| CPU, 112 cores | 9.39s | **1121s (18.7 min)** |
+| CPU, 64 cores | 12.97s | 1859s (31.0 min) |
+| **GPU, 4xA100, 32 ranks (correct MPS)** | **14.15s** | **2643s (44.1 min)** |
+| CPU, 32 cores | 23.51s | 2686s (44.8 min) |
+
+MPS fixed stage 1 modestly (`15.67s -> 14.15s`, now clearly ahead of
+32-core CPU) but barely touched stage 2 (`2658s -> 2643s`) -- direct
+confirmation that stage 2's cost was never an MPS/contention problem in
+the first place.
+
+### Follow-up: why stage 2 stays slow -- verified, not guessed
+
+Rather than leave "stage 2 is slow" as an unexplained number, profiled
+it directly with the same temporary-Stopwatch methodology used
+throughout this file, bracketing `Training::update("force")`'s PART 1
+(candidate/trial selection) and PART 2 (Jacobian assembly), on a real
+5-structure `temp/H2O_4G` subset:
+
+| bracket | share of `F_err` |
+|---|---|
+| `calcForces` (`Mode::calculateForces()`, the O(numAtoms^2) electrostatics loop) | ~68-70% |
+| `nnFallback` (force-Jacobian NN forward+`calculateDFdc`, CPU-only loop) | ~30% |
+| `shortNN` (short-range NN forward pass) | ~5% |
+| `dQdr` (this session's `GpuQeqSolver` work) | **~0.3%, negligible** |
+
+Two real, already-understood reasons, not a bug:
+
+1. **`calculateForces()` is already GPU-accelerated (`GpuElecForces`,
+   confirmed via a call-count check that `doneOnGpu=true` on every
+   call) but was only ever a documented ~12% win** (see this section's
+   earlier entry) -- capped by having to re-upload an O(numAtoms^2)
+   `dAdrQ` array (~9.5MB for a 630-atom structure) on every single
+   weight update, since it depends on the current charges and can't be
+   cached across calls. A caching fix for exactly this was attempted
+   earlier this session, caught a real correctness bug via cross-
+   checking, and was deliberately reverted rather than shipped
+   uncertain -- so this ~12% ceiling is accepted, not overlooked.
+2. **The force-Jacobian NN backward pass (`calculateDFdc`) was never
+   GPU-ported for 4G at all.** `Training.cpp`'s own comment says why:
+   `gpuNnForceDFdcSum` (the 2G equivalent) explicitly scopes out
+   HDNNP_4G's extra charge-input neuron and `dQdxia` handling. This is
+   a genuine, well-scoped, still-open follow-up -- not a defect in
+   anything built this session.
+
+Confirmed with a live MPS-vs-no-MPS comparison on the same small
+subset that `calcForces`'s cost is flat either way (~23s vs ~26s,
+within noise) -- ruling out contention as an explanation for its size
+and pointing squarely at the re-upload cost and kernel/data-marshaling
+overhead instead.
+
+**Net assessment:** this session's `GpuQeqSolver` port is fully
+validated and doing exactly what it was built for (stage 1, and the
+`calculateDQdr`/`calculateForceLambdaTotal`/`calculateForceLambdaElec`
+slice of stage 2) -- it just isn't where stage 2's time goes. The
+natural next step for anyone picking this back up is porting 4G's
+force-Jacobian NN backward pass, following `gpuNnForceDFdcSum`'s
+existing pattern with the extra charge-input-neuron/`dQdxia` handling
+this time -- likely the single biggest remaining opportunity in the
+whole 4G pipeline, given it's ~30% of stage 2's dominant `F_err` phase
+and has had zero GPU attention so far.
