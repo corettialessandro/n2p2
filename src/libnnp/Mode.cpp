@@ -1816,6 +1816,97 @@ void Mode::calculateAtomicNeuralNetworks(Structure& structure,
     {
         if (id == "elec")
         {
+#ifdef N2P2_GPU
+            // Widen the HDNNP_2G-only GPU dispatch (gpuNnForwardDEdG) to
+            // HDNNP_4G's "elec" (charge-equilibration) NN forward pass
+            // too -- gpu/README.md follow-up to the "short" NN port
+            // above, same class of gap (this dispatch was never wired
+            // up for HDNNP_4G at all). Differs from both HDNNP_2G's
+            // branch and this file's "short" case: output goes into
+            // a.dChidG/a.chi (not a.dEdG/a.energy -- the elec NN's
+            // forward output is "chi", the electronegativity feeding the
+            // charge-equilibration solve, not an energy), no extra
+            // charge-neuron input column (the elec NN's own input is
+            // just G, not self-referential on charge -- confirmed by
+            // Atom.cpp: dChidG.resize(numSymmetryFunctions, ...), no
+            // +1, unlike the "short" NN's dEdG), and the "negativity"
+            // normalize() post-processing step (when configured) is
+            // replicated here after the batched dispatch since
+            // gpuNnForwardDEdG doesn't know about it.
+            bool allElementsGpuCompatible = true;
+            for (size_t e = 0; e < elements.size(); ++e)
+            {
+                if (!elements.at(e).neuralNetworks.at(id)
+                        .hasGpuCompatibleArchitecture())
+                {
+                    allElementsGpuCompatible = false;
+                    break;
+                }
+            }
+
+            if (allElementsGpuCompatible)
+            {
+                vector<vector<size_t>> atomsByElement(elements.size());
+                for (size_t i = 0; i < structure.atoms.size(); ++i)
+                {
+                    atomsByElement.at(structure.atoms.at(i).element)
+                        .push_back(i);
+                }
+
+                for (size_t e = 0; e < elements.size(); ++e)
+                {
+                    vector<size_t> const& atomIndices = atomsByElement.at(e);
+                    if (atomIndices.empty()) continue;
+
+                    NeuralNetwork& nn = elements.at(e).neuralNetworks.at(id);
+                    int const numAtoms = (int)atomIndices.size();
+                    int const numIn = nn.getNumNeuronsInLayer(0);
+                    int const numHidden1 = nn.getNumNeuronsInLayer(1);
+                    int const numHidden2 = nn.getNumNeuronsInLayer(2);
+
+                    vector<double> connections(nn.getNumConnections());
+                    nn.getConnections(connections.data());
+
+                    vector<double> G((size_t)numAtoms * numIn);
+                    for (int t = 0; t < numAtoms; ++t)
+                    {
+                        Atom const& a = structure.atoms.at(atomIndices.at(t));
+                        copy(a.G.begin(), a.G.end(),
+                             G.begin() + (size_t)t * numIn);
+                    }
+
+                    vector<double> chiOut(numAtoms);
+                    vector<double> dChidGOut((size_t)numAtoms * numIn);
+                    gpuNnForwardDEdG(numAtoms, numIn, numHidden1, numHidden2,
+                                     connections.data(), G.data(),
+                                     chiOut.data(), dChidGOut.data());
+
+                    for (int t = 0; t < numAtoms; ++t)
+                    {
+                        Atom& a = structure.atoms.at(atomIndices.at(t));
+                        a.chi = chiOut.at(t);
+                        if (derivatives)
+                        {
+                            copy(dChidGOut.begin() + (size_t)t * numIn,
+                                 dChidGOut.begin() + (size_t)(t + 1) * numIn,
+                                 a.dChidG.begin());
+                            if (normalize)
+                            {
+                                for (auto& dChidGi : a.dChidG)
+                                    dChidGi = normalized("negativity",
+                                                          dChidGi);
+                            }
+                        }
+                        if (normalize)
+                        {
+                            a.chi = normalized("negativity", a.chi);
+                        }
+                    }
+                }
+
+                return;
+            }
+#endif
             for (auto& a : structure.atoms)
             {
                 NeuralNetwork& nn = elements.at(a.element)

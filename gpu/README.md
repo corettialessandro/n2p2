@@ -2903,3 +2903,67 @@ instead of `dEdG`, no extra charge-input column since the elec NN's
 own input is just symmetry functions) and a `normalize`
 post-processing step the `HDNNP_2G` branch doesn't have, so it isn't a
 copy-paste of this same diff. Tracked as its own commit.
+
+### Follow-up: ported the "elec" NN forward pass too -- correct, but a modest, honestly-reported ~1% win, not another big one
+
+Implemented the `"elec"` case following the same pattern as `"short"`
+above: a new `HDNNP_4G`-only GPU branch mirroring `HDNNP_2G`'s dispatch,
+writing into `a.chi`/`a.dChidG` instead of `a.energy`/`a.dEdG`, no extra
+charge-input column (confirmed via `Atom.cpp`:
+`dChidG.resize(numSymmetryFunctions, ...)`, no `+1` -- the elec NN's
+own input is just symmetry functions, unlike the "short" NN), and the
+"negativity" `normalize()` post-processing step (when configured)
+replicated after the batched dispatch.
+
+**Verified live** (`N2P2_ELECNN_XCHECK`): compared GPU-computed
+`chi`/`dChidG` against the real CPU reference across both stages
+(stage 1 trains charges and calls this heavily; stage 2's force branch
+calls it once per structure per `hasAMatrix` validity window), 60-structure
+subset, 2 epochs each -- **575 evaluations total (244 stage 1 + 331
+stage 2), `chi` matching to `~7-9E-13`**. Stage 1's `dChidG` diff came
+back exactly `0.000E+00` -- not a red flag: stage 1's charge branch
+calls this with `derivatives=false` (it only needs the forward `chi`
+value there; the actual charge-training weight-Jacobian goes through a
+separate `calculateDEdc()` call, not this function's `dChidG` output),
+so both the GPU and CPU-reference paths skip `dChidG` entirely on
+those calls, matching trivially. Stage 2's non-trivial `dChidG` match
+(`2.0E-12`) confirms the `derivatives=true` path is independently
+exercised and correct.
+
+**Performance, full scale, honestly reported.** The first clean run
+looked like a wash-to-slight-regression (stage 1 `14.27s -> 15.13s`,
+stage 2 `127.2s -> 126.2s`) -- rather than accept a single one-epoch
+number the way earlier sections in this file already learned not to, reran
+under identical conditions. The second run landed at stage 1 `14.01s`,
+stage 2 `125.8s` -- the first run's stage-1 number was noise (an
+`Q_com`/MPI-communication spike unrelated to this change, `0.030s ->
+1.197s` between the two runs on an otherwise-identical code path), not
+a real regression. Taking the reproducible second run:
+
+| | Stage 1 epoch | Stage 2 epoch |
+|---|---|---|
+| GPU, before this port ("short" NN port only) | `14.27s` | `127.2s` |
+| **GPU, after this port** | `14.01s` | **`125.8s`** |
+
+A real but modest **~1-2%** win on both stages -- far smaller than the
+`"short"` case's `~14.8%`, consistent with what was flagged when this
+follow-up was scoped ("a separate, smaller opportunity"). Most likely
+explanation: unlike `"short"` (called once per force-training
+candidate, i.e. very frequently), `"elec"`'s forward pass with
+`derivatives=true` only runs once per structure per `hasAMatrix`
+validity window -- a much lower call volume for the GPU dispatch's
+fixed per-call overhead (the `hasGpuCompatibleArchitecture()` sweep,
+topology/`G`-array construction, kernel launch) to amortize against.
+Still a net positive with no measured downside, so kept rather than
+reverted -- unlike the batching attempt and `dAdrQ`-caching attempt
+elsewhere in this file, this one didn't hit a wall, it just had less
+room to matter.
+
+**Net effect of both `calculateAtomicNeuralNetworks()` widenings
+together** (`"short"` + `"elec"`, full scale): stage 2 `149.3s ->
+125.8s` (`~15.7%` combined, on top of the short-range-loop port's own
+`8.8x`), stage 1 essentially unchanged (`14.15s -> 14.01s`, this
+dataset's stage-1 cost is dominated by the already-GPU-ported
+`chargeEquilibration()`/`GpuQeqSolver` solve, not NN forward passes).
+**GPU is now `5.49x` faster than CPU-112 on stage 2** (`691.2s` vs.
+`125.8s`).
