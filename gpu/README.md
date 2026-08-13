@@ -2632,3 +2632,30 @@ declared but never set outside the `HDNNP_4G`/`SM_THRESHOLD` force
 branch). All temporary instrumentation (`Stopwatch` brackets,
 `N2P2_FORCES_DETERMINISM_CHECK`) reverted before commit; only the
 one-line `forcesValid` guard ships.
+
+### Follow-up: confirmed at full production scale (1254 structures) -- stage 2 GPU time halved, CPU-112 gap narrows from 2.36x to 1.90x
+
+Reran the same CPU-112-vs-4xA100 comparison this file's "full
+production-scale comparison" section already established, on the exact
+same real, full `temp/H2O_4G` dataset (1254 structures, 790,020 atoms),
+1 epoch, `memorize_symfunc_results` on -- this time on top of the
+`forcesValid` fix above, to confirm the subset-60 result wasn't an
+artifact of the smaller test:
+
+| | Stage 1 epoch | Stage 2 epoch |
+|---|---|---|
+| CPU, 112 cores (dcgp) | `9.44s` (was `9.39s`, unaffected as expected) | `691.2s` (was `1121s`) -- **~38.4% faster** |
+| GPU, 4xA100, 32 ranks (MPS) | `14.15s` (unchanged, as expected) | `1311s` (was `2643s`) -- **~50.4% faster** |
+
+Stage 1 is bit-for-bit unaffected on both hardware paths, exactly as
+the fix's scope predicts. Stage 2 dropped by roughly half on GPU (a
+bigger relative win than the CPU side, consistent with GPU calls paying
+proportionally more per-call transfer/launch overhead that a halved
+call count directly removes) and by over a third on CPU. Net effect:
+the CPU-112-vs-GPU gap this file flagged as "stage 2 stays slow" is
+real but meaningfully smaller now -- **`1.90x`** (GPU slower) instead
+of the pre-fix **`2.36x`**. GPU is still behind CPU-112 on both stages
+(`14.15s` vs. `9.44s` stage 1, `1311s` vs. `691.2s` stage 2), so this
+alone doesn't flip the headline conclusion, but it's the single biggest
+step towards closing that gap found in this whole port -- and the only
+one so far that required no GPU code at all.
