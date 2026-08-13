@@ -2532,3 +2532,103 @@ don't create an opportunity for it to help. Stage 2's remaining time
 is not further addressable by batching this call site without first
 deciding, separately and deliberately, to change how many force
 samples go into each Kalman update.
+
+### Follow-up: a fresh re-profile found `calculateForces()` was being called TWICE per force candidate -- a real, ~40-48% stage-2 win, no GPU code involved
+
+Started a new profiling pass from scratch (temporary fine-grained
+`Stopwatch` brackets, same methodology as every other entry in this
+file, on a real 60-structure `temp/H2O_4G` subset, reverted after use)
+to re-check where stage-2 time goes now that `calculateDFdc` is ported
+and the batching attempt above is reverted. `calculateForces()`
+(PART 1's cached call) still accounted for roughly half of `F_err`, as
+expected -- but tallying every bracket against `F_err`'s own total left
+**~50% of `F_err` unaccounted for**, on top of the `calculateForces()`
+share already measured.
+
+The missing time: `Training::update()`'s `"force"` branch calls
+`calculateForces(s)` in **two** places --
+
+1. PART 1's trial loop (`if (!forcesValid) { ...; calculateForces(s);
+   forcesValid = true; }`), added by an earlier fix in this file (the
+   "two failed attempts, then a real ~12x win" / SM_THRESHOLD
+   redundant-trial fix) specifically to avoid recomputing forces across
+   repeated trials of the *same* candidate.
+2. PART 2's "Sum up total potential energy or calculate force" block,
+   **unconditionally**, with no `forcesValid` guard at all -- pre-dating
+   the fix above, never updated when that fix was added.
+
+Under this project's real config (`selection_mode 2` = `SM_THRESHOLD`,
+confirmed in `temp/H2O_4G/input.nn`), PART 1 always runs at least once
+per candidate, so PART 2's call is *always* a second, complete
+recomputation of the exact same structure under the exact same
+not-yet-updated weights -- pure duplicate work on `calculateForces()`,
+the single most expensive operation in stage 2 (see the `dAdrQ`
+re-upload discussion earlier in this section).
+
+**Why this is safe to fix, checked two ways before touching anything
+based only on a plausible-looking timing number:**
+- **By reading the code**: `Mode::calculateForces()` starts with an
+  unconditional `ai.f = Vec3D{};` reset for every atom (`Mode.cpp:2149`)
+  before accumulating short-range and electrostatic contributions --
+  every call is a complete, independent recomputation from zero, never
+  an accumulation across calls. Nothing between PART 1's cached call
+  and PART 2's runs changes the weights, charges, or geometry (no
+  `s.clearElectrostatics()` for the `useSubCandidates` path this
+  branch always takes, no `freeAtoms()` effect on `f`), so the two
+  calls are computing the identical thing.
+- **By measurement, live, on real training candidates**: added a
+  temporary `N2P2_FORCES_DETERMINISM_CHECK` probe that calls
+  `calculateForces(s)` twice in a row on the same unchanged state and
+  diffs the raw per-atom output bit-for-bit. Across 82 real candidates
+  on the GPU build, every single one showed nonzero differences between
+  the two calls -- up to ~1000 of 1890 force components differing, max
+  `8.9E-16`. This is exactly the known, already-documented
+  `atomicAdd`-on-doubles non-reproducibility of the `GpuElecForces`/
+  `GpuForces` scatter kernels (this file's `force/` section: "`atomicAdd`
+  on doubles is not run-to-run bit-reproducible"), not a logic error --
+  confirming the two calls really were computing the same thing to
+  within float noise, on both counts.
+
+That float noise explains an apparent puzzle when verifying the fix:
+`learning-curve.out.stage-1` came out bit-identical before/after (stage
+1 never touches this branch), but `learning-curve.out.stage-2` visibly
+diverged from epoch 1 onward. This is *not* a correctness regression --
+it's the Kalman filter's already well-documented chaotic sensitivity to
+floating-point perturbations (the same phenomenon that made the
+reverted `dAdrQ`/`dChidG`/`pEelecpr` caching attempt and `GpuQeqSolver`'s
+stage-2 divergence both look alarming at first) amplifying *which* of
+two ~1e-16-different, equally-valid roundings ends up feeding the
+filter. Removing the redundant call changes that choice; it does not
+change the physics.
+
+**Fix**: guard PART 2's call the same way PART 1's already is --
+`if (!forcesValid) calculateForces(s);`. `forcesValid` is declared
+fresh per candidate and is only ever set `true` by the
+`HDNNP_4G`/`SM_THRESHOLD` branch in PART 1, so `HDNNP_2G` and any
+non-`SM_THRESHOLD` selection mode are completely unaffected (the flag
+stays `false`, PART 2's call still runs exactly as before).
+
+**Measured win**, same 60-structure subset, 3 epochs, before vs. after
+(cumulative-since-start `Stopwatch` brackets and `timing.out.stage-2`
+both agree):
+
+| | Stage-2 epoch time | `calculateForces()` calls/rank (3 epochs) |
+|---|---|---|
+| GPU, 4xA100, 32 ranks (MPS) | `123.3s` -> `64.8s` | 500 -> 250 |
+| CPU, 32 ranks (dcgp) | (not separately measured unfixed) | 500 -> 250 (est. ~160s -> 99.5s epoch) |
+
+**~47.5%** stage-2 epoch-time reduction on GPU, **~38%** estimated on
+CPU (from the now-near-zero `prof_calcForcesPart2` bracket vs. the
+still-present `prof_calcForces` bracket) -- a bigger win than any GPU
+kernel work in this whole port, delivered by a four-line CPU-only
+change. This does not change the earlier finding that stage 2's
+`calculateForces()` GPU port is capped by the `dAdrQ` re-upload cost
+(still true, still unfixed) -- it changes how many times that capped
+cost gets paid per candidate, from two down to the necessary one.
+
+Verified: `learning-curve.out.stage-1` bit-identical, confirming
+`HDNNP_2G` and stage 1 are untouched by construction (`forcesValid` is
+declared but never set outside the `HDNNP_4G`/`SM_THRESHOLD` force
+branch). All temporary instrumentation (`Stopwatch` brackets,
+`N2P2_FORCES_DETERMINISM_CHECK`) reverted before commit; only the
+one-line `forcesValid` guard ships.

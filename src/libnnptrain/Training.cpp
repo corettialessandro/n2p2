@@ -3053,7 +3053,19 @@ void Training::update(string const& property)
         }
         else if (k == "force")
         {
-            calculateForces(s);
+            // HDNNP_4G/SM_THRESHOLD redundant-computation fix (see
+            // gpu/README.md): PART 1's trial loop above already computed
+            // calculateForces(s) for this exact structure under these
+            // exact (not-yet-updated) weights, cached via forcesValid
+            // across trials. Nothing between there and here changes the
+            // weights, charges, or geometry, so s.atoms[].f is still
+            // valid -- recomputing here just duplicated the single most
+            // expensive stage-2 operation for no benefit. forcesValid is
+            // only ever set true by the HDNNP_4G/SM_THRESHOLD branch
+            // above, so HDNNP_2G and non-SM_THRESHOLD selection modes are
+            // unaffected (forcesValid stays false, calculateForces(s)
+            // still runs here exactly as before).
+            if (!forcesValid) calculateForces(s);
             Atom const& a = s.atoms.at(sC->a);
             currentRmseFraction.at(b) = fabs(a.fRef[sC->c] - a.f[sC->c])
                                       / pu.errorTrain.at("RMSE");
