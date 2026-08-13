@@ -2829,3 +2829,77 @@ at the `HDNNP_2G`/`HDNNP_4G` boundary. With this port shipped, GPU is
 now the clearly faster option for 4G stage-2 training at this problem
 size, reversing the conclusion every full-scale comparison in this
 file had shown until now.
+
+### Follow-up: a fresh post-port profile found a third gap -- HDNNP_4G's "short" NN forward pass was also HDNNP_2G-only, ~15% more stage-2 win
+
+With the short-range force loop no longer dominant, re-profiled stage 2
+from scratch (same temporary-`Stopwatch`-bracket methodology, 60-structure
+subset) to see what the *new* `F_err` composition looks like, rather than
+assume the job was finished:
+
+| Component | Share of `F_err` (post short-range-loop port) |
+|---|---|
+| `calculateDFdc` GPU dispatch | 47.6% |
+| `calculateForces()` (both terms now GPU-ported) | 21.3% |
+| `calculateAtomicNeuralNetworks(..., "short")` | **17.1%** |
+| elec-NN forward + `chargeEquilibration` gate | 10.9% |
+| `calculateDQdr` | 3.0% |
+
+`calculateDFdc` is already GPU-ported and already at its documented
+ceiling (the `task_batch_size_force=1` batching wall from the reverted
+batching attempt above -- a training-methodology change, out of scope).
+But `calculateAtomicNeuralNetworks()`'s GPU dispatch
+(`gpuNnForwardDEdG`, the batched forward pass already validated at
+`~25-27x` for `HDNNP_2G` in `src/libnnpgpu/`'s Phase 6 work) turned out
+to have the *exact same* `if (nnpType == NNPType::HDNNP_2G)` gate as
+the two bugs already fixed this session (`Mode.cpp:1725`) --
+`HDNNP_4G` gets its own separate branch (`id == "short"` / `id ==
+"elec"`) that always falls back to the one-atom-at-a-time CPU loop.
+
+**Ported the `"short"` case** (the bigger of the two, `"elec"` is a
+separate follow-up below). Unlike `HDNNP_2G`'s branch, `HDNNP_4G`'s
+`"short"` NN has an extra charge-neuron input (`nn.setInput(a.G.size(),
+a.charge)` in the CPU fallback) and a correspondingly-widened `dEdG`
+output (`numSymmetryFunctions + 1`, last element `dEdQ`). No new device
+code needed -- `gpuNnForwardDEdG` is already `numIn`-generic and
+`hasGpuCompatibleArchitecture()` doesn't check `numIn` either, same
+"no new device code" pattern as `calculateDFdc`'s and the short-range
+loop's `HDNNP_4G` widenings. The added GPU branch mirrors `HDNNP_2G`'s
+almost exactly, with two differences: `G`'s extra column set to
+`a.charge` (matching the CPU fallback), and `dEdG`'s full `numIn`-wide
+result copied back *including* the trailing `dEdQ` element -- unlike
+`calculateForces()`'s short-range loop (which never reads it),
+`calculateForceLambdaTotal()`/`Elec()` depend on `dEdQ` being correct,
+so it can't be truncated the way the short-range-loop port could
+ignore it.
+
+**Verified live** (`N2P2_SHORTNN_XCHECK`, same pattern as every other
+port here): compared GPU-computed `energy`/`dEdG` against the real CPU
+reference for every real training candidate, 60-structure subset, 2
+epochs -- **5588 evaluations, every one matching to machine precision**
+(max abs diff `6.6E-14` energy, `6.8E-13` `dEdG`), zero failures.
+Reverted before commit; only the GPU dispatch branch itself ships.
+
+**Full-scale result** (clean run, no cross-check overhead):
+
+| | Stage 1 epoch | Stage 2 epoch |
+|---|---|---|
+| CPU, 112 cores (dcgp) | `9.44s` | `691.2s` |
+| GPU, before this port (short-range loop port only) | `14.17s` | `149.3s` |
+| **GPU, after this port** | `14.27s` (unchanged, expected) | **`127.2s`** |
+
+**~14.8%** further stage-2 speedup (`149.3s -> 127.2s`), `F_err`
+itself dropping `131.7s -> 109.4s` (`~16.9%`, matching the subset-60
+share estimate almost exactly). Stage 1 unaffected, as expected (this
+fix only touches `id == "short"`, and stage 1 only ever calls
+`calculateAtomicNeuralNetworks()` with `id == "elec"`/the charge NN).
+**GPU is now `5.44x` faster than CPU-112 on stage 2** (`691.2s` vs.
+`127.2s`), up from `4.63x` after the short-range-loop port alone.
+
+The `"elec"` case (`id == "elec"`, the charge-equilibration NN's own
+forward pass, part of the remaining `10.9%` bucket above) is a
+separate, smaller follow-up -- different output target (`dChidG`
+instead of `dEdG`, no extra charge-input column since the elec NN's
+own input is just symmetry functions) and a `normalize`
+post-processing step the `HDNNP_2G` branch doesn't have, so it isn't a
+copy-paste of this same diff. Tracked as its own commit.

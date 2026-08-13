@@ -1840,6 +1840,88 @@ void Mode::calculateAtomicNeuralNetworks(Structure& structure,
         }
         else if (id == "short")
         {
+#ifdef N2P2_GPU
+            // Widen the HDNNP_2G-only GPU dispatch above (gpuNnForwardDEdG,
+            // already validated ~25-27x there) to HDNNP_4G's "short" NN --
+            // gpu/README.md's post-short-range-port stage-2 profiling
+            // found this CPU one-atom-at-a-time loop is now ~17% of
+            // F_err, the biggest remaining un-ported piece. No new device
+            // code: gpuNnForwardDEdG is already numIn-generic and
+            // hasGpuCompatibleArchitecture() doesn't check numIn either
+            // (same "no new device code" pattern as calculateDFdc's
+            // HDNNP_4G widening). What DOES differ from the HDNNP_2G
+            // block above: this NN's extra charge-neuron input (G's last
+            // column set to a.charge, matching the CPU fallback's
+            // nn.setInput(a.G.size(), a.charge) below) and dEdG's extra
+            // trailing dEdQ element -- copied back in full since
+            // downstream code (calculateForceLambdaTotal()/Elec())
+            // depends on it, unlike calculateForces()'s short-range loop
+            // which never reads it.
+            bool allElementsGpuCompatible = true;
+            for (size_t e = 0; e < elements.size(); ++e)
+            {
+                if (!elements.at(e).neuralNetworks.at(id)
+                        .hasGpuCompatibleArchitecture())
+                {
+                    allElementsGpuCompatible = false;
+                    break;
+                }
+            }
+
+            if (allElementsGpuCompatible)
+            {
+                vector<vector<size_t>> atomsByElement(elements.size());
+                for (size_t i = 0; i < structure.atoms.size(); ++i)
+                {
+                    atomsByElement.at(structure.atoms.at(i).element)
+                        .push_back(i);
+                }
+
+                for (size_t e = 0; e < elements.size(); ++e)
+                {
+                    vector<size_t> const& atomIndices = atomsByElement.at(e);
+                    if (atomIndices.empty()) continue;
+
+                    NeuralNetwork& nn = elements.at(e).neuralNetworks.at(id);
+                    int const numAtoms = (int)atomIndices.size();
+                    int const numIn = nn.getNumNeuronsInLayer(0);
+                    int const numHidden1 = nn.getNumNeuronsInLayer(1);
+                    int const numHidden2 = nn.getNumNeuronsInLayer(2);
+
+                    vector<double> connections(nn.getNumConnections());
+                    nn.getConnections(connections.data());
+
+                    vector<double> G((size_t)numAtoms * numIn);
+                    for (int t = 0; t < numAtoms; ++t)
+                    {
+                        Atom const& a = structure.atoms.at(atomIndices.at(t));
+                        copy(a.G.begin(), a.G.end(),
+                             G.begin() + (size_t)t * numIn);
+                        G.at((size_t)t * numIn + a.G.size()) = a.charge;
+                    }
+
+                    vector<double> energyOut(numAtoms);
+                    vector<double> dEdGOut((size_t)numAtoms * numIn);
+                    gpuNnForwardDEdG(numAtoms, numIn, numHidden1, numHidden2,
+                                     connections.data(), G.data(),
+                                     energyOut.data(), dEdGOut.data());
+
+                    for (int t = 0; t < numAtoms; ++t)
+                    {
+                        Atom& a = structure.atoms.at(atomIndices.at(t));
+                        a.energy = energyOut.at(t);
+                        if (derivatives)
+                        {
+                            copy(dEdGOut.begin() + (size_t)t * numIn,
+                                 dEdGOut.begin() + (size_t)(t + 1) * numIn,
+                                 a.dEdG.begin());
+                        }
+                    }
+                }
+
+                return;
+            }
+#endif
             for (auto& a : structure.atoms)
             {
                 NeuralNetwork& nn = elements.at(a.element)
