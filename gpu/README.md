@@ -2383,3 +2383,86 @@ existing pattern with the extra charge-input-neuron/`dQdxia` handling
 this time -- likely the single biggest remaining opportunity in the
 whole 4G pipeline, given it's ~30% of stage 2's dominant `F_err` phase
 and has had zero GPU attention so far.
+
+### Follow-up: porting `calculateDFdc` to GPU for 4G -- a real, modest win, and why it's smaller than hoped
+
+Picked up the follow-up above. The surprise: no new device code was
+needed at all. `gpuNnForceDFdcSum()` (`src/libnnpgpu/GpuNeuralNetwork.cu`,
+built for the 2G port) was already fully generic in `numIn` -- it never
+assumes an "input" is a symmetry function rather than 4G's extra charge
+input neuron, and `NeuralNetwork::hasGpuCompatibleArchitecture()` never
+checks `numIn` either (only layer count, activation functions, and
+output size). The only thing scoping it to `HDNNP_2G` was
+`Training.cpp`'s dispatch code itself.
+
+The fix (`src/libnnptrain/Training.cpp`, `Training::update()`'s
+`"force"` branch) is a small, surgical extension of the existing
+2G-only GPU dispatch: `nnpType == NNPType::HDNNP_2G` widened to also
+accept `HDNNP_4G`, plus two array-construction fixes so the extra
+column reaches the (unchanged) GPU function correctly --
+
+- **G's last column** set to each atom's charge (`a.charge`), matching
+  the CPU fallback loop's `nn.setInput(it->G.size(), it->charge)`.
+- **dGdxyz's last column** set to `dQdxia =
+  s.atoms.at(sC->a).dQdr.at(ia)[sC->c]`, matching the CPU fallback
+  loop's `dGdxia.back() = dQdxia` (this value was already being
+  computed for every atom via `Structure::calculateDQdr()`, called
+  earlier in the same branch -- this session's `GpuQeqSolver` work, so
+  no new cost here either).
+
+`Atom::dEdG` and `NeuralNetwork::getNumNeuronsInLayer(0)` both already
+account for the extra charge neuron (`Atom.cpp`'s
+`dEdG.resize(numSymmetryFunctions + 1, ...)` when `useChargeNeuron` is
+set), so nothing downstream needed touching.
+
+**Correctness**, validated two ways:
+1. `gpu/gemm/libnnpgpu_dfdc_test.cu` already fuzzes `gpuNnForceDFdcSum()`
+   across architectures with random `numIn`/weights/inputs against the
+   real CPU `calculateDFdc()` -- since the function is unchanged, this
+   coverage carries over directly to the 4G case (a 4G net is just
+   "one more `numIn`" to that test).
+2. A temporary, env-var-gated live cross-check (`N2P2_DFDC_XCHECK`,
+   the same pattern used for `GpuQeqSolver` above) ran the real CPU
+   `calculateDFdc()` alongside the new GPU dispatch for every single
+   force-update candidate of a full 2-epoch stage-2 run on real 4G
+   data, diffing the two Jacobian sums. Every single call, across the
+   whole run: max absolute error ~1E-14 to 1E-19, max relative error
+   ~1E-11 to 1E-14 (the rare higher relative-error samples all traced
+   to a near-zero true value in the denominator, not a real
+   discrepancy) -- machine-precision agreement throughout. Reverted
+   after validating, per this file's established practice.
+
+**Performance**, full `temp/H2O_4G` dataset (1254 structures), 1
+epoch, 32 ranks / 4 GPUs, single shared MPS daemon (the corrected
+setup from the section above):
+
+| | Before this port | After this port |
+|---|---|---|
+| Stage 2 epoch time | `2643s` (44.1 min) | `2455s` (40.9 min) |
+| `F_err` (the force error/Jacobian phase) | `2554s` | `2355s` |
+| Stage 1 epoch time (unaffected, sanity check) | `14.15s` | `14.37s` (within noise) |
+
+A real **~7.1%** stage-2 speedup, **~7.8%** on `F_err` specifically --
+correct, and in the right direction, but far short of the ~30%
+`F_err` share the earlier CPU-time profiling attributed to this exact
+code path. The likely reason, consistent with a lesson already learned
+elsewhere in this file (`GpuForces.cu`'s documented first-pass
+regression from many small GPU calls under MPS contention): this
+dispatch is called once per (atom, coordinate) force-update candidate,
+not batched across candidates, so each of the many calls per epoch
+pays its own H2D/D2H transfer and kernel-launch overhead on a
+comparatively small amount of work (`numAtoms` ~210-420,
+`numIn` ~36-43) -- multiplied by 32 concurrent MPI ranks all sharing
+the same 4 GPUs under MPS. The CPU-time share this replaced was real,
+but a large fraction of the saved CPU time was spent instead on
+transfer/launch overhead rather than idle GPU compute.
+
+**Net assessment:** correct, shipped, and a genuine (if modest)
+stage-2 win -- worth keeping. `F_err` is still stage 2's dominant cost
+and 4x-A100 stage 2 is still slower than 64-core or 112-core CPU at
+this problem size (`2455s` vs `1859s`/`1121s`); closing that gap
+further would mean batching this dispatch across multiple force-update
+candidates per call (amortizing the transfer/launch overhead across
+more work per call, the same insight that motivated
+`GpuQeqSolver`'s multi-RHS batching earlier in this file) rather than
+further per-call kernel tuning.

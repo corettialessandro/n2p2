@@ -2735,15 +2735,24 @@ void Training::update(string const& property)
                 // the two Jacobian call sites -- calculateDFdc() loops over
                 // every input and touches every connection each time (see
                 // GpuNeuralNetwork.h's gpuNnForceDFdcSum() doc comment and
-                // gpu/gemm/nn_dfdc_gemm_test.cu's derivation). Only
-                // HDNNP_2G is handled (same scope restriction as the
-                // "energy" branch above); HDNNP_4G's extra charge input
-                // neuron/dQdxia handling and N2P2_FULL_SFD_MEMORY's
-                // per-atom dGdxia storage are both out of scope here. Falls
+                // gpu/gemm/nn_dfdc_gemm_test.cu's derivation).
+                // HDNNP_4G follow-up: gpuNnForceDFdcSum() is already fully
+                // generic in numIn -- it never assumes an input is a
+                // symmetry function rather than 4G's extra charge input
+                // neuron, and hasGpuCompatibleArchitecture() never checks
+                // numIn either (only layer count/activations/output size),
+                // so no new device code was needed here, only feeding it
+                // 4G's extra column: G's last column set to each atom's
+                // charge (matching the CPU loop's
+                // nn.setInput(it->G.size(), it->charge)) and dGdxyz's last
+                // column set to dQdxia (matching the CPU loop's
+                // dGdxia.back() = dQdxia below). N2P2_FULL_SFD_MEMORY's
+                // per-atom dGdxia storage is still out of scope here. Falls
                 // back to the exact CPU loop below if any element's
                 // network doesn't match src/libnnpgpu's fixed architecture.
 #ifndef N2P2_FULL_SFD_MEMORY
-                if (nnpType == NNPType::HDNNP_2G)
+                if (nnpType == NNPType::HDNNP_2G ||
+                    nnpType == NNPType::HDNNP_4G)
                 {
                     bool allElementsGpuCompatible = true;
                     for (size_t e = 0; e < numElements; ++e)
@@ -2773,6 +2782,12 @@ void Training::update(string const& property)
                         for (size_t ia = 0; ia < s.atoms.size(); ++ia)
                         {
                             collectDGdxia(s.atoms.at(ia), sC->a, sC->c);
+                            if (nnpType == NNPType::HDNNP_4G)
+                            {
+                                double dQdxia =
+                                    s.atoms.at(sC->a).dQdr.at(ia)[sC->c];
+                                dGdxia.back() = dQdxia;
+                            }
                             dGdxyzByAtom.at(ia) = dGdxia;
                         }
 
@@ -2800,6 +2815,11 @@ void Training::update(string const& property)
                                     s.atoms.at(atomIndices.at(t));
                                 copy(a.G.begin(), a.G.end(),
                                      G.begin() + (size_t)t * numIn);
+                                if (nnpType == NNPType::HDNNP_4G)
+                                {
+                                    G.at((size_t)t * numIn + a.G.size()) =
+                                        a.charge;
+                                }
                                 vector<double> const& d =
                                     dGdxyzByAtom.at(atomIndices.at(t));
                                 copy(d.begin(), d.end(),
