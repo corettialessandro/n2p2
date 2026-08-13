@@ -3102,3 +3102,74 @@ new, in `Training.h`/`.cpp`) plus the one call-site swap in
 `Training::update()`'s `"force"` branch. No GPU code at all -- same
 category as the stage-1 Jacobian-assembly reassociation fix earlier in
 this file: a real algorithmic fix that happened to need no CUDA.
+
+### Follow-up: stage 1 double-checked -- found a real unaccelerated loop, but it's not the dominant cost; the two already-GPU-ported pieces still are
+
+Stage 2 is now clearly faster than CPU-112 (`7.53x`), but stage 1
+remains the other way around (`14.13s` GPU vs. `9.44s` CPU-112,
+`~1.5x` *slower*) -- asked to double-check the code for stage 1 the
+same way, rather than accept that as a given.
+
+**Code review found one real, genuine gap**: `Training::update()`'s
+`"charge"` branch, PART 2 (`Training.cpp`, the loop building `dChidc`)
+computes every atom's `chi` forward pass *and* its full weight-Jacobian
+(`NeuralNetwork::calculateDEdc()`) one atom at a time through the plain
+CPU `propagate()`/`calculateDEdc()` path -- never touches the GPU.
+Structurally identical to `calculateDFdc`'s pattern (forward +
+weight-Jacobian per atom), which this file already GPU-ported for
+forces. Unlike that fix, though, this one can't reuse the existing
+production dispatch as-is: `gpuNnEnergyDEdcSum()` only returns the
+atom-*summed* result (fine for energy training, which only ever needs
+the sum), but stage 1's charge Jacobian needs each atom's `dChidc`
+*individually* -- each gets scaled by a per-atom weight `Sk` that isn't
+known until *after* this loop runs (it depends on the charge-
+equilibration solve, which itself depends on this loop's `chi`
+output). The underlying batched math for a genuine per-atom
+(non-summed) version already exists and was validated standalone
+(`gpu/gemm/nn_dedc_gemm_test.cu`) -- it was just never wired into
+`GpuNeuralNetwork.h/.cu` as a callable dispatch, because until now
+nothing needed per-atom results. Real opportunity, but a different
+risk/effort class than today's earlier fixes: needs genuinely new
+device code (a per-atom dEdc variant), not just widening an existing
+dispatch's condition -- though with much lower correctness risk than
+e.g. `dAdrQ` caching, since it's a pure batched computation, not
+stateful caching.
+
+**Measured its actual current size before deciding whether it's worth
+that effort** (fresh `Stopwatch` brackets, full 1254-structure
+dataset, 3 epochs) -- and the result reframes the priority:
+
+| Bracket | s/epoch | % of epoch | % of `Q_err` | GPU status |
+|---|---|---|---|---|
+| `part1charge` (PART 1 elec-NN forward, `calculateAtomicNeuralNetworks("elec")`) | `3.66s` | `26.5%` | `38.2%` | **already GPU-ported** (this session) |
+| `qeq` (`chargeEquilibration()`) | `3.61s` | `26.2%` | `37.7%` | **already GPU-ported** (`GpuQeqSolver`, prior session) |
+| `fwd` (the loop described above) | `2.00s` | `14.5%` | `20.9%` | **not GPU-ported** |
+| `dq` (`calculateDQdChi`/`calculateDQdJ`) | `0.21s` | `1.5%` | `2.2%` | already GPU-ported |
+| `jac` (Jacobian assembly) | `0.10s` | `0.7%` | `1.0%` | CPU-optimized, already small |
+
+(Sum `9.57s` matches `Q_err`'s measured `9.574s/epoch` almost exactly
+-- fully accounted for, nothing else hiding in stage 1's train phase.)
+
+**The real finding here isn't the unaccelerated loop -- it's that the
+two *already-GPU-ported* pieces (`part1charge` + `qeq`, `76%` of
+`Q_err` combined) are still the two largest costs**, bigger than the
+genuinely-unaccelerated `fwd` loop. This is the same shape of result
+`calculateDFdc`'s original port and `GpuElecForces` both hit earlier in
+this file: a real GPU port that's real but capped, most likely by the
+same cause already documented there (many small per-candidate GPU
+dispatch calls under 32-way MPS contention paying transfer/launch
+overhead disproportionate to the work per call) -- not confirmed by a
+fresh sub-split of `part1charge`/`qeq` themselves yet, so stated as the
+leading hypothesis, not a verified conclusion.
+
+**Not yet investigated further or implemented -- stopping here to
+write this down.** Fair next steps, in rough order of how well-scoped
+they are: (1) split `qeq`/`part1charge` the same way `calculateForces()`
+and `dfdc` were split earlier in this file, to confirm whether MPS
+per-call overhead is really the cause before assuming it; (2) if so,
+the fix would likely mean reducing per-call count/overhead rather than
+porting more code, a different kind of problem than everything fixed
+in this stage-2 pass; (3) the `fwd` loop's per-atom dEdc port remains
+a real, independently-worthwhile `~14.5%`-of-epoch opportunity
+regardless of what (1)/(2) find, using the already-validated
+`nn_dedc_gemm_test.cu` math as a starting point.
