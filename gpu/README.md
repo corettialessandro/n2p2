@@ -2466,3 +2466,69 @@ candidates per call (amortizing the transfer/launch overhead across
 more work per call, the same insight that motivated
 `GpuQeqSolver`'s multi-RHS batching earlier in this file) rather than
 further per-call kernel tuning.
+
+### Follow-up: batching the force-Jacobian dispatch -- built, validated, reverted (a real hyperparameter wall, not a bug)
+
+Picked up the follow-up above. Designed and implemented
+`gpuNnForceDFdcSumBatch()`: rather than just amortizing per-call
+transfer/launch overhead, it exploits that most of
+`gpuNnForceDFdcSum()`'s per-input (`k0`) loop body doesn't actually
+depend on `dGdxyz` at all -- only the final accumulation step per `k0`
+does. Splitting each `k0` iteration into a "producer" half (shared
+weights/forward-pass only, computed ONCE per `k0` for a whole group of
+candidates) and a "consumer" half (the `dGdxyz`-dependent part, still
+once per candidate) cuts the k0-loop's kernel-launch count by roughly
+1.8x as group size grows, on top of amortizing the weight/`G` upload
+and forward pass. `Training.cpp`'s HDNNP_4G force branch was
+restructured to stage each candidate's `dGdxyz` instead of dispatching
+immediately, then flush one batched call per (structure, element)
+group after the whole `batchSize` loop (safe because every candidate
+in one `update()` call shares the same not-yet-updated weights -- PART
+3 applies exactly one weight update per call).
+
+**Correctness**, validated two ways, both clean: (1) a standalone test
+(`gpu/gemm/libnnpgpu_dfdc_batch_test.cu`) comparing the batched
+function against repeated single calls across 7 cases (group sizes
+1-20, growing/shrinking atom counts to exercise the capacity-growth
+logic) came back **bit-identical** (`0.000E+00` in every case -- not
+just close, exactly the same floating-point operations in the same
+order). (2) A live cross-check
+(`N2P2_DFDC_BATCH_XCHECK`) against the real CPU `calculateDFdc()`
+through the actual staged/flushed `Training.cpp` code path, over 7232
+samples of a real stage-2 run, held machine precision throughout.
+
+**The wall:** every single one of those 7232 samples had `nCand=1`.
+`temp/H2O_4G/input.nn` sets `task_batch_size_force 1` -- every
+`Training::update("force")` call processes exactly ONE candidate
+before applying its Kalman-filter weight update. Since weights change
+between every single candidate, there is *structurally* never more
+than one force-training candidate available to batch within a
+dispatch opportunity under this training configuration -- not a bug
+anywhere in this session's code, just what `task_batch_size_force=1`
+means. The `useSubCandidates`/`numGroupedSubCand` machinery this
+follow-up hoped to piggyback on turned out to group which *candidate*
+several consecutive (separately weight-updated) calls draw from the
+same structure, not multiple candidates evaluated under the same
+weights -- an easy mechanism to misread from its name alone.
+
+With `nCand` pinned at 1, the batched path is provably no faster than
+the original per-candidate dispatch (same work, same GPU calls) and
+strictly *more* overhead (duplicate `G`/`atomsByElement` construction
+at both staging and flush time, plus the staging map itself) -- a pure
+regression risk for zero benefit. Reverted in full (`Training.cpp`,
+`GpuNeuralNetwork.cu`/`.h`, and the standalone test) rather than kept
+as unreachable dead code.
+
+The only way to get more than one force-training candidate under the
+same weights would be raising `task_batch_size_force` itself -- a
+training-methodology change (fewer, larger-batch Kalman updates
+instead of many single-candidate ones) that affects convergence
+dynamics, not a performance-only knob, and explicitly out of scope for
+a "speed up the existing GPU port" session. **Net assessment:** the
+diagnosis that motivated this (many small GPU calls, ~30% of `F_err`
+theoretically available) was correct; the fix built for it was correct
+too; the training hyperparameters this dataset actually uses simply
+don't create an opportunity for it to help. Stage 2's remaining time
+is not further addressable by batching this call site without first
+deciding, separately and deliberately, to change how many force
+samples go into each Kalman update.
