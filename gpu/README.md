@@ -2967,3 +2967,48 @@ dataset's stage-1 cost is dominated by the already-GPU-ported
 `chargeEquilibration()`/`GpuQeqSolver` solve, not NN forward passes).
 **GPU is now `5.49x` faster than CPU-112 on stage 2** (`691.2s` vs.
 `125.8s`).
+
+### Follow-up: one more fresh full-scale profile with all three ports together, to confirm the numbers hold and see what's left
+
+Re-ran the same fine-grained `Stopwatch`-bracket profiling one more
+time, this time at the fully-committed state (short-range force loop +
+`"short"` NN + `"elec"` NN, all three ports from this session), on the
+full 1254-structure dataset in a single job -- both to confirm the
+incrementally-measured numbers reproduce together (not just
+individually) and to see the current `F_err` composition in one place.
+
+| | Stage 1 epoch | Stage 2 epoch |
+|---|---|---|
+| CPU, 112 cores (dcgp) | `9.44s` | `691.2s` |
+| GPU, 4xA100, 32 ranks (MPS), all three ports | `14.07s` | `126.5s` |
+
+Matches the incrementally-committed numbers closely (`125.8s` /
+`14.01s` from the last two commits individually) -- **`5.46x` faster
+than CPU-112 on stage 2**, consistent with the `5.49x` reported above
+to within normal run-to-run variance.
+
+`F_err` composition, freshly measured (not inferred from earlier,
+now-stale subset-60 numbers):
+
+| Component | Share of `F_err` | Status |
+|---|---|---|
+| `calculateDFdc` GPU dispatch | 60.3% | GPU-ported, at its `task_batch_size_force=1` ceiling |
+| `calculateForces()` | 28.6% | GPU-ported (both terms), capped by the `dAdrQ` re-upload cost |
+| elec-NN forward + `chargeEquilibration` gate | 6.5% | GPU-ported |
+| `calculateDQdr` | 2.9% | GPU-ported, negligible |
+| `"short"` NN forward (PART 1 candidate scoring) | 1.8% | GPU-ported |
+
+`calculateDFdc` and `calculateForces()` together are now `~89%` of
+`F_err`, and **both are already at documented ceilings** -- `dfdc`'s
+batching wall (`task_batch_size_force=1`, a training-methodology
+change, out of scope) and `calculateForces()`'s `dAdrQ` re-upload cost
+(the caching fix for this was attempted, caught a real correctness bug
+via cross-checking, and was deliberately reverted rather than shipped
+uncertain -- still true, still unfixed). Everything else this session
+found and ported is now under `7%` combined. Further stage-2 GPU work
+from here would mean revisiting one of those two known walls
+specifically (a `Structure`-level generation-counter for `dAdrQ`
+staleness, or a deliberate, separately-scoped decision to raise
+`task_batch_size_force`) rather than another "found an unported
+function" pass -- this session's low-risk, high-value gaps of that
+kind appear to be exhausted.
