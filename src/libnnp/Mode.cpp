@@ -2009,6 +2009,14 @@ void Mode::calculateForces(Structure& structure) const
         return;
     }
 
+    // Set by the HDNNP_2G/HDNNP_4G GPU dispatch below when it handles the
+    // short-range self+pair term, so the CPU fallback loop further down
+    // can skip it -- HDNNP_4G falls through instead of returning early
+    // (unlike HDNNP_2G) since it still needs the electrostatics block
+    // after this. Stays false (and the flag check below becomes dead
+    // code) in builds without N2P2_GPU.
+    bool shortRangeDoneOnGpu = false;
+
 #ifdef N2P2_GPU
 #ifndef N2P2_FULL_SFD_MEMORY
     // gpu/README.md's "F_err is ~84% calculateForces(), not GPU dispatch"
@@ -2017,11 +2025,24 @@ void Mode::calculateForces(Structure& structure) const
     // the dominant real cost, so it gets its own GPU port
     // (GpuForces.h/.cu), independent of and orthogonal to the three
     // NN-architecture-dependent dispatch functions in GpuNeuralNetwork.h.
-    // HDNNP_4G is out of scope (its extra electrostatics force
-    // contributions below are untouched either way); N2P2_FULL_SFD_MEMORY
-    // stores dGdxia per-atom rather than in the shared #dGdxia scratch
-    // member this port's CPU-side data extraction assumes, also out of
-    // scope (and off by default, see src/makefile.gnu).
+    // N2P2_FULL_SFD_MEMORY stores dGdxia per-atom rather than in the
+    // shared #dGdxia scratch member this port's CPU-side data extraction
+    // assumes, out of scope (and off by default, see src/makefile.gnu).
+    //
+    // HDNNP_4G follow-up (gpu/README.md, "found the next lever"): this
+    // short-range self+pair loop is shared, unmodified code -- HDNNP_4G's
+    // "short" NN uses the exact same per-atom dEdG/dGdr/neighbor-list
+    // representation as HDNNP_2G (its extra charge-neuron input only
+    // widens dEdG by one trailing element, which
+    // calculateSelfForceShort()/calculatePairForceShort() never read --
+    // both loop strictly over [0, numSymmetryFunctions), confirmed by
+    // reading Atom.cpp directly, not assumed). So this dispatch and the
+    // topology/dEdG-building code below need zero changes for HDNNP_4G,
+    // same "no new device code" pattern as calculateDFdc's HDNNP_4G
+    // widening. What DOES differ: HDNNP_2G has nothing left to do once
+    // this runs (return immediately), but HDNNP_4G must fall through to
+    // the electrostatics block below, which adds onto these forces
+    // rather than replacing them -- see shortRangeDoneOnGpu below.
     //
     // A first, stateless pass (rebuild AND re-upload topology every call)
     // measured WORSE end-to-end (104-110s -> 136.3s) -- the edge list
@@ -2033,7 +2054,7 @@ void Mode::calculateForces(Structure& structure) const
     // ONCE per structure (gpuForcesUploadTopology(), keyed by
     // structure.index) and cached there; only the small dEdG array is
     // rebuilt and re-uploaded every call (gpuForcesCompute()).
-    if (nnpType == NNPType::HDNNP_2G)
+    if (nnpType == NNPType::HDNNP_2G || nnpType == NNPType::HDNNP_4G)
     {
         static set<size_t> gpuForceTopologyUploaded;
         bool const firstCallForThisStructure =
@@ -2129,18 +2150,25 @@ void Mode::calculateForces(Structure& structure) const
             a.f.r[2] = force[3 * i + 2];
         }
 
-        return;
+        shortRangeDoneOnGpu = true;
+        if (nnpType == NNPType::HDNNP_2G) return;
     }
 #endif
 #endif
 
-    // Loop over all atoms, center atom i (ai).
+    // Loop over all atoms, center atom i (ai). Skipped per-atom when the
+    // GPU dispatch above already computed the short-range term
+    // (shortRangeDoneOnGpu) -- HDNNP_4G falls through to here instead of
+    // returning early since it still needs the electrostatics block
+    // below, which adds onto ai.f rather than resetting it.
 #ifdef _OPENMP
     #pragma omp parallel
     {
     #pragma omp for
 #endif
     for (size_t i = 0; i < structure.atoms.size(); ++i) {
+        if (shortRangeDoneOnGpu) continue;
+
         // Set pointer to atom.
         Atom &ai = structure.atoms.at(i);
 

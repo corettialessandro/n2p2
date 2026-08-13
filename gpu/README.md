@@ -2754,3 +2754,78 @@ well-scoped, low-numerical-risk port.
 Not yet implemented -- this section documents the finding and the
 plan, following this file's practice of writing up what was found
 before deciding whether/how to act on it.
+
+### Follow-up: implemented -- HDNNP_4G's short-range force loop now uses GpuForces.cu, ~8.8x stage-2 win, GPU flips from 1.90x slower than CPU-112 to 4.63x faster
+
+Implemented the plan above. `Mode::calculateForces()`'s GPU dispatch
+(`Mode.cpp:2057`) widened from `if (nnpType == NNPType::HDNNP_2G)` to
+`if (nnpType == NNPType::HDNNP_2G || nnpType == NNPType::HDNNP_4G)` --
+zero changes to the topology/dEdG-building code or to `GpuForces.cu`
+itself, exactly as expected (confirmed by directly reading
+`Atom::calculateSelfForceShort()`/`calculatePairForceShort()`: both
+loop strictly over `[0, numSymmetryFunctions)`, so `HDNNP_4G`'s extra
+charge-neuron `dEdG` element -- which the shared force-loop code never
+touches -- doesn't change the topology/`dEdG` array sizing at all).
+
+The one real code change: a new `shortRangeDoneOnGpu` flag replaces
+`HDNNP_2G`'s unconditional early `return` with a conditional one --
+`HDNNP_2G` still returns immediately (nothing left to do), but
+`HDNNP_4G` falls through into the CPU loop's `#pragma omp parallel`
+region with `if (shortRangeDoneOnGpu) continue;` guarding the per-atom
+work (so the loop body never re-runs), reaching the existing
+electrostatics block afterward exactly as before -- that block adds
+onto `ai.f` (`+=`) rather than resetting it, so it composes correctly
+with either the GPU-computed or CPU-computed short-range result
+underneath.
+
+**Verified two ways**, following the "test before touching anything"
+discipline this bug already needed:
+1. **Live cross-check** (`N2P2_SHORTFORCE_XCHECK`, same pattern as
+   every other port in this file): inside the GPU dispatch, saved the
+   GPU result, recomputed the exact CPU reference into the same
+   slots, diffed, then restored the GPU result before continuing (so
+   the check never changes what the real run uses). 60-structure
+   subset, 2 epochs, real training candidates: **5428 evaluations,
+   every one matching to machine precision, max abs diff `3.3E-14`**,
+   zero failures.
+2. **Clean performance run** (no cross-check -- the diagnostic itself
+   redoes the full CPU computation for verification, which would
+   otherwise mask any speedup): full `temp/H2O_4G` dataset (1254
+   structures), 1 epoch, 32 ranks / 4 GPUs (MPS).
+
+**Full-scale result**:
+
+| | Stage 1 epoch | Stage 2 epoch |
+|---|---|---|
+| CPU, 112 cores (dcgp) | `9.44s` | `691.2s` |
+| GPU, 4xA100, 32 ranks (MPS), before this port | `14.15s` | `1311s` |
+| **GPU, 4xA100, 32 ranks (MPS), after this port** | `14.17s` (unchanged, expected) | **`149.3s`** |
+
+**~8.8x** stage-2 speedup from this one port (`1311s -> 149.3s`) --
+close to `GpuForces.cu`'s original `~12x` for the identical
+computation on `HDNNP_2G`, and by far the single biggest win in this
+whole 4G porting effort. Stage 1 is unaffected, exactly as expected
+(it never calls `calculateForces()`).
+
+**This flips the headline CPU-vs-GPU comparison.** The "confirmed at
+full production scale" entry above left GPU `1.90x` slower than
+CPU-112 on stage 2; with this port, **GPU is now `4.63x` faster than
+CPU-112 on stage 2** (`691.2s` vs. `149.3s`), and roughly **`4.3x`
+faster overall** across both stages combined (`700.6s` vs. `163.5s`
+total). Stage 1 remains GPU's one weak point (`14.17s` vs. `9.44s`,
+`~1.5x` slower) -- `GpuQeqSolver`'s territory, not this port's, and a
+much smaller absolute cost than stage 2 either way.
+
+All temporary instrumentation (`N2P2_SHORTFORCE_XCHECK`) reverted
+before commit; the shipped change is the `shortRangeDoneOnGpu`
+restructuring only, no new device code.
+
+**Net assessment for the single-node multi-GPU question this whole
+profiling pass set out to answer**: the deployment shape (4xA100, one
+Booster node, 32 ranks, one shared MPS daemon) was correct all along
+and needed no change. What was missing was completing an already
+well-scoped, already-validated port that had silently stopped halfway
+at the `HDNNP_2G`/`HDNNP_4G` boundary. With this port shipped, GPU is
+now the clearly faster option for 4G stage-2 training at this problem
+size, reversing the conclusion every full-scale comparison in this
+file had shown until now.
