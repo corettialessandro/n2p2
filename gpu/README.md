@@ -3173,3 +3173,65 @@ in this stage-2 pass; (3) the `fwd` loop's per-atom dEdc port remains
 a real, independently-worthwhile `~14.5%`-of-epoch opportunity
 regardless of what (1)/(2) find, using the already-validated
 `nn_dedc_gemm_test.cu` math as a starting point.
+
+### Follow-up: did (1) -- the MPS-contention hypothesis was WRONG for `chargeEquilibration()`, right for the elec-NN forward call, and points at a real, unmeasured lever
+
+Split both already-GPU-ported functions into their CPU-side and
+GPU-dispatch phases directly (temporary `Stopwatch` brackets, full
+1254-structure dataset, 3 epochs), rather than trust the "MPS
+contention" guess from the entry above.
+
+**`chargeEquilibration()` -> `Structure::calculateElectrostaticEnergy()`**
+splits into three phases: the CPU-side dense `(numAtoms+1)x(numAtoms+1)`
+matrix assembly (Ewald real+reciprocal-space summation for this
+periodic dataset, `Structure.cpp:609-807`, never touched by any GPU
+work), the actually-GPU-ported `gpuQeqFactorize`/`gpuQeqSolve` call,
+and the final charge-assignment loop:
+
+| Phase | s/epoch | % of function | GPU status |
+|---|---|---|---|
+| matrix assembly (Ewald sum) | `11.35s` | `95.1%` | **never GPU-ported** |
+| `gpuQeqFactorize`/`gpuQeqSolve` | `0.58s` | `4.9%` | GPU-ported |
+| charge assignment | `~0s` | `0.0%` | n/a, trivial |
+
+**The MPS-contention hypothesis is wrong here.** The piece that's
+actually GPU-ported (the factorize+solve) is cheap -- `19.6x` cheaper
+than the CPU-side matrix assembly it's bundled with. `GpuQeqSolver`
+did exactly what it was built for; the "ceiling" was never there. This
+is the same shape of surprise as `calculateForces()`'s `dAdrQ` flatten
+and `dfdc`'s `collectDGdxia()` earlier in this file: a "GPU-ported"
+function whose *un-ported* CPU setup dominates. Note this split
+measures *every* call to `calculateElectrostaticEnergy()`, including
+the ones from `calculateErrorEpoch()`'s unconditional per-structure
+pass (not just `Training::update()`'s PART 1/2, which only account for
+part of this total) -- `calculateErrorEpoch()`'s own contribution isn't
+separately isolated yet.
+
+**The elec-NN forward call is the opposite story.** Split
+`calculateAtomicNeuralNetworks("elec")`'s GPU branch into the CPU-side
+`G` array construction vs. the `gpuNnForwardDEdG` dispatch call itself:
+
+| Phase | s/epoch | % of function |
+|---|---|---|
+| CPU `G` array build | `0.011s` | `2.4%` |
+| `gpuNnForwardDEdG` dispatch | `0.468s` | `97.6%` |
+
+Here the GPU call genuinely dominates its own function (`41.3x` over
+the CPU build) -- consistent with the per-call transfer/launch
+overhead under 32-way MPS contention already documented for
+`calculateDFdc`/`GpuElecForces` elsewhere in this file. But this
+function's total (`~0.48s/epoch`) is small next to `chargeEquilibration`'s
+matrix assembly (`11.35s/epoch`) -- it was never the main story.
+
+**Bottom line**: the real, still-unaddressed lever in stage 1 is
+`Structure::calculateElectrostaticEnergy()`'s CPU-only Ewald matrix
+assembly -- an O(numAtoms^2 x k-vectors) real+reciprocal-space sum,
+never GPU-accelerated, currently ~`11.35s` of every training epoch on
+this rank (dwarfing everything else measured in this stage-1
+investigation, including the `fwd`-loop gap found earlier). Porting it
+would need genuinely new device code (a dense-matrix-assembly kernel,
+not a dispatch widening) -- same effort/risk class as the `fwd`-loop
+`calculateDEdc` port, but larger in magnitude. Not yet scoped or
+started; `calculateErrorEpoch()`'s separate contribution to this same
+cost is also not yet isolated. Both are natural next steps if this
+gets picked up.
