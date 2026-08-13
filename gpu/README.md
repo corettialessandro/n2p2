@@ -3012,3 +3012,93 @@ staleness, or a deliberate, separately-scoped decision to raise
 `task_batch_size_force`) rather than another "found an unported
 function" pass -- this session's low-risk, high-value gaps of that
 kind appear to be exhausted.
+
+### Follow-up: the "ceilings" were both bundling something real underneath -- collectDGdxia()'s O(numAtoms x numNeighbors) CPU scan, ~27% more stage-2 win, no batching wall involved
+
+Asked to double-check the two "ceilings" above rather than accept them
+at face value. Good call -- both turned out to bundle a genuinely
+unrelated, addressable cost together with the piece that actually was
+capped. A direct split (temporary `Stopwatch` brackets around `dfdc`'s
+two halves, and around `calculateForces()`'s short-range/electrostatics
+sub-phases) found:
+
+- Within `dfdc` (`59.4%` of `F_err`): `collectDGdxia()` -- called once
+  per atom, each atom linearly scanning its own full neighbor list for
+  one fixed target atom -- was **`34.0%` of `F_err` on its own, bigger
+  than the GPU kernel dispatch it feeds (`25.3%`)**. This has nothing
+  to do with `task_batch_size_force`; it never touches the GPU.
+- Within `calculateForces()` (`29.9%` of `F_err`): the CPU-side
+  `dAdrQ` flatten (rebuilding the flat array from `Atom::dAdrQ` every
+  call) was `11.0%` on its own, comparable to the `14.2%` GPU
+  re-upload cost the "ceiling" framing had named as the whole story.
+
+`collectDGdxia()`'s pattern -- each atom scanning its own neighbor list
+for one fixed target -- is the exact same shape `GpuForces.cu`/
+`GpuElecForces.cu` already fixed elsewhere via a precomputed
+owner-centric edge list instead of a live per-call scan. Built a CPU-side
+(no new device code) equivalent: `Training::collectDGdxiaAllAtoms()`
+precomputes, once per structure and cached thereafter (purely
+geometric -- doesn't depend on weights or which atom is being
+perturbed), a *target-grouped* reverse index (CSR: `dGdxiaTopologyCache`,
+keyed by `Structure::index`). A single call for a given perturbed atom
+then only visits the edges that actually touch it -- O(edges touching
+that atom), not O(numAtoms x numNeighbors) -- and fills every atom's
+`dGdxia` array in one pass instead of `numAtoms` separate calls.
+
+**Verified live** (`N2P2_DGDXIA_XCHECK`): unlike every GPU port in this
+file, this rewrite does the *exact same arithmetic in the exact same
+order* as the original (each owner atom's accumulation is independent
+of every other, so cross-owner reordering can't matter, and the
+target-grouped edges for one atom preserve the original's
+owner-then-neighbor-then-symmetry-function visitation order) -- so
+the correctness bar here is **bit-identical**, not float-noise
+agreement. Confirmed three times across implementation iterations, on
+real training data (60-structure subset, 2 epochs, both stages):
+**5248 evaluations, `maxAbsDiff=0.000E+00`, zero differing elements,
+every single time.**
+
+**A real memory cost, found and fixed, not hidden.** The first working
+version stored each edge as `(ownerAtom, ownerTableIndex, dGdr)` --
+40 bytes, built via a temporary `vector<vector<DGdxiaEdge>>` bucketed
+by target. Measured on the full 1254-structure/32-rank dataset:
+cgroup peak RSS **197GB -> 324GB (+127GB)**, uncomfortably close to
+the 400GB node budget. First fix attempt (two-pass exact-size CSR
+build, no temporary per-target vectors, `uint32_t` fields instead of
+`size_t`: 32 bytes/edge) only brought it to **309GB** -- the
+hypothesis that construction overhead was the dominant cost was
+*wrong*; the temporary vectors were already being freed correctly, and
+the real driver was simply the size of the cached data itself (each
+630-atom structure's edge list is genuinely large, confirmed by this
+measurement, not assumed). Second fix: store a *reference* into data
+already resident in `Atom`/`Structure` (`ownerAtom`, `neighborSlotIndex`,
+`dGdrIndex` -- 12 bytes, confirmed via a standalone `sizeof()` check)
+instead of a copy of `dGdr`/the table index, re-deriving both from
+already-resident storage (`Element::getSymmetryFunctionTable()`, an
+inline getter with no computation) at read time. This brought peak RSS
+to **272GB** -- smaller than the naive 2.67x-from-struct-size
+prediction would suggest (some other overhead remains, not fully
+explained), but a real, comfortable reduction from the original
+`324GB`, and confirmed bit-identical all over again after the rewrite.
+
+**Full-scale result** (clean run, no cross-check overhead):
+
+| | Stage 1 epoch | Stage 2 epoch | Peak RSS (cgroup, whole job) |
+|---|---|---|---|
+| GPU, before this fix | `14.15s` | `126.5s` | not separately measured |
+| **GPU, after this fix** | `14.13s` (unchanged, expected) | **`91.81s`** | `272GB` |
+
+**~27.4%** further stage-2 speedup (`126.5s -> 91.81s`), on top of
+everything else this session already shipped. Stage 1 is unaffected,
+exactly as expected (`collectDGdxiaAllAtoms()` is only reached from the
+`"force"` branch's PART 2 Jacobian assembly, which stage 1 never runs).
+**GPU is now `7.53x` faster than CPU-112 on stage 2** (`691.2s` vs.
+`91.81s`), up from `5.46x` before this fix -- and up from `1.90x`
+*slower* at the very start of this whole profiling pass.
+
+All temporary instrumentation (`Stopwatch` brackets, `MODE_PROF_CEILING`,
+`N2P2_DGDXIA_XCHECK`) reverted before commit; the shipped change is
+`collectDGdxiaAllAtoms()`, `DGdxiaEdge`, and `dGdxiaTopologyCache` (all
+new, in `Training.h`/`.cpp`) plus the one call-site swap in
+`Training::update()`'s `"force"` branch. No GPU code at all -- same
+category as the stage-1 Jacobian-assembly reassociation fix earlier in
+this file: a real algorithmic fix that happened to need no CUDA.

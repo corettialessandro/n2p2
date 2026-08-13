@@ -22,6 +22,7 @@
 #include "Stopwatch.h"
 #include "Updater.h"
 #include <cstddef> // std::size_t
+#include <cstdint> // std::uint32_t
 #include <fstream> // std::ofstream
 #include <map>     // std::map
 #include <random>  // std::mt19937_64
@@ -563,6 +564,33 @@ private:
     /// Derivative of symmetry functions with respect to one specific atom
     /// coordinate.
     std::vector<double>      dGdxia;
+    /// One entry of collectDGdxiaAllAtoms()'s target-grouped (CSR)
+    /// reverse neighbor index -- see that function's doc comment. A
+    /// *reference* into data already resident in Structure/Atom
+    /// (owner's neighbor slot + which of that neighbor's dGdr entries),
+    /// not a copy of dGdr/the table index -- an earlier version stored
+    /// those directly (32 bytes/edge) and measured +112GB cgroup RSS
+    /// on the full dataset (real cost, not theoretical: the edge count
+    /// itself is large, ~90MB cached per 630-atom structure, so a
+    /// per-edge Vec3D copy adds up fast). This form is 12 bytes/edge;
+    /// the owner's own symmetry-function table index and dGdr value are
+    /// re-derived from already-resident storage at read time instead.
+    struct DGdxiaEdge
+    {
+        std::uint32_t ownerAtom;
+        std::uint32_t neighborSlotIndex;
+        std::uint16_t dGdrIndex;
+    };
+    /// Purely geometric, per-structure cache of collectDGdxia()'s
+    /// reverse (target-grouped) neighbor index, keyed by
+    /// Structure::index. Built once and reused for the whole
+    /// structure's lifetime -- same rationale as GpuForces.h's
+    /// topology cache: atom positions/neighbor lists are fixed once a
+    /// structure is loaded. Value is (CSR offsets sized numAtoms + 1,
+    /// flat edge array).
+    std::map<std::size_t,
+             std::pair<std::vector<std::size_t>,
+                       std::vector<DGdxiaEdge>>> dGdxiaTopologyCache;
 #endif
     /// Neural network weights and biases for each element. If nnpType 4G also
     ///  h = sqrt(J) included.
@@ -659,6 +687,38 @@ private:
     void collectDGdxia(Atom const& atom,
                        std::size_t indexAtom,
                        std::size_t indexComponent);
+    /** Batched equivalent of calling collectDGdxia() once per atom of a
+     * structure with the same indexAtom/indexComponent -- exactly the
+     * pattern Training::update()'s "force" branch needs to build
+     * dGdxyzByAtom for the GPU calculateDFdc dispatch.
+     *
+     * collectDGdxia() has each atom linearly scan its OWN full neighbor
+     * list looking for one fixed target (indexAtom) -- an
+     * O(numAtoms x numNeighbors) cost per call that profiling found is
+     * the single largest piece of stage-2 "force" F_err once
+     * calculateForces() and the NN forward passes were GPU-ported (see
+     * gpu/README.md). Fix: precompute, once per structure and cached
+     * thereafter via #dGdxiaTopologyCache (purely geometric -- doesn't
+     * depend on weights or indexAtom), a reverse index grouped by
+     * TARGET atom instead of by owner -- then a single call for a given
+     * indexAtom only visits the edges that actually touch it
+     * (O(edges touching indexAtom), not O(numAtoms x numNeighbors)).
+     *
+     * @param[in]  s Structure to compute for.
+     * @param[in]  indexAtom The index of the perturbed atom (same
+     *             meaning as collectDGdxia()'s indexAtom).
+     * @param[in]  indexComponent The coordinate component (same meaning
+     *             as collectDGdxia()'s indexComponent).
+     * @param[out] dGdxyzByAtom Filled with one entry per atom of s, each
+     *             sized/laid out exactly like collectDGdxia() leaves
+     *             #dGdxia for that atom (resized and overwritten,
+     *             any pre-existing content is discarded).
+     */
+    void collectDGdxiaAllAtoms(Structure const& s,
+                               std::size_t indexAtom,
+                               std::size_t indexComponent,
+                               std::vector<std::vector<double>>&
+                                   dGdxyzByAtom);
 #endif
     /** Randomly initialize specificy neural network weights.
      *

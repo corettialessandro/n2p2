@@ -2774,21 +2774,26 @@ void Training::update(string const& property)
                                 .push_back(ia);
                         }
 
-                        // collectDGdxia() writes into the shared #dGdxia
-                        // scratch member (overwritten every call), so every
-                        // atom's result must be copied out before any of
-                        // them can be batched together.
-                        vector<vector<double>> dGdxyzByAtom(s.atoms.size());
-                        for (size_t ia = 0; ia < s.atoms.size(); ++ia)
+                        // Profiling (gpu/README.md) found calling
+                        // collectDGdxia() once per atom -- each atom
+                        // linearly scanning its own full neighbor list
+                        // for the single fixed target sC->a -- is now
+                        // the single largest piece of stage-2 F_err,
+                        // bigger than the GPU dispatch below it feeds.
+                        // collectDGdxiaAllAtoms() replaces the whole
+                        // loop with one call using a cached, target-
+                        // grouped reverse index (O(edges touching
+                        // sC->a) instead of O(numAtoms x numNeighbors)).
+                        vector<vector<double>> dGdxyzByAtom;
+                        collectDGdxiaAllAtoms(s, sC->a, sC->c, dGdxyzByAtom);
+                        if (nnpType == NNPType::HDNNP_4G)
                         {
-                            collectDGdxia(s.atoms.at(ia), sC->a, sC->c);
-                            if (nnpType == NNPType::HDNNP_4G)
+                            for (size_t ia = 0; ia < s.atoms.size(); ++ia)
                             {
                                 double dQdxia =
                                     s.atoms.at(sC->a).dQdr.at(ia)[sC->c];
-                                dGdxia.back() = dQdxia;
+                                dGdxyzByAtom.at(ia).back() = dQdxia;
                             }
-                            dGdxyzByAtom.at(ia) = dGdxia;
                         }
 
                         for (size_t e = 0; e < numElements; ++e)
@@ -3901,6 +3906,106 @@ void Training::collectDGdxia(Atom const& atom,
         {
             dGdxia[i] += atom.dGdr[i][indexComponent];
         }
+    }
+
+    return;
+}
+
+void Training::collectDGdxiaAllAtoms(Structure const&                  s,
+                                     size_t                             indexAtom,
+                                     size_t                             indexComponent,
+                                     vector<vector<double>>&            dGdxyzByAtom)
+{
+    size_t const numAtoms = s.atoms.size();
+
+    // Build (once per structure, cached in #dGdxiaTopologyCache) the
+    // target-grouped reverse index: for each atom playing the "owner"
+    // role (the exact traversal collectDGdxia() does per call), record
+    // every neighbor entry as an edge keyed by TARGET (neighbor.index)
+    // instead of by owner. Purely geometric -- doesn't depend on
+    // indexAtom/indexComponent/weights -- so this only actually runs
+    // the first time a given structure is seen.
+    auto cacheIt = dGdxiaTopologyCache.find(s.index);
+    if (cacheIt == dGdxiaTopologyCache.end())
+    {
+        // Two-pass CSR build (count, then fill directly into one
+        // exact-size allocation, no intermediate per-target vectors).
+        // Only records WHERE each edge's data lives (owner atom +
+        // neighbor slot + dGdr index) -- not the table index or dGdr
+        // value themselves, both re-derived from already-resident
+        // Atom/Element storage at read time below. See DGdxiaEdge's
+        // doc comment in Training.h for why (a version storing them
+        // directly measured +112GB cgroup peak RSS on the full
+        // dataset).
+        vector<size_t> offset(numAtoms + 1, 0);
+        for (size_t j = 0; j < numAtoms; ++j)
+        {
+            Atom const& aj = s.atoms.at(j);
+            for (size_t i = 0; i < aj.numNeighbors; ++i)
+            {
+                offset.at(aj.neighbors[i].index + 1) +=
+                    aj.neighbors[i].dGdr.size();
+            }
+        }
+        for (size_t t = 0; t < numAtoms; ++t)
+        {
+            offset.at(t + 1) += offset.at(t);
+        }
+
+        vector<DGdxiaEdge> edges(offset.back());
+        vector<size_t> writePos(offset.begin(), offset.end() - 1);
+        for (size_t j = 0; j < numAtoms; ++j)
+        {
+            Atom const& aj = s.atoms.at(j);
+            for (size_t i = 0; i < aj.numNeighbors; ++i)
+            {
+                Atom::Neighbor const& n = aj.neighbors[i];
+                for (size_t m = 0; m < n.dGdr.size(); ++m)
+                {
+                    size_t& pos = writePos.at(n.index);
+                    edges.at(pos) = DGdxiaEdge{(uint32_t)j, (uint32_t)i,
+                        (uint16_t)m};
+                    ++pos;
+                }
+            }
+        }
+
+        cacheIt = dGdxiaTopologyCache.emplace(
+            s.index, make_pair(std::move(offset), std::move(edges))).first;
+    }
+
+    vector<size_t> const& offset = cacheIt->second.first;
+    vector<DGdxiaEdge> const& edges = cacheIt->second.second;
+
+    dGdxyzByAtom.resize(numAtoms);
+    for (size_t ia = 0; ia < numAtoms; ++ia)
+    {
+        size_t const nsf = s.atoms.at(ia).numSymmetryFunctions;
+        vector<double>& d = dGdxyzByAtom.at(ia);
+        d.clear();
+        if (nnpType == NNPType::HDNNP_4G) d.resize(nsf + 1, 0.0);
+        else d.resize(nsf, 0.0);
+    }
+
+    for (size_t e = offset.at(indexAtom); e < offset.at(indexAtom + 1); ++e)
+    {
+        DGdxiaEdge const& edge = edges.at(e);
+        Atom const& aj = s.atoms.at(edge.ownerAtom);
+        Atom::Neighbor const& n = aj.neighbors.at(edge.neighborSlotIndex);
+        vector<vector<size_t> > const& tableFull
+            = elements.at(aj.element).getSymmetryFunctionTable();
+        size_t const tableIndex = tableFull.at(n.element).at(edge.dGdrIndex);
+        dGdxyzByAtom.at(edge.ownerAtom).at(tableIndex) +=
+            n.dGdr.at(edge.dGdrIndex)[indexComponent];
+    }
+
+    // Self term: matches collectDGdxia()'s "if (atom.index == indexAtom)"
+    // branch, which only ever fires for the single atom == indexAtom.
+    Atom const& aSelf = s.atoms.at(indexAtom);
+    size_t const nsfSelf = aSelf.numSymmetryFunctions;
+    for (size_t k = 0; k < nsfSelf; ++k)
+    {
+        dGdxyzByAtom.at(indexAtom).at(k) += aSelf.dGdr.at(k)[indexComponent];
     }
 
     return;
