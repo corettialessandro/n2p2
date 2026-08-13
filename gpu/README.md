@@ -2659,3 +2659,98 @@ of the pre-fix **`2.36x`**. GPU is still behind CPU-112 on both stages
 alone doesn't flip the headline conclusion, but it's the single biggest
 step towards closing that gap found in this whole port -- and the only
 one so far that required no GPU code at all.
+
+### Follow-up: found the next lever -- HDNNP_4G's short-range force loop was never GPU-ported, and it now dwarfs the electrostatics block by ~55-60x
+
+With `calculateForces()`'s redundant call gone, re-checked what's left
+inside a single call. Earlier profiling in this file attributed
+`calculateForces()`'s cost mostly to the electrostatics `dChidr`/`dAdrQ`
+loop -- the piece `GpuElecForces` ported -- since that was the obvious
+`HDNNP_4G`-specific addition on top of the (already GPU-ported for
+`HDNNP_2G`) short-range term. That assumption was never directly
+checked with its own bracket. It was wrong.
+
+`Mode::calculateForces()` has two top-level phases for `HDNNP_4G`: the
+short-range self+pair loop (`Mode.cpp:2138-2192`, shared, unmodified
+code also used by `HDNNP_2G` -- the exact computation `GpuForces.cu`
+already ported for a documented `~12x` win, see this file's `force/`
+section) followed by the `HDNNP_4G`-only electrostatics block
+(`GpuElecForces`-ported). A direct temporary `Stopwatch` split of
+these two phases (60-structure subset, 1 epoch, GPU build) found:
+
+| Phase | Cumulative time (1 epoch, per rank) |
+|---|---|
+| Short-range self+pair loop (**not** GPU-ported for `HDNNP_4G`) | `~55-60s` |
+| Electrostatics block (`GpuElecForces`-ported) | `~0.8-1.1s` |
+
+**The un-ported short-range loop is ~55-60x more expensive than the
+entire already-GPU-ported electrostatics block.** `Mode.cpp`'s
+`GpuForces.h` dispatch is gated `if (nnpType == NNPType::HDNNP_2G)`
+only, with a comment on the `HDNNP_4G` electrostatics port above it
+noting "`HDNNP_4G` is out of scope" -- true for the electrostatics
+addition that comment was actually about, but it silently left the
+*shared* short-range term unported for `HDNNP_4G` too, since `HDNNP_4G`
+never takes the `HDNNP_2G`-gated early-return path at all and falls
+straight through to the plain CPU loop instead. This single loop is
+now, by a wide margin, `calculateForces()`'s dominant cost -- and by
+extension one of stage 2's dominant costs, given `calculateForces()`
+is `F_err`'s dominant phase.
+
+**Why this looks like a low-risk, high-value port, not a new one:**
+`HDNNP_4G`'s short-range term uses the exact same
+`calculateAtomicNeuralNetworks(s, derivatives, "short")` forward pass
+and the same `Atom::dEdG`/`dGdr`/neighbor-list structures `HDNNP_2G`
+already uses -- `GpuForces.h/.cu` was written against that shared
+representation, not anything `HDNNP_2G`-specific in the math itself
+(`NeuralNetwork::hasGpuCompatibleArchitecture()`, the same
+architecture gate `calculateDFdc`'s widening relied on, doesn't check
+`nnpType` either). The module is already built, already validated
+(`gpu/gemm/libnnpgpu_forces_test.cu`, real data), and already proved
+worth `~12x` on this identical computation for `HDNNP_2G`.
+
+**What the port actually needs**, unlike `calculateDFdc`'s widening,
+isn't a one-line dispatch-condition change: `HDNNP_2G`'s current path
+(`Mode.cpp:2037`) `return`s immediately after `gpuForcesCompute()`
+sets `ai.f`, but `HDNNP_4G` must *continue* into the electrostatics
+block afterward (which adds onto the same `ai.f` via `+=`, not
+overwrites it) rather than returning. So this needs restructuring the
+early-return into a fall-through -- run `gpuForcesCompute()` for both
+`HDNNP_2G` and `HDNNP_4G` when the architecture check passes, populate
+`ai.f` (and, for `HDNNP_2G`, `return` as today; for `HDNNP_4G`, don't),
+then let the existing `HDNNP_4G` electrostatics block run on top as it
+already does today for CPU-computed short-range forces. Moderate,
+well-understood scope -- not a new algorithm, no new numerical-safety
+question (pure reduction/scatter, same class as `GpuElecForces`, not a
+factorization like `GpuQeqSolver`) -- but real engineering, not a
+one-liner, and needs its own real-data validation pass before shipping
+(same discipline as every port in this file).
+
+**Expected impact, not yet realized**: if this port gets anywhere near
+`GpuForces.cu`'s existing `~12x` for the identical `HDNNP_2G`
+computation, `calculateForces()`'s cost would drop from
+`~56-61s`/epoch to roughly `~5-6s`/epoch at this problem size (the
+already-cheap electrostatics block barely moves the total either way)
+-- and since `calculateForces()` is `F_err`'s dominant phase and `F_err`
+is stage 2's dominant phase, this is very plausibly enough to flip the
+CPU-112-vs-GPU comparison the "confirmed at full production scale"
+entry above left at `1.90x` (GPU slower) into GPU actually winning.
+This is the single biggest lever identified in this whole file that
+hasn't been pulled yet.
+
+**On the single-node multi-GPU question this profiling pass set out to
+answer**: the deployment shape already in use (4xA100 on one Booster
+node, 32 MPI ranks, one shared unrestricted MPS control daemon) is not
+the bottleneck and doesn't need to change -- every scaling experiment
+in this file (single-daemon vs. per-GPU-daemon MPS, rank-per-GPU
+counts, DCGP core-count scaling) already confirmed that topology is
+sound. What was actually missing was completeness of the port itself:
+a large fraction of stage 2's real compute was still silently running
+on the CPU inside a function whose other half looked, from the
+outside, like it had already been GPU-accelerated. The right "multi-GPU
+strategy" here is not more GPUs, a different batching topology, or a
+new kernel-launch pattern -- it's finishing this specific, already
+well-scoped, low-numerical-risk port.
+
+Not yet implemented -- this section documents the finding and the
+plan, following this file's practice of writing up what was found
+before deciding whether/how to act on it.
