@@ -3235,3 +3235,38 @@ not a dispatch widening) -- same effort/risk class as the `fwd`-loop
 started; `calculateErrorEpoch()`'s separate contribution to this same
 cost is also not yet isolated. Both are natural next steps if this
 gets picked up.
+
+**Is this only a stage-1 cost? No, but the call pattern differs a lot
+between the two stages** (checked directly against every
+`chargeEquilibration()` call site in `Training.cpp`):
+
+- **Stage 1** (`"charge"` branch): called *unconditionally*, twice per
+  candidate, no caching at all -- `Training.cpp:2437` (PART 1
+  trial-loop scoring) and `Training.cpp:2970` (PART 2 Jacobian
+  assembly). Neither is gated by `hasAMatrix`/`hasCharges`. Every
+  single training candidate rebuilds the full Ewald matrix from
+  scratch, twice.
+- **Stage 2** (`"energy"`/`"force"` branches): called only when the
+  cached electrostatics state is stale -- `Training.cpp:2374`/`2407`
+  (PART 1) and `2580`/`2721` (PART 2), all gated by
+  `if (!s.hasCharges)` or `if (!s.hasAMatrix)`. Force training reuses
+  the same structure across several sub-candidates before a weight
+  update (the `useSubCandidates` grouping already relevant to the
+  `calculateForces()` redundancy fix earlier in this file), so stage 2
+  hits this function far less often per candidate processed -- most
+  calls find `hasAMatrix` already `true` and skip past it.
+- `calculateErrorEpoch()` (the separate error-evaluation pass) also
+  calls it for every structure, every epoch -- unconditionally for
+  stage 1 (`Training.cpp:1436`), gated for stage 2 (`Training.cpp:1440`).
+
+So a fix here would help **both stages** (this is the same
+`AConstrained`/`GpuQeqSolver` machinery already documented above as
+shared across both), but stage 1's exposure is direct and predictable
+(unconditional, every candidate) while stage 2's benefit scales with
+how often `hasAMatrix` actually gets invalidated during training --
+still real, just proportionally smaller than stage 1's.
+
+**Status: analysis only, nothing implemented.** This and the two
+entries above it are a complete, self-contained writeup of the
+investigation (what's expensive, why, how it could be fixed, and where
+else the fix would matter) for whoever picks this up next.
