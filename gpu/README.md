@@ -7,6 +7,185 @@ Phase 6's first pass, one real, narrow integration point now exists in
 `src/` too: `src/libnnpgpu/` and a `Mode::calculateAtomicNeuralNetworks()`
 call site gated behind `N2P2_GPU`/`make GPU=1`, described at this file's end.
 
+## Final status summary
+
+This file is a chronological development log -- the rest of it reads top to
+bottom as the actual investigation happened, including dead ends. This
+section is the opposite: a single, current-state reference for whoever
+picks this up next, so they don't have to reconstruct it from ~40
+`### Follow-up:` entries. Everything below is on `temp/H2O_4G` (the
+electrostatics/charge-transfer dataset, `HDNNP_4G`), full 1254-structure
+production scale, `memorize_symfunc_results` on, GPU side = 4xA100 on one
+Booster node, 32 MPI ranks under a single shared NVIDIA MPS daemon, CPU
+side = one full `dcgp_usr_prod` node (112 cores). Numbers below are a
+fresh, clean rerun at the current commit specifically for this summary,
+not copy-pasted from earlier entries (though they land close to the
+numbers those entries already reported, which is itself a useful
+cross-check).
+
+### Where things stand, end to end
+
+| | Stage 1 (charge/electronegativity) | Stage 2 (energy + force) |
+|---|---|---|
+| CPU, 112 cores (dcgp, full node) | `~7.5s`/epoch | `~695.9s`/epoch |
+| GPU, 4xA100, 32 ranks (MPS) | `~4.4-4.5s`/epoch | `~84.5-87.4s`/epoch |
+| **GPU vs CPU-112** | **`~1.7x` faster** | **`~8.0x` faster** |
+
+Both stages now clearly favor GPU on this single-node-multi-GPU deployment
+shape, on this problem size. That wasn't true for most of this file's
+history -- stage 2 spent a long stretch **slower** than CPU-112 (as bad as
+`2.36x` slower) before the fixes below flipped it, and stage 1 was `~1.5x`
+slower right up until the Ewald-matrix-assembly investigation. The
+single-node/4-GPU/shared-MPS deployment shape itself was validated correct
+very early and never needed to change -- every win below came from fixing
+what ran *on* that deployment, not the deployment itself.
+
+### Successfully shipped (in the production `src/` tree today, behind `N2P2_GPU`/`make GPU=1`)
+
+**New GPU device code:**
+- `GpuNeuralNetwork.h/.cu` -- `gpuNnForwardDEdG` (batched NN forward +
+  `dEdG`, `HDNNP_2G` and `HDNNP_4G`'s `"short"`/`"elec"` branches),
+  `gpuNnEnergyDEdcSum` (stage-2 energy weight-Jacobian, summed),
+  `gpuNnForceDFdcSum` (stage-2 force weight-Jacobian, summed, widened to
+  4G's extra charge-input column). `25-28x` standalone on the forward
+  pass; end-to-end effect folded into the totals below.
+- `GpuKalmanFilter.h/.cu` -- the two `O(N^2 m)` steps of the Kalman weight
+  update (`X=P.H`, the `K.X^T` covariance downdate term), `P` persistent
+  on GPU for the filter object's lifetime. Shared by both stages. Two real
+  correctness bugs found and fixed here via real end-to-end data (a
+  hand-rolled GPU inverse that was numerically wrong for ill-conditioned
+  production Jacobians, and a missing `selfadjointView`-equivalent
+  symmetrization) -- see List 2 below for the inverse, which was removed
+  entirely rather than kept broken.
+- `GpuForces.h/.cu` -- owner-centric edge-list, `atomicAdd`-scatter port
+  of `Mode::calculateForces()`'s short-range term, persistent per-structure
+  topology cache. `HDNNP_2G` and (widened, no new device code)
+  `HDNNP_4G`'s shared short-range loop. Single biggest win in this whole
+  file: `HDNNP_4G` stage 2 `1311s -> 149.3s` (`~8.8x`) from this port alone.
+- `GpuElecForces.h/.cu` -- 4G-specific electrostatic-force port
+  (pre-multiplied `lambdaTotal`/`lambdaElec` into `dChidG`, owner-centric
+  self+edge structure, dense `dAdrQ` reduction). Stage 2, 4G only, capped
+  at a modest `~12%` win by `dAdrQ`'s per-call re-upload cost (`~9.5MB`
+  /structure, genuinely changes every call -- see "what's left" below).
+- `GpuQeqSolver.h/.cu` -- cuSOLVER LU-based batched replacement for the
+  charge-equilibration `ColPivHouseholderQR` solve. Shared by both stages.
+  Numerical safety pre-validated against real production matrices
+  (condition number, LU-vs-QR agreement) before writing any CUDA -- exactly
+  the check that would have caught the Kalman inverse bug earlier.
+- `GpuEwaldReal.h/.cu` -- owner-centric edge-list, `atomicAdd`-scatter port
+  of the Ewald real-space erfc double loop, persistent per-structure
+  topology cache -- the `GpuForces.cu` template applied to a second,
+  unrelated part of the code. Stage 1 primarily (also stage 2 via the
+  shared `chargeEquilibration()` machinery). `~4.3x` further stage-1 win on
+  its own.
+
+**CPU-only algorithmic fixes (no device code, same effort, same file):**
+- `AConstrainedQr` factorize-once fix (was refactorizing per solve across
+  5 call sites) -- `~10x`/`~126x` on the pieces it touched, shared by both
+  stages, bit-identical.
+- Stage-1 Jacobian-assembly loop reassociation
+  (`O(numAtoms^2 numWeights) -> O(numAtoms^2)+O(numAtoms numWeights)`) --
+  `~3.1x`, bit-identical.
+- `memorize_symfunc_results` enabled -- pure config change, `~1.76x` at
+  full scale for `~1.2%` extra memory.
+- Reciprocal-space Ewald sum reformulated as two GEMMs instead of an
+  `O(numAtoms^2 x numK)` `cos()` loop -- caught and fixed a real
+  triangle-placement bug along the way; a small win for *this* dataset
+  specifically (`numK=3`, real-space-dominated), likely a bigger one for a
+  dataset with a larger k-space grid.
+- Two redundant-recomputation fixes, same bug shape found twice
+  independently: stage 2's `calculateForces()` called twice per force
+  candidate (`~40-50%` stage-2 win) and stage 1's `chargeEquilibration()`
+  called twice per accepted candidate (part of the `~16-20%` stage-1 win).
+- `collectDGdxiaAllAtoms()` -- precomputed CSR reverse-neighbor index
+  replacing an `O(numAtoms x numNeighbors)` per-atom scan, computed once
+  per structure. Stage 2, 4G only, `~27%` further win, bit-identical.
+
+**Infrastructure (enables everything above):** `src/libnnpgpu/` build
+integration, `NeuralNetwork::hasGpuCompatibleArchitecture()` gating,
+NVIDIA MPS (single shared daemon, all 4 GPUs) fixing the 32-rank/1-GPU
+contention that had made an early GPU pass *slower* than CPU net, spreading
+ranks across all 4 GPUs (8/GPU), persistent per-architecture/per-structure
+device-state caching everywhere instead of `cudaMalloc`/`cudaFree` per
+call, plus several correctness fixes surfaced along the way
+(`PM_TRAIN_RK0` silently running on every rank, a build-race heisenbug,
+`nnp-dataset` never having been run).
+
+### Tried, built, validated or debugged, and explicitly reverted
+
+1. **Hand-rolled GPU Gauss-Jordan matrix inverse** (inside the Kalman
+   port) -- passed its synthetic test, diverged **~10 orders of
+   magnitude** on real end-to-end data (ill-conditioned real Jacobians
+   vs. well-conditioned synthetic ones). Removed entirely, moved back to
+   host Eigen.
+2. **`GpuElecForces`'s `dChidG`/`dAdrQ`/`pEelecpr` caching** -- built to
+   avoid re-uploading these every call; a live cross-check caught a real
+   staleness bug (a code path that flips `hasAMatrix` true without
+   refreshing the cache). Reverted entirely rather than ship an uncertain
+   partial fix.
+3. **Batched force-Jacobian dispatch** (`gpuNnForceDFdcSumBatch`) --
+   validated bit-identical against 7232 live samples, **not a correctness
+   bug** -- reverted because `task_batch_size_force 1` means every real
+   candidate has exactly one batch member, so the batching path is pure
+   overhead for zero benefit under this training config. Would need a
+   training-methodology change (raising that hyperparameter) to ever
+   engage, out of scope for a performance-only pass.
+4. **`gpuNnChargeDEdc()`, the stage-1 `"fwd"` loop port** -- validated
+   bit-exact on the first try, then caused a reproducible **`6-9%`
+   regression** at full 32-rank MPS scale. Every component of the branch
+   was bracketed and summed to less than half of measured `Q_err` -- the
+   gap is inter-rank desynchronization/stalling from added GPU-queue
+   contention, invisible to any single rank's own timer, the same failure
+   class as the `GpuForces.cu` first-pass regression but with no
+   topology-cache-style fix available here (the inputs genuinely change
+   every call).
+
+### What's left, and my honest opinion on it
+
+Every remaining cost either bracketed or reasoned about in this file falls
+into one of three buckets, and none of them look like quick wins:
+
+1. **Already GPU-accelerated, capped by per-call dispatch/transfer
+   overhead under MPS, not by unaccelerated compute.** Stage 1's
+   `chargeEquilibration()` trial-loop calls (`~26%` of `Q_err`, all
+   running through `GpuEwaldReal`/`GpuQeqSolver` already) and
+   `GpuElecForces`'s `dAdrQ` re-upload are the two clearest examples. The
+   `gpuNnChargeDEdc()` revert just demonstrated, concretely and
+   reproducibly, that adding *more* small per-call GPU dispatch under this
+   MPS setup is as likely to make things worse as better -- this isn't a
+   theoretical risk anymore, it's a measured one. Chasing this further
+   needs batching *across* candidates/structures into fewer, larger calls
+   (the same idea the reverted batched-`calculateDFdc` attempt used), not
+   another single-call port.
+2. **Structurally blocked by training hyperparameters, not code.** The
+   batched-force-Jacobian dispatch is *built and validated*, sitting idle
+   behind `task_batch_size_force 1`. Turning it on is a one-line
+   `input.nn` change with an already-working GPU path behind it -- but it
+   changes training *convergence behavior* (more candidates per weight
+   update), which is a modeling decision, not a performance one, and isn't
+   this kind of engineering pass's call to make unilaterally.
+3. **Cheap enough that porting isn't worth the risk.** Stage 1's `dq`/
+   `jac` brackets are `~0.24s`/`~0.12s` per epoch -- genuinely small in
+   absolute terms now that the two big stage-1 levers (Ewald real-space,
+   the redundant-call fixes) are shipped. The CPU-only reciprocal-sum GEMM
+   is similarly small for *this* dataset's Ewald parameters specifically.
+
+**My honest read: there's no non-negligible low-hanging fruit left in the
+"port more code to GPU" direction.** The two genuinely large,
+well-scoped opportunities this file identified (stage 2's force/NN-forward
+path, stage 1's Ewald matrix assembly) are both done, and both flips
+(`2.36x` slower `-> 8.0x` faster; `1.5x` slower `-> 1.7x` faster) are
+banked. What remains is either (a) a real but substantial architectural
+change -- batching across candidates to cut per-call MPS-contention
+overhead, which is new design work with the same numerical-safety burden
+every port in this file has needed, not a quick follow-up -- or (b) a
+training-methodology lever (`task_batch_size_force`) that isn't a
+performance-engineering decision at all. If asked to prioritize, I'd stop
+here rather than chase (a) speculatively: the last two things tried in
+this exact spirit (the batched-Jacobian attempt, the `fwd` port) were both
+correct and both didn't pay off, for two different structural reasons
+that a third attempt in the same style would very plausibly hit again.
+
 ## `smoke/`
 
 Standalone CUDA smoke tests: from-scratch reimplementations of individual
