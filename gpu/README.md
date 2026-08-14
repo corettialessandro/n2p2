@@ -3270,3 +3270,103 @@ still real, just proportionally smaller than stage 1's.
 entries above it are a complete, self-contained writeup of the
 investigation (what's expensive, why, how it could be fixed, and where
 else the fix would matter) for whoever picks this up next.
+
+### Follow-up: implemented the CPU-first pass on the Ewald matrix assembly -- the reciprocal-sum hypothesis was wrong, but it led to a real redundant-call bug worth ~16-20% of stage 1
+
+Went CPU-first on `calculateElectrostaticEnergy()`'s matrix assembly,
+per the earlier feasibility analysis: the reciprocal-space double loop
+(`A(i,j) += 2*coeff*cos(k.(ri-rj))/fourPiEps`, summed over all
+k-vectors for every atom pair) has an exact algebraic reformulation via
+`cos(a-b) = cos(a)cos(b) + sin(a)sin(b)`, turning an `O(numAtoms^2 x
+numKvectors)` sum of `cos()` calls into two GEMMs (`Cw.Cwᵀ + Sw.Swᵀ`
+from precomputed per-atom `cos(k.r)`/`sin(k.r)` projections, weighted
+by `sqrt(2*coeff/fourPiEps)`).
+
+**Implemented and validated bit-exact, but caught a real bug on the
+way.** Cross-checked the new GEMM path against the original triple
+loop on real `temp/H2O_4G` data (env-gated, reverted before commit):
+the first version's `relDiff` was `~57x`, not floating-point noise.
+Root cause: the *removed* loop's `A(j,i) = A(i,j)` mirror step wasn't
+just handling the reciprocal term -- it was also propagating the
+real-space erfc contribution (which the atom loop only ever writes
+into the upper triangle, `j >= i`) into the lower triangle. The
+replacement has to rank-update the *same* (upper) triangle the
+real-space loop already populated, then mirror at the end -- rank-
+updating the lower triangle first (the more "natural" Eigen default)
+silently drops the real-space term from half the matrix. Once fixed,
+`relDiff ~5.7e-9` against the direct sum (pure roundoff).
+
+**The reciprocal sum turned out not to be the lever.** Split
+`calculateElectrostaticEnergy()`'s periodic branch into three
+brackets (diagonal+real-space, cos/sin projection build, GEMM) with
+temporary `Stopwatch`s, full 1254-structure dataset, 1 epoch:
+
+| Phase | s/epoch (per rank) |
+|---|---|
+| diagonal + real-space erfc loop | `~6.0-6.4s` |
+| cos/sin projection build | `~0.009s` |
+| GEMM (both ranks, old or new) | `~0.08-0.2s` |
+
+`numK` for this dataset's Ewald parameters is only **3** -- the
+reciprocal sum was always cheap here (the `eta` for this system pushes
+essentially all the weight into real space, needing a correspondingly
+large `rCut`), so the "port the reciprocal sum" hypothesis from the
+earlier analysis undershot the real cost by roughly two orders of
+magnitude. The GEMM fix is still correct, still a real (if small)
+win, and would matter more for a system with a larger k-space grid --
+kept, not reverted.
+
+**Instrumented call count + neighbor-pair count to find the real
+lever**, since real-space cost = calls x neighbor-pairs-per-call x
+erfc-cost: `148` calls/rank/epoch, `~202M` neighbor-pairs/rank/epoch
+(`~1.37M` per call -- large, but genuinely neighbor-list-bounded, not
+`O(numAtoms^2)`), `~15ns`/erfc() call. This is real, unavoidable-by-
+caching compute for 148 *distinct* calls -- except a look at
+`Training.cpp` showed not all 148 are actually distinct work.
+
+**Found the actual redundant-call bug -- same shape as the
+`calculateForces()` fix earlier in this file.** Stage 1's PART 1
+trial loop (`Training.cpp`, `SM_THRESHOLD` candidate scoring) calls
+`chargeEquilibration(s, false)` per trial, then either `break`s
+immediately if the candidate clears the RMSE threshold (skipping
+`s.clearElectrostatics()` entirely) or falls through to
+`s.clearElectrostatics()` and tries the next candidate. So for the
+*winning* candidate specifically, `s.hasAMatrix` is still `true` when
+PART 2 runs -- yet PART 2's `chargeEquilibration(s, false)` call was
+unconditional, unlike every stage-2 call site in this same file (all
+gated by `hasAMatrix`/`hasCharges`). Nothing between PART 1's call and
+PART 2's runs changes the weights or geometry (PART 2 does recompute
+`ak.chi` via a direct NN forward pass, needed regardless for `dChidc`,
+but under unchanged weights/inputs it's numerically identical to
+PART 1's) -- so PART 2 was reliably re-running the entire ~6s/epoch
+real-space+reciprocal matrix assembly for a structure whose `A`/`Q`/
+`lambda` were already valid. Fix: `if (!s.hasAMatrix)
+chargeEquilibration(s, false);`, mirroring the exact gating stage 2
+already uses.
+
+**Validated bit-exact, not just plausible.** Temporary env-gated
+cross-check: whenever `s.hasAMatrix` was `true` at PART 2, force the
+recompute anyway and diff the resulting charges against the cached
+ones. `maxChargeDiff` / `lambdaDiff` = `0.0` across all `112` cache-hit
+occurrences over 2 epochs on a 60-structure subset -- exact
+determinism, as expected from a deterministic NN forward pass under
+unchanged weights.
+
+**Combined effect, full 1254-structure dataset, 6 epochs:** steady-
+state stage-1 epoch time `~22.6s -> ~19s` (`~16-20%`), `Q_err` bucket
+`~15.7s -> ~10.4s` (`~34%`, since that's where most `chargeEquilibration()`
+calls live). Multi-epoch `learning-curve.out.stage-1` matches the
+baseline closely -- epochs 0-1 bit-identical, epochs 2+ diverge only
+at the `~1e-4` relative level, consistent with the reciprocal GEMM's
+different floating-point summation order (same caveat already
+documented for `atomicAdd` reordering elsewhere in this file, not a
+correctness regression).
+
+**What's left.** The real-space erfc loop itself (`~6s/epoch/rank`,
+`~202M` neighbor-pairs/rank/epoch even after the redundant-call fix)
+is now the clear, unaddressed dominant cost -- not the reciprocal sum
+this investigation started from. It's neighbor-list-bounded (not
+`O(numAtoms^2)`), which makes it structurally similar to `GpuForces.cu`'s
+owner-centric edge-list pattern: a natural next GPU candidate if this
+gets picked up again, now correctly scoped by measurement rather than
+by the original (wrong) hypothesis. Not started.
