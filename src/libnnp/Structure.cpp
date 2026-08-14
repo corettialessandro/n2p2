@@ -19,6 +19,7 @@
 #include "Vec3D.h"
 #include "utility.h"
 #ifdef N2P2_GPU
+#include "GpuEwaldReal.h"
 #include "GpuQeqSolver.h"
 #endif
 #include <Eigen/Dense> // MatrixXd, VectorXd
@@ -26,6 +27,7 @@
 #include <cmath>       // fabs, erf
 #include <cstdlib>     // atof
 #include <limits>      // std::numeric_limits
+#include <set>         // std::set
 #include <stdexcept>   // std::runtime_error
 #include <string>      // std::getline
 #include <iostream>
@@ -664,7 +666,10 @@ double Structure::calculateElectrostaticEnergy(
             hardnessJ(i) = hardness(ei);
             b(i) = -ai.chi;
 
-            // real part
+#ifndef N2P2_GPU
+            // real part (CPU fallback -- see GpuEwaldReal.h for the GPU
+            // path, used instead when N2P2_GPU is defined, right after
+            // this atom loop).
             size_t const numNeighbors = ai.getStoredMinNumNeighbors(rcutReal);
             for (size_t k = 0; k < numNeighbors; ++k)
             {
@@ -681,10 +686,85 @@ double Structure::calculateElectrostaticEnergy(
 
                 A(i, j) += (erfcSqrt2Eta - erfcGammaSqrt2) / (rij * fourPiEps);
             }
+#endif
             // Reciprocal part is added below via two GEMMs, using
             // cos(k.(ri-rj)) = cos(k.ri)cos(k.rj) + sin(k.ri)sin(k.rj)
             // instead of an O(numAtoms^2 x numKvectors) direct sum.
         }
+
+#ifdef N2P2_GPU
+        // Real-space erfc sum on GPU (see GpuEwaldReal.h): the edge list
+        // (owner, target, rij, element pair) is purely geometric --
+        // uploaded exactly once per structure and cached there, keyed by
+        // structure index, exactly mirroring GpuForces.h's topology
+        // caching rationale. Only gammaSqrt2 (depends on the trainable
+        // per-element Qsigma) is re-uploaded every call.
+#ifdef _OPENMP
+        #pragma omp single
+        {
+#endif
+        {
+            static set<size_t> gpuEwaldRealTopologyUploaded;
+            if (gpuEwaldRealTopologyUploaded.insert(index).second)
+            {
+                vector<int> edgeOwner, edgeTarget, edgeElemI, edgeElemJ;
+                vector<double> edgeRij;
+                for (size_t i = 0; i < numAtoms; ++i)
+                {
+                    Atom const &ai = atoms.at(i);
+                    size_t const ei = ai.element;
+                    size_t const numNeighbors =
+                        ai.getStoredMinNumNeighbors(rcutReal);
+                    for (size_t k = 0; k < numNeighbors; ++k)
+                    {
+                        auto const &n = ai.neighbors[k];
+                        size_t const j = n.tag;
+                        if (j < i) continue;
+
+                        edgeOwner.push_back((int)i);
+                        edgeTarget.push_back((int)j);
+                        edgeRij.push_back(n.d);
+                        edgeElemI.push_back((int)ei);
+                        edgeElemJ.push_back((int)n.element);
+                    }
+                }
+                gpuEwaldRealUploadTopology((int)index, (int)numAtoms,
+                                           (int)gammaSqrt2.rows(),
+                                           (int)edgeOwner.size(),
+                                           edgeOwner.data(),
+                                           edgeTarget.data(),
+                                           edgeRij.data(),
+                                           edgeElemI.data(),
+                                           edgeElemJ.data());
+            }
+
+            // GpuEwaldReal.h's contract is row-major; gammaSqrt2 is
+            // symmetric so Eigen's column-major .data() would happen to
+            // read back correctly here too, but build an explicit
+            // row-major copy instead of relying on that coincidence.
+            size_t const nE = (size_t)gammaSqrt2.rows();
+            vector<double> gammaSqrt2RowMajor(nE * nE);
+            for (size_t i = 0; i < nE; ++i)
+                for (size_t j = 0; j < nE; ++j)
+                    gammaSqrt2RowMajor[i * nE + j] = gammaSqrt2(i, j);
+
+            vector<double> ewaldRealUpperAdd((size_t)numAtoms * numAtoms);
+            gpuEwaldRealCompute((int)index, gammaSqrt2RowMajor.data(),
+                                sqrt2eta, fourPiEps,
+                                ewaldRealUpperAdd.data());
+
+            for (size_t i = 0; i < numAtoms; ++i)
+            {
+                for (size_t j = i; j < numAtoms; ++j)
+                {
+                    A(i, j) += ewaldRealUpperAdd[i * numAtoms + j];
+                }
+            }
+        }
+#ifdef _OPENMP
+        }
+#endif
+#endif
 
 #ifdef _OPENMP
         #pragma omp single
