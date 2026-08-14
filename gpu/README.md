@@ -3502,3 +3502,57 @@ file, and with today's fix being control-flow/algorithmic wins on top
 of an already fairly light workload, not a from-scratch GPU port of a
 previously-dominant, previously-CPU-only cost the way stage 2's
 `GpuForces.cu` port was.
+
+### Follow-up: fresh stage-1 reprofile -- the next lever, and it's a big one
+
+Asked "what else could we optimize" after the `~5.1x` stage-1 result
+above -- rather than guess from the pre-investigation percentages
+(which are now stale, since `chargeEquilibration` collapsed from the
+dominant cost to a minor one), re-profiled from scratch with the same
+temporary-`Stopwatch`-bracket methodology used throughout this file,
+splitting `Training::update("charge")`'s PART 1/PART 2 into six named
+brackets. Full 1254-structure dataset, 3 epochs, current HEAD (GPU
+build):
+
+| Bracket | s/epoch (per rank) | % of `Q_err` | GPU status |
+|---|---|---|---|
+| `fwd` (PART 2's per-atom `chi`/`dChidc` forward + weight-Jacobian loop) | `~2.04s` | **`~62%`** | **not GPU-ported** |
+| `part1qeq` (PART 1's `chargeEquilibration()`, all trials) | `~0.84s` | `~26%` | GPU-ported (real-space + solve), CPU (reciprocal GEMM) |
+| `dq` (`calculateDQdChi`/`calculateDQdJ`) | `~0.26s` | `~8%` | GPU-ported |
+| `jac` (Jacobian summation) | `~0.10s` | `~3%` | CPU-optimized, already small |
+| `part1nn` (PART 1's `calculateAtomicNeuralNetworks`) | `~0.03s` | `~1%` | GPU-ported |
+| `part2qeq` (PART 2's now-conditional `chargeEquilibration()`) | `~0.00002s` | `~0%` | confirms the redundant-call fix above works as intended |
+
+(Sum `~3.27s/epoch` matches `Q_err`'s measured `~3.27s/epoch` almost
+exactly -- fully accounted for.)
+
+**`fwd` is now the dominant remaining cost by a wide margin** --
+`~62%` of `Q_err`, roughly `~46%` of the whole stage-1 epoch. This is
+`Training.cpp`'s PART 2 computing, one atom at a time on CPU, the
+electronegativity NN's forward pass (`chi`) and its full per-atom
+weight-Jacobian (`NeuralNetwork::calculateDEdc()`, needed for
+`dChidc`) -- never GPU-ported. It's structurally identical to
+`calculateDFdc`'s pattern (forward + weight-Jacobian per atom), which
+this file already GPU-ported for stage 2 at `~47.6%` of `F_err` back
+when it was profiled -- the same underlying batched-GEMM math
+(`gpu/gemm/nn_dedc_gemm_test.cu`) should apply here directly, no new
+device-code design needed, just a new dispatch function for the
+"elec" NN mirroring `calculateDFdc`'s.
+
+`part1qeq`'s `~26%` is worth noting too: it's the PART-1 trial-loop's
+repeated `chargeEquilibration()` calls (`SM_THRESHOLD`'s rejected
+trials, not just the accepted candidate -- `part2qeq`'s near-zero
+number above confirms the redundant-call fix is working), and it's
+*already* GPU-accelerated end to end (real-space via `GpuEwaldReal`,
+solve via `GpuQeqSolver`). Its remaining cost is most likely per-call
+GPU dispatch/transfer overhead under 32-way MPS contention -- the same
+shape this file has documented for `calculateDFdc` and others -- not
+unaccelerated compute. A secondary, smaller-payoff target if `fwd`
+gets addressed first (which it should be, given the size difference).
+
+**Status: profiled, not yet implemented.** `fwd`'s port looks like a
+well-scoped, comparatively low-risk next step given the directly
+reusable validated math, but a real GPU-code change nonetheless --
+next action if this gets picked up. All temporary instrumentation
+(`STAGE1_REPROFILE`, the six `Stopwatch` brackets) reverted, nothing
+shipped from this entry beyond the write-up.
