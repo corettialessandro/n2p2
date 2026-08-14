@@ -3556,3 +3556,89 @@ reusable validated math, but a real GPU-code change nonetheless --
 next action if this gets picked up. All temporary instrumentation
 (`STAGE1_REPROFILE`, the six `Stopwatch` brackets) reverted, nothing
 shipped from this entry beyond the write-up.
+
+### Follow-up: implemented the `fwd` port -- correct, individually fast, but a net regression at full 32-rank MPS scale; reverted
+
+Built `gpuNnChargeDEdc()` (`GpuNeuralNetwork.h/.cu`), mirroring
+`gpuNnEnergyDEdcSum()`'s forward-pass GEMM pipeline exactly but keeping
+every atom's `dEdc` separate instead of contracting the atom axis --
+the same per-atom batched-outer-product math `gpu/gemm/nn_dedc_gemm_test.cu`
+already validated standalone (batched `cublasDgemmStridedBatched`,
+`k=1`, for `dE/dW1`/`dE/dW2`, plus a small packing kernel for the
+`dE/db1`/`dE/db2`/`dE/dW3`/`dE/db3` alias pieces already sitting in
+the forward pass's own intermediates -- see that file's header comment
+for the derivation). Wired into `Training.cpp`'s PART 2 `"charge"`
+branch, grouping atoms by element and dispatching one batched call per
+element per structure, mirroring `calculateAtomicNeuralNetworks()`'s
+`"elec"`-branch GPU dispatch in `Mode.cpp` -- but returning the
+per-atom breakdown instead of a sum, since PART 2 weights each atom's
+`dChidc` differently (by `dQdChi`) before summing into the Jacobian,
+unlike `"energy"` training which only ever needs the total.
+
+**Validated bit-exact, no correctness issues at any point.** Cross-checked
+`chi`/`dEdc` against the CPU reference on real data (env-gated, forced
+recompute after the GPU result, diffed, then restored): `relDiff` at
+machine precision (`maxChiDiff ~4.4e-15`, `maxDEdcDiff ~8.9e-16`) across
+112 occurrences, 60-structure subset, 2 epochs -- correct on the first
+attempt, no triangle-placement-style bug this time.
+
+**But full-scale timing was a real, reproducible regression, not a
+win.** Confirmed via multiple controlled back-to-back A/B runs (same
+job, same node, before/after built and run sequentially, ruling out
+cluster-load noise): full 1254-structure dataset, stage-1 steady-state
+epoch time went `~4.39s -> ~4.76-4.78s` -- a **`6-9%` slowdown**, not
+the expected win, despite the port being individually fast and exactly
+correct.
+
+**Diagnosed by bracketing every remaining component of
+`Training::update("charge")`'s `HDNNP_4G` branch, not just the new
+code** (temporary `Stopwatch`s on `part1nn`, `part1qeq`, `fwd`'s three
+phases, `part2qeq`, `dq`, `jac` -- literally everything PART 1/PART 2
+do for this property):
+
+| Bracket | s/epoch (per rank) |
+|---|---|
+| `part1nn` | `0.026s` |
+| `part1qeq` | `0.848s` (unchanged from before -- rules out shared-GPU-contention slowdown of *this* piece specifically) |
+| `fwd` prep (CPU-side G/connections build) | `0.070s` |
+| `fwd` call (`gpuNnChargeDEdc()` itself) | `0.172s` |
+| `fwd` copyback (chi/dChidc into host arrays) | `0.137s` |
+| `part2qeq` | `~0.000s` (confirms the earlier redundant-call fix still works) |
+| `dq` | `0.242s` |
+| `jac` | `0.115s` |
+| **Sum** | **`~1.61s`** |
+| **Measured `Q_err`** | **`~3.58s`** |
+| **Unaccounted gap** | **`~1.97s`** |
+
+Every single piece of compute this branch does is bracketed above, and
+they sum to less than half of measured `Q_err`. The missing `~1.97s`
+isn't hiding in any code path -- it's the same failure mode this file
+already documented for `calculateForces()`'s first GPU pass: a
+Stopwatch around a GPU call measures *this rank's* wall time for that
+call, but under 32-way MPS sharing across only 4 GPUs, adding more
+small per-structure GPU dispatches (now two more per structure per
+candidate, on top of everything already contending for the same GPUs)
+increases *timing variance across ranks* -- some ranks' calls queue
+behind others'. That desync is invisible to any single rank's own
+bracket; it shows up as every rank blocking at the next synchronization
+point waiting for the slowest one. `Q_com` (the explicit communication
+column) stays small throughout because this isn't communication, it's
+an implicit stall at a barrier -- real wall-clock cost with no
+corresponding line in any per-rank instrumentation.
+
+**Reverted, not shipped.** Unlike `GpuForces.cu`'s first-pass
+regression (fixed by caching topology once per structure, cutting
+repeat upload cost directly), there's no equivalent fix available
+here without a genuinely different design: `gpuNnChargeDEdc()`'s
+inputs (the current weights) change every call by construction, so
+there's no topology to cache. The plausible next move is batching
+*across* candidates/structures into fewer, larger calls (amortizing
+per-call MPS contention the way `GpuElecForces`/`GpuForces` amortize
+per-call transfer cost) -- but that's new design work, not a quick
+follow-up, and not attempted here. `GpuNeuralNetwork.h/.cu`'s
+`gpuNnChargeDEdc()`, `GpuNnChargeState`, `outerProductBatched()`, and
+`packDEdcKernel()`, plus the `Training.cpp` PART 2 dispatch change,
+were all reverted before commit -- this entry is the complete record
+for whoever picks this up next, including the exact numbers that ruled
+out the two most obvious explanations (a correctness bug, and
+part1qeq-specific contention) before landing on the real one.
