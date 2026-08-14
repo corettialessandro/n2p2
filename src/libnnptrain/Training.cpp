@@ -2967,7 +2967,21 @@ void Training::update(string const& property)
                     }
 
                 }
-                chargeEquilibration(s, false);
+
+                // HDNNP_4G/SM_THRESHOLD redundant-computation fix (same
+                // shape as the "force" branch fix above, see
+                // gpu/README.md): PART 1's trial loop above already ran
+                // chargeEquilibration(s, false) for this exact structure
+                // under these exact (not-yet-updated) weights, and the
+                // trial loop breaks out (skipping s.clearElectrostatics())
+                // as soon as a candidate is accepted -- so for the winning
+                // candidate s.hasAMatrix is still true here. ak.chi is
+                // recomputed just above (needed regardless, for dChidc),
+                // but under unchanged weights/geometry it is numerically
+                // identical to PART 1's, so A/AConstrained/Q/lambda are
+                // still valid and recomputing them here just duplicates
+                // the same expensive Ewald matrix assembly for no benefit.
+                if (!s.hasAMatrix) chargeEquilibration(s, false);
 
                 vector<Eigen::VectorXd> dQdChi;
                 s.calculateDQdChi(dQdChi);
