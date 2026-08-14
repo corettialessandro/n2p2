@@ -133,6 +133,13 @@ struct Structure
     Eigen::ColPivHouseholderQR<Eigen::MatrixXd> AConstrainedQr;
     /// If A matrix of this structure is currently stored.
     bool                     hasAMatrix;
+    /// Per-atom (numAtoms x numKvectors) weighted cos(k.r)/sin(k.r)
+    /// projections, scratch space reused across calls to
+    /// calculateElectrostaticEnergy() for the reciprocal-space Ewald sum
+    /// (computed there via cos(a-b) = cos(a)cos(b) + sin(a)sin(b), turning
+    /// the O(numAtoms^2 x numKvectors) direct sum into two GEMMs).
+    Eigen::MatrixXd          ewaldCosProj;
+    Eigen::MatrixXd          ewaldSinProj;
     /// Number of atoms of each element in this structure.
     std::vector<std::size_t> numAtomsPerElement;
     /// Vector of all atoms in this structure.

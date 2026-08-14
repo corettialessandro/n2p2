@@ -618,6 +618,7 @@ double Structure::calculateElectrostaticEnergy(
     VectorXd bConstrained(numAtoms + 1);
     VectorXd hardnessJ(numAtoms);
     VectorXd Q;
+    size_t numKvectors = 0;
     erfcBuf.reset(atoms, 2);
 
 #ifdef _OPENMP
@@ -680,21 +681,63 @@ double Structure::calculateElectrostaticEnergy(
 
                 A(i, j) += (erfcSqrt2Eta - erfcGammaSqrt2) / (rij * fourPiEps);
             }
-            // reciprocal part
-            for (size_t j = i; j < numAtoms; ++j)
+            // Reciprocal part is added below via two GEMMs, using
+            // cos(k.(ri-rj)) = cos(k.ri)cos(k.rj) + sin(k.ri)sin(k.rj)
+            // instead of an O(numAtoms^2 x numKvectors) direct sum.
+        }
+
+#ifdef _OPENMP
+        #pragma omp single
+        {
+#endif
+        numKvectors = grid.kvectors.size();
+        ewaldCosProj.resize(numAtoms, numKvectors);
+        ewaldSinProj.resize(numAtoms, numKvectors);
+#ifdef _OPENMP
+        }
+#endif
+
+#ifdef _OPENMP
+        #pragma omp for schedule(static)
+#endif
+        for (size_t i = 0; i < numAtoms; ++i)
+        {
+            Atom const &ai = atoms.at(i);
+            for (size_t k = 0; k < numKvectors; ++k)
             {
-                Atom const &aj = atoms.at(j);
-                for (auto const &gv: grid.kvectors)
-                {
-                    // Multiply by 2 because our grid is only a half-sphere
-                    // Vec3D const dr = applyMinimumImageConvention(ai.r - aj.r);
-                    Vec3D const dr = ai.r - aj.r;
-                    A(i, j) += 2 * gv.coeff * cos(gv.k * dr) / fourPiEps;
-                    //A(i, j) += 2 * gv.coeff * cos(gv.k * (ai.r - aj.r));
-                }
-                A(j, i) = A(i, j);
+                Kvector const &gv = grid.kvectors[k];
+                double const angle = gv.k * ai.r;
+                // Multiply by 2 because our grid is only a half-sphere;
+                // sqrt() split evenly between the cos/sin projections so
+                // that their outer products sum to the same
+                // 2*coeff/fourPiEps weight the direct sum used per term.
+                double const w = sqrt(2.0 * gv.coeff / fourPiEps);
+                ewaldCosProj(i, k) = cos(angle) * w;
+                ewaldSinProj(i, k) = sin(angle) * w;
             }
         }
+
+#ifdef _OPENMP
+        #pragma omp single
+        {
+#endif
+        // Real-space erfc contribution above was only ever written into
+        // the upper triangle (j >= i); rank-update the SAME (upper)
+        // triangle here so the reciprocal term lands on top of it, then
+        // mirror into the lower triangle at the end. Updating the lower
+        // triangle instead would silently drop the real-space term from
+        // the final matrix.
+        A.topLeftCorner(numAtoms, numAtoms)
+         .selfadjointView<Eigen::Upper>().rankUpdate(ewaldCosProj);
+        A.topLeftCorner(numAtoms, numAtoms)
+         .selfadjointView<Eigen::Upper>().rankUpdate(ewaldSinProj);
+        A.topLeftCorner(numAtoms, numAtoms)
+         .triangularView<Eigen::StrictlyLower>()
+            = A.topLeftCorner(numAtoms, numAtoms).transpose()
+               .triangularView<Eigen::StrictlyLower>();
+#ifdef _OPENMP
+        }
+#endif
     }
     else
     {
