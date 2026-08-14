@@ -3370,3 +3370,66 @@ this investigation started from. It's neighbor-list-bounded (not
 owner-centric edge-list pattern: a natural next GPU candidate if this
 gets picked up again, now correctly scoped by measurement rather than
 by the original (wrong) hypothesis. Not started.
+
+### Follow-up: ported the real-space erfc loop to GPU (`GpuEwaldReal`) -- correctly scoped this time, and the payoff shows it
+
+Followed `GpuForces.cu`'s exact template, since the real-space sum has
+the identical shape: an owner-centric edge list (owner atom, target
+atom, distance, element pair), purely geometric (atom positions never
+change during training) so uploaded to the GPU exactly **once** per
+structure and cached there keyed by `Structure::index`, then a
+one-thread-per-edge kernel that `atomicAdd`s each edge's
+`(erfc(rij/sqrt2eta) - erfc(rij/gammaSqrt2(ei,ej))) / (rij*fourPiEps)`
+contribution into a dense `numAtoms x numAtoms` output buffer.
+`atomicAdd` is required, not optional here (same as `GpuForces.cu`'s
+pair-force kernel): this dataset's real-space cutoff pulls in multiple
+periodic images of the same neighbor (consistent with `numK=3` --
+large `eta`, real-space-dominated regime, see above), so several edges
+can legitimately target the same `(i, j)` output slot. Only
+`gammaSqrt2` (depends on the trainable per-element `Qsigma`) is
+re-uploaded every call, mirroring `GpuForces.h`'s "topology once,
+small per-call data every time" convention exactly.
+
+**One correctness wrinkle caught before it mattered**: `GpuEwaldReal`'s
+contract is row-major `gammaSqrt2`, but Eigen's `MatrixXd::data()` is
+column-major. `gammaSqrt2` happens to be symmetric (`gammaSqrt2(i,j) ==
+gammaSqrt2(j,i)` by construction in `Mode::chargeEquilibration()`), so
+passing the column-major buffer directly would have happened to read
+back the *correct* value anyway -- a coincidence not worth relying on.
+Built an explicit small row-major copy instead (tiny, `numElements^2`,
+negligible cost) rather than leave a landmine for the day `gammaSqrt2`
+stops being symmetric.
+
+**Validated bit-exact.** Same env-gated cross-check pattern as the
+rest of this file: computed the CPU reference (still compiled in even
+under `N2P2_GPU`, gated by a runtime env check rather than excluded
+via `#ifndef`) alongside the GPU result on real `temp/H2O_4G` data.
+`relDiff ~4.5e-16` -- pure floating-point roundoff between the CPU's
+and CUDA's `erfc()` implementations, on the first try (unlike the
+reciprocal GEMM earlier in this file, no triangle-placement or other
+bug this time -- the math is a direct one-to-one transcription of the
+CPU loop, with no reformulation to get subtly wrong).
+
+**Full-scale result, 1254-structure dataset:** no GPU errors, no OOM
+(host `MaxRSS ~198GB` of a `400GB` budget -- the edge-list cache's
+memory footprint was checked, not assumed, given this file's
+`collectDGdxiaAllAtoms` memory-blowup history earlier). Full-scale
+stage-1 epoch time: `~19s` (CPU, both earlier fixes in this
+investigation applied) `-> ~4.4s` -- a further **`~4.3x`**. Combined
+with this investigation's two CPU-side fixes (`~22.6s -> ~19s`), stage
+1's epoch time has gone `~22.6s -> ~4.4s` end to end
+(**`~5.1x`**) since this Ewald-matrix-assembly investigation started.
+Multi-epoch `learning-curve.out.stage-1` matches the baseline closely,
+same floating-point-reassociation-level caveat as the reciprocal GEMM
+fix (different `atomicAdd`/reduction order, not a correctness
+regression).
+
+**Status: implemented, validated, and merged.** The original
+hypothesis this whole investigation started from (port the reciprocal
+sum) turned out to be a red herring for this dataset; measuring before
+committing to it is what found the real lever twice in a row here (the
+redundant `chargeEquilibration()` call, then this). Stage 1's Ewald
+matrix assembly is now GPU-accelerated end to end -- both the
+reciprocal sum (GEMM) and the real-space sum (`GpuEwaldReal`) -- with
+only the trivial `O(numAtoms)` diagonal/RHS setup and the already-fast
+`GpuQeqSolver` factorize/solve left on their existing paths.
