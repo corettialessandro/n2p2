@@ -3433,3 +3433,72 @@ matrix assembly is now GPU-accelerated end to end -- both the
 reciprocal sum (GEMM) and the real-space sum (`GpuEwaldReal`) -- with
 only the trivial `O(numAtoms)` diagonal/RHS setup and the already-fast
 `GpuQeqSolver` factorize/solve left on their existing paths.
+
+### Follow-up: refreshed the CPU-112 comparison -- stage 1 flips too, same shape as every stage-2 flip in this file
+
+Every number in this file's stage-1-vs-CPU-112 story up to now
+(`14.13s` GPU vs `9.44s` CPU-112, GPU `~1.5x` *slower*) predates this
+whole investigation. That `9.44s` CPU-112 baseline is now stale in a
+specific way worth calling out: the two CPU-side fixes above
+(reciprocal GEMM, redundant-call skip) are pure algorithmic changes
+with no GPU dependency, so they *also* speed up a CPU-only run --
+comparing today's GPU number against yesterday's CPU-112 number would
+overstate the GPU win. Rebuilt CPU-only (no `GPU=1`) at current HEAD
+and reran the exact same 112-rank/full-node methodology used for
+every other CPU-112 number in this file (`dcgp_usr_prod`, `112` ranks,
+full 1254-structure dataset):
+
+| | Stage 1 epoch |
+|---|---|
+| CPU, 112 cores (dcgp), pre-investigation | `9.44s` |
+| **CPU, 112 cores (dcgp), current HEAD (both CPU fixes)** | `~7.6-10.5s` (`Q_com`-noisy, avg `~8.8s`) |
+| **GPU, 4xA100, 32 ranks (MPS), current HEAD** | `~4.4s` |
+
+The CPU-112 number barely moved and got noisier, not cleanly faster --
+unlike the clean `22.6s -> 19s` win measured earlier in this file at
+32 ranks. `Q_com` (communication time) swung `0.11s` to `3.05s` across
+3 epochs on this run, while `Q_err` (the actual compute) stayed tight
+at `4.24-4.26s` -- consistent with the interpretation that 112-way MPI
+synchronization overhead dominates enough at full-node scale to mask
+the compute-side win visible at 32 ranks. Reported as a range rather
+than a cherry-picked single epoch, matching this file's "rerun before
+trusting a single number" practice.
+
+**Even against the noisier end of that range, GPU wins.** `~4.4s` vs
+`~7.6-10.5s` is **`~1.7x-2.4x` faster** (`~2.0x` against the `8.8s`
+average) -- the same *shape* of result as every stage-2 flip in this
+file (`GpuElecForces`, the short-range force loop, the "short"/"elec"
+NN forward ports, `collectDGdxiaAllAtoms`): GPU was behind CPU-112 on
+stage 1 for this whole file until this investigation, and now isn't.
+
+**Stage 2's CPU-112 comparison (`691.2s`, GPU `7.53x` faster) is
+carried forward unchanged, not re-verified this session.** It's not
+entirely unaffected in principle -- stage 2 also calls
+`chargeEquilibration()` (gated by `hasAMatrix`/`hasCharges`, see the
+"Is this only a stage-1 cost?" entry above), so both of today's CPU
+fixes and the `GpuEwaldReal` port apply there too whenever that gate
+lets a call through. But stage 2's dominant costs are
+`calculateDFdc`/`calculateForces`/the NN forward passes/
+`collectDGdxiaAllAtoms` -- charge equilibration was never more than a
+minor contributor there, gated to run far less often than stage 1's
+unconditional-every-candidate calls. Expected to move slightly, not
+enough to be worth a dedicated rerun right now.
+
+**Net picture, both stages, against a full 112-core CPU node:**
+
+| | Stage 1 | Stage 2 |
+|---|---|---|
+| CPU-112 (dcgp, full node) | `~7.6-10.5s`/epoch | `691.2s`/epoch |
+| GPU (4xA100, 32 ranks, MPS) | `~4.4s`/epoch | `91.81s`/epoch |
+| GPU vs CPU-112 | **`~2.0x` faster** | **`7.53x` faster** |
+
+GPU is now the clearly faster option on **both** stages of `HDNNP_4G`
+training at this problem size, on the single-node-multi-GPU deployment
+shape (4xA100, one Booster node, one shared MPS daemon) this whole
+profiling effort validated as correct from the start. Stage 1's flip
+is narrower than stage 2's (`~2.0x` vs `7.53x`) -- consistent with
+stage 1 being the smaller absolute cost of the two throughout this
+file, and with today's fix being control-flow/algorithmic wins on top
+of an already fairly light workload, not a from-scratch GPU port of a
+previously-dominant, previously-CPU-only cost the way stage 2's
+`GpuForces.cu` port was.
