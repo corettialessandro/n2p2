@@ -3821,3 +3821,101 @@ were all reverted before commit -- this entry is the complete record
 for whoever picks this up next, including the exact numbers that ruled
 out the two most obvious explanations (a correctness bug, and
 part1qeq-specific contention) before landing on the real one.
+
+### Follow-up: generalized the GPU-ported NN kernels beyond tanh -- unlocks real in-repo examples, no depth work yet
+
+Separate task, not part of the 4G electrostatics effort above: while
+surveying `examples/` for what else could benefit from this port,
+`NeuralNetwork::hasGpuCompatibleArchitecture()` turned out to silently
+fall every element's NN forward/backward pass back to CPU-only unless
+the network had *exactly* two hidden layers using tanh -- including two
+real, already-in-repo datasets (`examples/nnp-train/Cu2S_PBE`,
+`examples/nnp-train/QM9`, both `global_activation_short p p l`, i.e.
+softplus). `GpuForces` (the force scatter-reduction kernel) already
+dispatched for them regardless, since it's gated independently and only
+needs `dEdG` as input -- this follow-up is specifically about the NN
+forward/Jacobian kernels catching up.
+
+Checked the n2p2 docs and the CPU reference directly: 10 activation
+functions are supported (`AF_IDENTITY/TANH/LOGISTIC/SOFTPLUS/RELU/
+GAUSSIAN/COS/REVLOGISTIC/EXP/HARMONIC`), no documented cap on hidden-layer
+depth or width. Scoped this pass to activation only -- depth (more than
+two hidden layers) stays out of scope, a separate and materially bigger
+rewrite (the three dispatch functions are hand-unrolled for exactly two
+hidden layers, not loop-based).
+
+**Where the tanh assumption actually lived.** Grepped all of
+`src/libnnpgpu/` for `AF_TANH`/`tanh(` -- exactly two kernels in the
+whole tree hardcoded it (`biasTanhKernel`, forward-only; `biasTanhD2Kernel`,
+also needs `d2fdx2` for the force-Jacobian pass), called twice each
+(once per hidden layer) inside the three public dispatch functions.
+Everything else (the GEMMs, elementwise mul/add, transpose, scale-by-
+row/col) was always activation-agnostic. Replaced both with
+`biasActivationKernel`/`biasActivationD2Kernel`, generic device helpers
+implementing all 10 formulas verbatim from `NeuralNetwork::propagateLayer()`
+(including the `EXP_LIMIT=35.0` overflow clamp on LOGISTIC/SOFTPLUS
+only -- no clamp added anywhere the CPU reference doesn't have one),
+selected via a `switch` on a plain `int activation` kernel parameter
+(uniform across every thread in one launch, so this is a predictable
+branch, not warp divergence). The per-architecture device buffer cache
+(`ArchKey = numIn/numHidden1/numHidden2`) deliberately does *not* get
+activation added to its key -- nothing activation-dependent is ever
+cached, weights are re-uploaded and activations recomputed every call,
+so two elements sharing hidden-layer sizes but using different
+activations correctly share cached buffers and just pass different
+activation arguments per call.
+
+**Validated kernel-level first**, same discipline as everything else in
+this file. Generalized `gpu/gemm/nn_forward_gemm_test.cu` and
+`nn_dfdc_gemm_test.cu` (previously tanh-only) to loop over all 10
+activations against the real `nnp::NeuralNetwork` CPU class as ground
+truth -- not synthetic hand-rolled formulas, the actual class this port
+has to match. Softplus used real weight/G magnitudes from
+`Cu2S_PBE/scaling.data`; the other 8 (no real in-repo example) used
+weight/G ranges drawn from that same real dataset's scale rather than
+arbitrary values. All 10 activations PASS to ~1e-14 on both the forward
+(`dEdG`) and force-Jacobian (`dFdc`, exercises `d2fdx2`) paths.
+
+**Caught one real numerical artifact along the way, not a port bug.**
+`AF_EXP` initially failed catastrophically (`max|E_gemm-E_cpu|` ~1e229).
+Root cause: `AF_EXP` has no overflow clamp on the CPU side either
+(unlike LOGISTIC/SOFTPLUS's `EXP_LIMIT`) -- with the test's `[-1,1]`
+random weight init, two chained unclamped `exp()` layers overflow
+toward `double`'s range limit, where GPU and CPU `exp()` diverge at the
+ULP level and that gets amplified exponentially. Both implementations
+were doing the right thing; the random weights just aren't a
+numerically realistic point for this specific activation (no real
+trained network would survive to such weights -- the Kalman update
+would diverge to NaN long before). Fixed by scaling that one
+activation's test weights down (`×0.05`) to a regime a real optimizer
+could actually reach, not by adding a clamp neither implementation has.
+
+**End-to-end validation on the real softplus example.** Built CPU and
+GPU binaries from the same commit in a scratch worktree
+(`wt_activation_cu2s`), ran `examples/nnp-train/Cu2S_PBE` (2G, softplus
+hidden layers, 20 structures, 144 atoms/structure, 4 MPI ranks) for its
+full 10 configured epochs on both. `learning-curve.out` matches to
+~8 significant figures through epoch 5, then diverges the way every
+other GPU-vs-CPU comparison in this file already does past one full
+epoch (recursive Kalman-filter update, floating-point reduction-order
+sensitivity -- not a correctness issue, see the H2O_2G report's
+identical footnote), converging to the same order of magnitude by
+epoch 10 (`E_test` 1.65E-3 CPU vs 8.93E-4 GPU, both down from 1.11E+1
+at epoch 0). Confirms the softplus path is wired correctly, not just
+numerically correct in isolation.
+
+**Honest timing note, both directions.** Kernel-level (step above):
+all 10 activations landed within 0.048-0.055ms/call in the batched
+forward pass, no meaningful difference between tanh and any other
+activation -- confirms these are memory-bound elementwise kernels where
+the specific transcendental function is a rounding error, exactly as
+expected going in. End-to-end on `Cu2S_PBE`, though: GPU total training
+time was *slower* than CPU (37.5s vs 12.6s for the 10-epoch run) --
+expected and consistent with this file's own repeated finding that
+GPU dispatch needs enough problem size to amortize per-call overhead
+under MPS; `Cu2S_PBE` (20 structures, 144 atoms/structure, 4 ranks) is
+far below the ~1254-structure/630-atom scale this project's real wins
+were measured at. This generalization makes the softplus/relu/etc. path
+*available* and *correct* for smaller real datasets -- it doesn't by
+itself make GPU dispatch worth using at every scale, same caveat as
+always in this file.
