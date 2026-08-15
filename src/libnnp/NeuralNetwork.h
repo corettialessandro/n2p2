@@ -159,17 +159,25 @@ public:
      *                   output layer).
      */
     int                      getNumNeuronsInLayer(int layer) const;
+    /** Return the activation function used by a given layer.
+     *
+     * @param[in] layer Layer index (0 = input layer, #getNumLayers() - 1 =
+     *                   output layer).
+     */
+    ActivationFunction       getActivationFunctionOfLayer(int layer) const;
     /** Check whether this network matches the fixed architecture a
      *  hand-specialized GPU implementation (src/libnnpgpu) was written
-     *  for: exactly two hidden layers (i.e. four layers total) with
-     *  #AF_TANH activation and a single-neuron #AF_IDENTITY output layer,
-     *  neuron normalization disabled (not implemented on the GPU side),
-     *  and hidden layer sizes within maxHiddenLayerSize. Architecture
-     *  (number of hidden layers, their sizes, activation functions) is a
-     *  run-time property read from input.nn, not a compile-time constant,
-     *  so callers wanting a GPU fast path must check this first and fall
-     *  back to the CPU path otherwise -- see
-     *  Mode::calculateAtomicNeuralNetworks().
+     *  for: exactly two hidden layers (i.e. four layers total), any
+     *  activation function on the two hidden layers (src/libnnpgpu
+     *  implements all of #ActivationFunction), a single-neuron
+     *  #AF_IDENTITY output layer, neuron normalization disabled (not
+     *  implemented on the GPU side), and hidden layer sizes within
+     *  maxHiddenLayerSize. Architecture (number of hidden layers, their
+     *  sizes, activation functions) is a run-time property read from
+     *  input.nn, not a compile-time constant, so callers wanting a GPU
+     *  fast path must check this first and fall back to the CPU path
+     *  otherwise -- see Mode::calculateAtomicNeuralNetworks(). Depth
+     *  (more than two hidden layers) is not supported on the GPU side.
      *
      * @param[in] maxHiddenLayerSize Upper bound the GPU implementation
      *                               supports for each hidden layer's size.

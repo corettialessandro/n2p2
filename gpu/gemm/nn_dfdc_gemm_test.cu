@@ -63,6 +63,7 @@
 #include <string>
 #include <random>
 #include <algorithm>
+#include <functional>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
@@ -229,18 +230,97 @@ __global__ void nnDFdcKernel(
 
 // --- Elementwise kernels ---------------------------------------------------
 
-__global__ void biasTanhD2Kernel(const double* pre, const double* b,
-                                  int numAtoms, int width,
-                                  double* H, double* dfdx, double* d2fdx2)
+// --- Activation-function generalization (gpu-portability follow-up): see
+// nn_forward_gemm_test.cu's identical comment for the full rationale.
+// This is the D2 (value+dfdx+d2fdx2) counterpart needed by the
+// force-Jacobian pipeline below -- d2fdx2 is the piece the plain forward
+// pass (nn_forward_gemm_test.cu) never needed. Formulas ported verbatim
+// from NeuralNetwork::propagateLayer() (NeuralNetwork.cpp:785-919),
+// EXP_LIMIT=35.0 clamp on LOGISTIC/SOFTPLUS only. Ordinals match
+// NeuralNetwork::ActivationFunction's implicit declaration order. ---
+
+__device__ __forceinline__ void activationForwardD2(double x, int af,
+                                                      double& value,
+                                                      double& dfdx,
+                                                      double& d2fdx2)
+{
+    switch (af)
+    {
+        case 1: // AF_IDENTITY
+            value = x; dfdx = 1.0; d2fdx2 = 0.0;
+            break;
+        case 2: // AF_TANH
+        {
+            double h = tanh(x);
+            double dh = 1.0 - h * h;
+            value = h; dfdx = dh; d2fdx2 = -2.0 * h * dh;
+            break;
+        }
+        case 3: // AF_LOGISTIC
+            if (x > 35.0) { value = 1.0; dfdx = 0.0; d2fdx2 = 0.0; }
+            else if (x < -35.0) { value = 0.0; dfdx = 0.0; d2fdx2 = 0.0; }
+            else
+            {
+                double s = 1.0 / (1.0 + exp(-x));
+                value = s; dfdx = s * (1.0 - s);
+                d2fdx2 = s * (1.0 - s) * (1.0 - 2.0 * s);
+            }
+            break;
+        case 4: // AF_SOFTPLUS
+            if (x > 35.0) { value = x; dfdx = 1.0; d2fdx2 = 0.0; }
+            else if (x < -35.0) { value = 0.0; dfdx = 0.0; d2fdx2 = 0.0; }
+            else
+            {
+                double s = 1.0 / (1.0 + exp(-x));
+                value = log(1.0 + exp(x)); dfdx = s; d2fdx2 = s * (1.0 - s);
+            }
+            break;
+        case 5: // AF_RELU
+            if (x > 0.0) { value = x; dfdx = 1.0; d2fdx2 = 0.0; }
+            else { value = 0.0; dfdx = 0.0; d2fdx2 = 0.0; }
+            break;
+        case 6: // AF_GAUSSIAN
+        {
+            double e = exp(-0.5 * x * x);
+            value = e; dfdx = -x * e; d2fdx2 = (x * x - 1.0) * e;
+            break;
+        }
+        case 7: // AF_COS
+        {
+            double c = cos(x);
+            value = c; dfdx = -sin(x); d2fdx2 = -c;
+            break;
+        }
+        case 8: // AF_REVLOGISTIC
+        {
+            double s = 1.0 / (1.0 + exp(-x));
+            value = 1.0 - s; dfdx = s * (s - 1.0);
+            d2fdx2 = s * (s - 1.0) * (1.0 - 2.0 * s);
+            break;
+        }
+        case 9: // AF_EXP
+        {
+            double e = exp(-x);
+            value = e; dfdx = -e; d2fdx2 = e;
+            break;
+        }
+        case 10: // AF_HARMONIC
+            value = x * x; dfdx = 2.0 * x; d2fdx2 = 2.0;
+            break;
+        default:
+            value = x; dfdx = 1.0; d2fdx2 = 0.0;
+            break;
+    }
+}
+
+__global__ void biasActivationD2Kernel(const double* pre, const double* b,
+                                        int af, int numAtoms, int width,
+                                        double* H, double* dfdx, double* d2fdx2)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= numAtoms * width) return;
     int col = idx % width;
-    double h = tanh(pre[idx] + b[col]);
-    H[idx] = h;
-    double dh = 1.0 - h * h;
-    dfdx[idx] = dh;
-    d2fdx2[idx] = -2.0 * h * dh;
+    activationForwardD2(pre[idx] + b[col], af, H[idx], dfdx[idx], d2fdx2[idx]);
 }
 
 // out[atom,col] = A[atom,col] * row[col]  (row vector broadcast across atoms)
@@ -340,18 +420,29 @@ int main(int argc, char** argv)
 
     bool allOk = true;
 
-    auto runElement = [&](char const* label, int e, int numIn, unsigned seed)
+    auto runElement = [&](char const* label, int e, int numIn, unsigned seed,
+                          NeuralNetwork::ActivationFunction hiddenAf,
+                          int hiddenAfOrdinal)
     {
         printf("--- %s (numIn=%d) ---\n", label, numIn);
         int const numHidden1 = 25, numHidden2 = 25, numOut = 1, numLayers = 4;
         NeuralNetwork::ActivationFunction af[4] = {
-            NeuralNetwork::AF_IDENTITY, NeuralNetwork::AF_TANH,
-            NeuralNetwork::AF_TANH, NeuralNetwork::AF_IDENTITY};
+            NeuralNetwork::AF_IDENTITY, hiddenAf,
+            hiddenAf, NeuralNetwork::AF_IDENTITY};
         int layers[4] = {numIn, numHidden1, numHidden2, numOut};
         NeuralNetwork nn(numLayers, layers, af);
         nn.initializeConnectionsRandomUniform(seed);
         vector<double> conn(nn.getNumConnections());
         nn.getConnections(conn.data());
+        // See nn_forward_gemm_test.cu's identical comment: AF_EXP is
+        // unclamped on the CPU side too, and [-1,1] random weights overflow
+        // it through two chained exp() layers -- scale down so the test
+        // reflects a numerically realistic (trainable) regime.
+        if (hiddenAfOrdinal == 9) // AF_EXP
+        {
+            for (double& w : conn) w *= 0.05;
+            nn.setConnections(conn.data());
+        }
         size_t connCount = (size_t)nn.getNumConnections();
 
         size_t off = 0;
@@ -457,11 +548,11 @@ int main(int argc, char** argv)
             CUDA_CHECK(cudaMemset(d_dFdcGemm, 0, (size_t)numAtoms * connCount * sizeof(double)));
 
             gemmRowMajor(handle, numAtoms, numHidden1, numIn, d_G, d_W1, d_H1pre);
-            biasTanhD2Kernel<<<(numAtoms * numHidden1 + blk - 1) / blk, blk>>>(
-                d_H1pre, d_b1, numAtoms, numHidden1, d_H1, d_dfdx1, d_d2fdx2_1);
+            biasActivationD2Kernel<<<(numAtoms * numHidden1 + blk - 1) / blk, blk>>>(
+                d_H1pre, d_b1, hiddenAfOrdinal, numAtoms, numHidden1, d_H1, d_dfdx1, d_d2fdx2_1);
             gemmRowMajor(handle, numAtoms, numHidden2, numHidden1, d_H1, d_W2, d_H2pre);
-            biasTanhD2Kernel<<<(numAtoms * numHidden2 + blk - 1) / blk, blk>>>(
-                d_H2pre, d_b2, numAtoms, numHidden2, d_H2, d_dfdx2, d_d2fdx2_2);
+            biasActivationD2Kernel<<<(numAtoms * numHidden2 + blk - 1) / blk, blk>>>(
+                d_H2pre, d_b2, hiddenAfOrdinal, numAtoms, numHidden2, d_H2, d_dfdx2, d_d2fdx2_2);
 
             scaleByRowKernel<<<(numAtoms * numHidden2 + blk - 1) / blk, blk>>>(
                 d_dfdx2, d_W3, numAtoms, numHidden2, d_v2);
@@ -528,32 +619,49 @@ int main(int argc, char** argv)
         CUDA_CHECK(cudaMemcpy(dFdcGemm.data(), d_dFdcGemm, (size_t)numAtoms * connCount * sizeof(double), cudaMemcpyDeviceToHost));
 
         // --- One-thread-per-atom GPU reference ------------------------------
-        double* d_dFdcPerAtom;
-        CUDA_CHECK(cudaMalloc(&d_dFdcPerAtom, (size_t)numAtoms * connCount * sizeof(double)));
-        auto runPerAtomKernel = [&]()
+        // Hardcodes tanh() (nnCalculateDFdc/nnDFdcKernel above) -- only a
+        // valid second ground truth for AF_TANH, same reasoning as
+        // nn_forward_gemm_test.cu. The real NeuralNetwork::calculateDFdc()
+        // (already compared above) is the sole ground truth for every other
+        // activation.
+        bool const isTanh = (hiddenAfOrdinal == 2);
+        double maxErrPerAtom = 0.0;
+        float msGemm = 0.0f, msPerAtom = 0.0f;
+        double* d_dFdcPerAtom = nullptr;
+        std::function<void()> runPerAtomKernel;
+        if (isTanh)
         {
-            CUDA_CHECK(cudaMemset(d_dFdcPerAtom, 0, (size_t)numAtoms * connCount * sizeof(double)));
-            nnDFdcKernel<<<(numAtoms + blk - 1) / blk, blk>>>(
-                numAtoms, numIn, d_W1, d_b1, numHidden1, d_W2, d_b2, numHidden2,
-                d_W3, d_b3, numOut, d_G, d_dGdxyz, d_dFdcPerAtom, connCount);
-        };
-        runPerAtomKernel();
-        CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaMalloc(&d_dFdcPerAtom, (size_t)numAtoms * connCount * sizeof(double)));
+            runPerAtomKernel = [&]()
+            {
+                CUDA_CHECK(cudaMemset(d_dFdcPerAtom, 0, (size_t)numAtoms * connCount * sizeof(double)));
+                nnDFdcKernel<<<(numAtoms + blk - 1) / blk, blk>>>(
+                    numAtoms, numIn, d_W1, d_b1, numHidden1, d_W2, d_b2, numHidden2,
+                    d_W3, d_b3, numOut, d_G, d_dGdxyz, d_dFdcPerAtom, connCount);
+            };
+            runPerAtomKernel();
+            CUDA_CHECK(cudaDeviceSynchronize());
 
-        vector<double> dFdcPerAtom((size_t)numAtoms * connCount);
-        CUDA_CHECK(cudaMemcpy(dFdcPerAtom.data(), d_dFdcPerAtom, (size_t)numAtoms * connCount * sizeof(double), cudaMemcpyDeviceToHost));
+            vector<double> dFdcPerAtom((size_t)numAtoms * connCount);
+            CUDA_CHECK(cudaMemcpy(dFdcPerAtom.data(), d_dFdcPerAtom, (size_t)numAtoms * connCount * sizeof(double), cudaMemcpyDeviceToHost));
+            for (int t = 0; t < numAtoms; ++t)
+                for (size_t c = 0; c < connCount; ++c)
+                {
+                    size_t idx = (size_t)t * connCount + c;
+                    maxErrPerAtom = max(maxErrPerAtom, fabs(dFdcGemm[idx] - dFdcPerAtom[idx]));
+                }
+        }
 
-        double maxErrCpu = 0.0, maxErrPerAtom = 0.0;
+        double maxErrCpu = 0.0;
         for (int t = 0; t < numAtoms; ++t)
             for (size_t c = 0; c < connCount; ++c)
             {
                 size_t idx = (size_t)t * connCount + c;
                 maxErrCpu = max(maxErrCpu, fabs(dFdcGemm[idx] - dFdcCpu[t][c]));
-                maxErrPerAtom = max(maxErrPerAtom, fabs(dFdcGemm[idx] - dFdcPerAtom[idx]));
             }
         printf("  atoms=%d  connCount=%zu\n", numAtoms, connCount);
-        printf("  max|dFdc_gemm-dFdc_cpu|=%.3E max|dFdc_gemm-dFdc_perAtom|=%.3E\n",
-               maxErrCpu, maxErrPerAtom);
+        printf("  max|dFdc_gemm-dFdc_cpu|=%.3E\n", maxErrCpu);
+        if (isTanh) printf("  max|dFdc_gemm-dFdc_perAtom|=%.3E\n", maxErrPerAtom);
 
         int const reps = 100;
         cudaEvent_t t0, t1;
@@ -562,15 +670,22 @@ int main(int argc, char** argv)
         for (int r = 0; r < reps; ++r) runGemmPipeline();
         CUDA_CHECK(cudaEventRecord(t1));
         CUDA_CHECK(cudaEventSynchronize(t1));
-        float msGemm = 0.0f; CUDA_CHECK(cudaEventElapsedTime(&msGemm, t0, t1));
+        CUDA_CHECK(cudaEventElapsedTime(&msGemm, t0, t1));
 
-        CUDA_CHECK(cudaEventRecord(t0));
-        for (int r = 0; r < reps; ++r) runPerAtomKernel();
-        CUDA_CHECK(cudaEventRecord(t1));
-        CUDA_CHECK(cudaEventSynchronize(t1));
-        float msPerAtom = 0.0f; CUDA_CHECK(cudaEventElapsedTime(&msPerAtom, t0, t1));
-        printf("  timing (%d reps): gemm=%.4f ms/call, per-atom=%.4f ms/call (%.2fx)\n",
-               reps, msGemm / reps, msPerAtom / reps, msPerAtom / msGemm);
+        if (isTanh)
+        {
+            CUDA_CHECK(cudaEventRecord(t0));
+            for (int r = 0; r < reps; ++r) runPerAtomKernel();
+            CUDA_CHECK(cudaEventRecord(t1));
+            CUDA_CHECK(cudaEventSynchronize(t1));
+            CUDA_CHECK(cudaEventElapsedTime(&msPerAtom, t0, t1));
+            printf("  timing (%d reps): gemm=%.4f ms/call, per-atom=%.4f ms/call (%.2fx)\n",
+                   reps, msGemm / reps, msPerAtom / reps, msPerAtom / msGemm);
+        }
+        else
+        {
+            printf("  timing (%d reps): gemm=%.4f ms/call\n", reps, msGemm / reps);
+        }
 
         cudaEventDestroy(t0); cudaEventDestroy(t1);
         cudaFree(d_W1); cudaFree(d_b1); cudaFree(d_W2); cudaFree(d_b2);
@@ -581,15 +696,36 @@ int main(int argc, char** argv)
         cudaFree(d_u); cudaFree(d_dxdG2); cudaFree(d_tmp); cudaFree(d_jacBH2);
         cudaFree(d_jacW3); cudaFree(d_T); cudaFree(d_term1); cudaFree(d_term2);
         cudaFree(d_jacBH1); cudaFree(d_P); cudaFree(d_Q2); cudaFree(d_Gscaled);
-        cudaFree(d_dFdcGemm); cudaFree(d_dFdcPerAtom);
+        cudaFree(d_dFdcGemm);
+        if (isTanh) cudaFree(d_dFdcPerAtom);
 
-        bool pass = maxErrCpu < 1e-9 && maxErrPerAtom < 1e-9;
+        bool pass = maxErrCpu < 1e-9;
+        if (isTanh) pass = pass && maxErrPerAtom < 1e-9;
         printf("  %s\n\n", pass ? "PASS" : "FAIL");
         return pass;
     };
 
-    allOk &= runElement("H short-range NN", H, 35, 44);
-    allOk &= runElement("O short-range NN", O, 42, 45);
+    struct AfCase { char const* name; NeuralNetwork::ActivationFunction af; int ordinal; };
+    AfCase const afCases[] = {
+        {"identity",    NeuralNetwork::AF_IDENTITY,    1},
+        {"tanh",        NeuralNetwork::AF_TANH,        2},
+        {"logistic",    NeuralNetwork::AF_LOGISTIC,    3},
+        {"softplus",    NeuralNetwork::AF_SOFTPLUS,    4},
+        {"relu",        NeuralNetwork::AF_RELU,        5},
+        {"gaussian",    NeuralNetwork::AF_GAUSSIAN,    6},
+        {"cos",         NeuralNetwork::AF_COS,         7},
+        {"revlogistic", NeuralNetwork::AF_REVLOGISTIC, 8},
+        {"exp",         NeuralNetwork::AF_EXP,         9},
+        {"harmonic",    NeuralNetwork::AF_HARMONIC,   10},
+    };
+    for (auto const& c : afCases)
+    {
+        char label[64];
+        snprintf(label, sizeof(label), "H short-range NN [%s]", c.name);
+        allOk &= runElement(label, H, 35, 44, c.af, c.ordinal);
+    }
+    allOk &= runElement("O short-range NN [softplus]", O, 42, 45,
+                         NeuralNetwork::AF_SOFTPLUS, 4);
 
     cublasDestroy(handle);
     printf("%s\n", allOk ? "ALL PASS" : "SOME FAILED");
