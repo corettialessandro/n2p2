@@ -2630,6 +2630,10 @@ void Training::update(string const& property)
                             int const numIn = nn.getNumNeuronsInLayer(0);
                             int const numHidden1 = nn.getNumNeuronsInLayer(1);
                             int const numHidden2 = nn.getNumNeuronsInLayer(2);
+                            int const activation1 =
+                                (int)nn.getActivationFunctionOfLayer(1);
+                            int const activation2 =
+                                (int)nn.getActivationFunctionOfLayer(2);
 
                             vector<double> connections(nn.getNumConnections());
                             nn.getConnections(connections.data());
@@ -2645,7 +2649,8 @@ void Training::update(string const& property)
 
                             vector<double> energyOut(numAtoms);
                             gpuNnEnergyDEdcSum(numAtoms, numIn, numHidden1,
-                                               numHidden2, connections.data(),
+                                               numHidden2, activation1,
+                                               activation2, connections.data(),
                                                G.data(), energyOut.data(),
                                                dXdc.at(e).data());
 
@@ -2808,6 +2813,10 @@ void Training::update(string const& property)
                             int const numIn = nn.getNumNeuronsInLayer(0);
                             int const numHidden1 = nn.getNumNeuronsInLayer(1);
                             int const numHidden2 = nn.getNumNeuronsInLayer(2);
+                            int const activation1 =
+                                (int)nn.getActivationFunctionOfLayer(1);
+                            int const activation2 =
+                                (int)nn.getActivationFunctionOfLayer(2);
 
                             vector<double> connections(nn.getNumConnections());
                             nn.getConnections(connections.data());
@@ -2834,7 +2843,8 @@ void Training::update(string const& property)
                             vector<double> energyOut(numAtoms);
                             vector<double> dEdGOut((size_t)numAtoms * numIn);
                             gpuNnForceDFdcSum(numAtoms, numIn, numHidden1,
-                                              numHidden2, connections.data(),
+                                              numHidden2, activation1,
+                                              activation2, connections.data(),
                                               G.data(), dGdxyz.data(),
                                               energyOut.data(),
                                               dEdGOut.data(),

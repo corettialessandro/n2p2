@@ -23,13 +23,27 @@ namespace nnp
  *  real datasets configure hidden layer sizes via input.nn, see
  *  NeuralNetwork::hasGpuCompatibleArchitecture()). Callers MUST check
  *  hasGpuCompatibleArchitecture() on the network first -- this function
- *  assumes exactly two tanh hidden layers and a single-neuron identity
- *  output layer without checking again.
+ *  assumes exactly two hidden layers and a single-neuron identity output
+ *  layer without checking again (any of NeuralNetwork::ActivationFunction's
+ *  10 activations is supported on the two hidden layers, see activation1/
+ *  activation2 below; depth beyond two hidden layers is not supported).
  *
  * @param[in]  numAtoms Number of atoms (all of the same element).
  * @param[in]  numIn Number of symmetry functions / input neurons.
  * @param[in]  numHidden1 Size of the first hidden layer.
  * @param[in]  numHidden2 Size of the second hidden layer.
+ * @param[in]  activation1 First hidden layer's activation function --
+ *             MUST match NeuralNetwork::ActivationFunction's enum ordinal
+ *             (implicit declaration order, NeuralNetwork.h: AF_IDENTITY=1,
+ *             AF_TANH=2, AF_LOGISTIC=3, AF_SOFTPLUS=4, AF_RELU=5,
+ *             AF_GAUSSIAN=6, AF_COS=7, AF_REVLOGISTIC=8, AF_EXP=9,
+ *             AF_HARMONIC=10; AF_UNSET=0 is never valid here). This header
+ *             deliberately doesn't include NeuralNetwork.h (see file
+ *             header), so callers pass e.g.
+ *             (int)nn.getActivationFunctionOfLayer(1).
+ * @param[in]  activation2 Second hidden layer's activation function, same
+ *             ordinal convention as activation1 -- independent of it (a
+ *             network may mix activations across its two hidden layers).
  * @param[in]  connections Flat connections array, same order as
  *             NeuralNetwork::getConnections() ([W1,b1,W2,b2,W3,b3]).
  * @param[in]  G Symmetry function values, (numAtoms x numIn) row-major
@@ -40,6 +54,7 @@ namespace nnp
  *             function, (numAtoms x numIn) row-major, same layout as G.
  */
 void gpuNnForwardDEdG(int numAtoms, int numIn, int numHidden1, int numHidden2,
+                      int activation1, int activation2,
                       double const* connections,
                       double const* G, double* energyOut, double* dEdGOut);
 
@@ -59,6 +74,10 @@ void gpuNnForwardDEdG(int numAtoms, int numIn, int numHidden1, int numHidden2,
  * @param[in]  numIn Number of symmetry functions / input neurons.
  * @param[in]  numHidden1 Size of the first hidden layer.
  * @param[in]  numHidden2 Size of the second hidden layer.
+ * @param[in]  activation1 First hidden layer's activation function -- see
+ *             gpuNnForwardDEdG()'s doc comment for the ordinal convention.
+ * @param[in]  activation2 Second hidden layer's activation function, same
+ *             convention as activation1.
  * @param[in]  connections Flat connections array, same order as
  *             NeuralNetwork::getConnections() ([W1,b1,W2,b2,W3,b3]).
  * @param[in]  G Symmetry function values, (numAtoms x numIn) row-major.
@@ -68,6 +87,7 @@ void gpuNnForwardDEdG(int numAtoms, int numIn, int numHidden1, int numHidden2,
  *             length as NeuralNetwork::getNumConnections().
  */
 void gpuNnEnergyDEdcSum(int numAtoms, int numIn, int numHidden1, int numHidden2,
+                        int activation1, int activation2,
                         double const* connections,
                         double const* G, double* energyOut, double* dEdcSumOut);
 
@@ -94,6 +114,10 @@ void gpuNnEnergyDEdcSum(int numAtoms, int numIn, int numHidden1, int numHidden2,
  * @param[in]  numIn Number of symmetry functions / input neurons.
  * @param[in]  numHidden1 Size of the first hidden layer.
  * @param[in]  numHidden2 Size of the second hidden layer.
+ * @param[in]  activation1 First hidden layer's activation function -- see
+ *             gpuNnForwardDEdG()'s doc comment for the ordinal convention.
+ * @param[in]  activation2 Second hidden layer's activation function, same
+ *             convention as activation1.
  * @param[in]  connections Flat connections array, same order as
  *             NeuralNetwork::getConnections() ([W1,b1,W2,b2,W3,b3]).
  * @param[in]  G Symmetry function values, (numAtoms x numIn) row-major.
@@ -111,6 +135,7 @@ void gpuNnEnergyDEdcSum(int numAtoms, int numIn, int numHidden1, int numHidden2,
  *             length as NeuralNetwork::getNumConnections().
  */
 void gpuNnForceDFdcSum(int numAtoms, int numIn, int numHidden1, int numHidden2,
+                       int activation1, int activation2,
                        double const* connections,
                        double const* G, double const* dGdxyz,
                        double* energyOut, double* dEdGOut, double* dFdcSumOut);

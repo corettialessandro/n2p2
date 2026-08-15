@@ -98,15 +98,175 @@ void gemmRowMajor(cublasHandle_t handle, int m, int n, int k,
                              n, m, k, &alpha, B, n, A, k, &beta, C, n));
 }
 
-__global__ void biasTanhKernel(double const* pre, double const* b,
-                                int numAtoms, int width, double* H, double* dfdx)
+// Activation-function generalization (gpu-portability follow-up): originally
+// hardcoded tanh() here and below (formerly biasTanhKernel/biasTanhD2Kernel,
+// now biasActivationKernel/biasActivationD2Kernel) -- the only two
+// tanh-specific spots in this whole file, everything else (the GEMMs,
+// elementwise mul/add, transpose, scale-by-row/col) was always
+// activation-agnostic. Validated first in gpu/gemm/nn_forward_gemm_test.cu
+// and nn_dfdc_gemm_test.cu (all 10 activations, against the real
+// NeuralNetwork CPU class, ~1e-14) before landing here -- these two
+// __device__ helpers are ported verbatim from that validation. Formulas
+// match NeuralNetwork::propagateLayer() (NeuralNetwork.cpp:785-919)
+// bit-for-bit, including the EXP_LIMIT=35.0 overflow clamp on LOGISTIC/
+// SOFTPLUS only (NeuralNetwork.cpp:25) -- no clamp added for the other
+// activations beyond what the CPU reference itself has. `af` ordinals
+// must match NeuralNetwork::ActivationFunction's implicit declaration
+// order (NeuralNetwork.h:32-55; AF_UNSET=0 is never passed) -- this file
+// deliberately doesn't include NeuralNetwork.h (see file header), so the
+// mapping is documented here rather than shared via the enum type itself.
+// `af` is uniform across every thread in one kernel launch (a plain
+// function parameter, not per-thread data), so the switch below costs a
+// predictable branch, not warp divergence.
+__device__ __forceinline__ void activationForward(double x, int af,
+                                                    double& value,
+                                                    double& dfdx)
+{
+    switch (af)
+    {
+        case 1: // AF_IDENTITY
+            value = x; dfdx = 1.0;
+            break;
+        case 2: // AF_TANH
+        {
+            double h = tanh(x);
+            value = h; dfdx = 1.0 - h * h;
+            break;
+        }
+        case 3: // AF_LOGISTIC
+            if (x > 35.0) { value = 1.0; dfdx = 0.0; }
+            else if (x < -35.0) { value = 0.0; dfdx = 0.0; }
+            else
+            {
+                double s = 1.0 / (1.0 + exp(-x));
+                value = s; dfdx = s * (1.0 - s);
+            }
+            break;
+        case 4: // AF_SOFTPLUS
+            if (x > 35.0) { value = x; dfdx = 1.0; }
+            else if (x < -35.0) { value = 0.0; dfdx = 0.0; }
+            else
+            {
+                value = log(1.0 + exp(x));
+                dfdx = 1.0 / (1.0 + exp(-x));
+            }
+            break;
+        case 5: // AF_RELU
+            if (x > 0.0) { value = x; dfdx = 1.0; }
+            else { value = 0.0; dfdx = 0.0; }
+            break;
+        case 6: // AF_GAUSSIAN
+        {
+            double e = exp(-0.5 * x * x);
+            value = e; dfdx = -x * e;
+            break;
+        }
+        case 7: // AF_COS
+            value = cos(x); dfdx = -sin(x);
+            break;
+        case 8: // AF_REVLOGISTIC
+        {
+            double s = 1.0 / (1.0 + exp(-x));
+            value = 1.0 - s; dfdx = s * (s - 1.0);
+            break;
+        }
+        case 9: // AF_EXP
+        {
+            double e = exp(-x);
+            value = e; dfdx = -e;
+            break;
+        }
+        case 10: // AF_HARMONIC
+            value = x * x; dfdx = 2.0 * x;
+            break;
+        default:
+            value = x; dfdx = 1.0;
+            break;
+    }
+}
+
+__device__ __forceinline__ void activationForwardD2(double x, int af,
+                                                      double& value,
+                                                      double& dfdx,
+                                                      double& d2fdx2)
+{
+    switch (af)
+    {
+        case 1: // AF_IDENTITY
+            value = x; dfdx = 1.0; d2fdx2 = 0.0;
+            break;
+        case 2: // AF_TANH
+        {
+            double h = tanh(x);
+            double dh = 1.0 - h * h;
+            value = h; dfdx = dh; d2fdx2 = -2.0 * h * dh;
+            break;
+        }
+        case 3: // AF_LOGISTIC
+            if (x > 35.0) { value = 1.0; dfdx = 0.0; d2fdx2 = 0.0; }
+            else if (x < -35.0) { value = 0.0; dfdx = 0.0; d2fdx2 = 0.0; }
+            else
+            {
+                double s = 1.0 / (1.0 + exp(-x));
+                value = s; dfdx = s * (1.0 - s);
+                d2fdx2 = s * (1.0 - s) * (1.0 - 2.0 * s);
+            }
+            break;
+        case 4: // AF_SOFTPLUS
+            if (x > 35.0) { value = x; dfdx = 1.0; d2fdx2 = 0.0; }
+            else if (x < -35.0) { value = 0.0; dfdx = 0.0; d2fdx2 = 0.0; }
+            else
+            {
+                double s = 1.0 / (1.0 + exp(-x));
+                value = log(1.0 + exp(x)); dfdx = s; d2fdx2 = s * (1.0 - s);
+            }
+            break;
+        case 5: // AF_RELU
+            if (x > 0.0) { value = x; dfdx = 1.0; d2fdx2 = 0.0; }
+            else { value = 0.0; dfdx = 0.0; d2fdx2 = 0.0; }
+            break;
+        case 6: // AF_GAUSSIAN
+        {
+            double e = exp(-0.5 * x * x);
+            value = e; dfdx = -x * e; d2fdx2 = (x * x - 1.0) * e;
+            break;
+        }
+        case 7: // AF_COS
+        {
+            double c = cos(x);
+            value = c; dfdx = -sin(x); d2fdx2 = -c;
+            break;
+        }
+        case 8: // AF_REVLOGISTIC
+        {
+            double s = 1.0 / (1.0 + exp(-x));
+            value = 1.0 - s; dfdx = s * (s - 1.0);
+            d2fdx2 = s * (s - 1.0) * (1.0 - 2.0 * s);
+            break;
+        }
+        case 9: // AF_EXP
+        {
+            double e = exp(-x);
+            value = e; dfdx = -e; d2fdx2 = e;
+            break;
+        }
+        case 10: // AF_HARMONIC
+            value = x * x; dfdx = 2.0 * x; d2fdx2 = 2.0;
+            break;
+        default:
+            value = x; dfdx = 1.0; d2fdx2 = 0.0;
+            break;
+    }
+}
+
+__global__ void biasActivationKernel(double const* pre, double const* b,
+                                      int af, int numAtoms, int width,
+                                      double* H, double* dfdx)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= numAtoms * width) return;
     int col = idx % width;
-    double h = tanh(pre[idx] + b[col]);
-    H[idx] = h;
-    dfdx[idx] = 1.0 - h * h;
+    activationForward(pre[idx] + b[col], af, H[idx], dfdx[idx]);
 }
 
 __global__ void addOutputBiasKernel(double const* pre, double b3,
@@ -166,18 +326,14 @@ void gemmRowMajorATransB(cublasHandle_t handle, int m, int n, int k,
     gemmRowMajorATransBAcc(handle, m, n, k, 1.0, A, B, 0.0, C);
 }
 
-__global__ void biasTanhD2Kernel(double const* pre, double const* b,
-                                  int numAtoms, int width,
-                                  double* H, double* dfdx, double* d2fdx2)
+__global__ void biasActivationD2Kernel(double const* pre, double const* b,
+                                        int af, int numAtoms, int width,
+                                        double* H, double* dfdx, double* d2fdx2)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= numAtoms * width) return;
     int col = idx % width;
-    double h = tanh(pre[idx] + b[col]);
-    H[idx] = h;
-    double dh = 1.0 - h * h;
-    dfdx[idx] = dh;
-    d2fdx2[idx] = -2.0 * h * dh;
+    activationForwardD2(pre[idx] + b[col], af, H[idx], dfdx[idx], d2fdx2[idx]);
 }
 
 __global__ void elementwiseAddKernel(double const* a, double const* b, int n, double* out)
@@ -222,7 +378,14 @@ __global__ void transposeKernel(double const* in, int numAtoms, int width, doubl
 // the exact same triple, they'd correctly share one state too (every call
 // fully overwrites the weight buffers before use, and n2p2 doesn't call
 // these functions concurrently across elements), just without a
-// performance-irrelevant separate allocation.
+// performance-irrelevant separate allocation. Deliberately does NOT
+// include activation1/activation2 (gpu-portability follow-up): nothing
+// activation-dependent is ever cached in GpuNnForward/Energy/ForceState
+// below, it's threaded through purely as a per-call function parameter,
+// same as it flows on the CPU side. Two elements sharing a triple but
+// using different activations (e.g. both 15/15 hidden layers, one tanh
+// one softplus) correctly share the cached buffers and just pass
+// different activation arguments each call.
 using ArchKey = std::tuple<int, int, int>;
 
 void hostTransposeW1(double const* W1, int numIn, int numHidden1, double* W1T)
@@ -476,6 +639,7 @@ namespace nnp
 {
 
 void gpuNnForwardDEdG(int numAtoms, int numIn, int numHidden1, int numHidden2,
+                      int activation1, int activation2,
                       double const* connections,
                       double const* G, double* energyOut, double* dEdGOut)
 {
@@ -507,12 +671,12 @@ void gpuNnForwardDEdG(int numAtoms, int numIn, int numHidden1, int numHidden2,
     int const blk = 256;
 
     gemmRowMajor(handle, numAtoms, numHidden1, numIn, s.d_G, s.d_W1, s.d_H1pre);
-    biasTanhKernel<<<(numAtoms * numHidden1 + blk - 1) / blk, blk>>>(
-        s.d_H1pre, s.d_b1, numAtoms, numHidden1, s.d_H1, s.d_dfdx1);
+    biasActivationKernel<<<(numAtoms * numHidden1 + blk - 1) / blk, blk>>>(
+        s.d_H1pre, s.d_b1, activation1, numAtoms, numHidden1, s.d_H1, s.d_dfdx1);
 
     gemmRowMajor(handle, numAtoms, numHidden2, numHidden1, s.d_H1, s.d_W2, s.d_H2pre);
-    biasTanhKernel<<<(numAtoms * numHidden2 + blk - 1) / blk, blk>>>(
-        s.d_H2pre, s.d_b2, numAtoms, numHidden2, s.d_H2, s.d_dfdx2);
+    biasActivationKernel<<<(numAtoms * numHidden2 + blk - 1) / blk, blk>>>(
+        s.d_H2pre, s.d_b2, activation2, numAtoms, numHidden2, s.d_H2, s.d_dfdx2);
 
     gemmRowMajor(handle, numAtoms, numOut, numHidden2, s.d_H2, s.d_W3, s.d_outPre);
     addOutputBiasKernel<<<(numAtoms + blk - 1) / blk, blk>>>(s.d_outPre, b3, numAtoms, s.d_energy);
@@ -532,6 +696,7 @@ void gpuNnForwardDEdG(int numAtoms, int numIn, int numHidden1, int numHidden2,
 }
 
 void gpuNnEnergyDEdcSum(int numAtoms, int numIn, int numHidden1, int numHidden2,
+                        int activation1, int activation2,
                         double const* connections,
                         double const* G, double* energyOut, double* dEdcSumOut)
 {
@@ -572,12 +737,12 @@ void gpuNnEnergyDEdcSum(int numAtoms, int numIn, int numHidden1, int numHidden2,
     fillOnesKernel<<<(numAtoms + blk - 1) / blk, blk>>>(s.d_ones, numAtoms);
 
     gemmRowMajor(handle, numAtoms, numHidden1, numIn, s.d_G, s.d_W1, s.d_H1pre);
-    biasTanhKernel<<<(numAtoms * numHidden1 + blk - 1) / blk, blk>>>(
-        s.d_H1pre, s.d_b1, numAtoms, numHidden1, s.d_H1, s.d_dfdx1);
+    biasActivationKernel<<<(numAtoms * numHidden1 + blk - 1) / blk, blk>>>(
+        s.d_H1pre, s.d_b1, activation1, numAtoms, numHidden1, s.d_H1, s.d_dfdx1);
 
     gemmRowMajor(handle, numAtoms, numHidden2, numHidden1, s.d_H1, s.d_W2, s.d_H2pre);
-    biasTanhKernel<<<(numAtoms * numHidden2 + blk - 1) / blk, blk>>>(
-        s.d_H2pre, s.d_b2, numAtoms, numHidden2, s.d_H2, s.d_dfdx2);
+    biasActivationKernel<<<(numAtoms * numHidden2 + blk - 1) / blk, blk>>>(
+        s.d_H2pre, s.d_b2, activation2, numAtoms, numHidden2, s.d_H2, s.d_dfdx2);
 
     gemmRowMajor(handle, numAtoms, numOut, numHidden2, s.d_H2, s.d_W3, s.d_outPre);
     addOutputBiasKernel<<<(numAtoms + blk - 1) / blk, blk>>>(s.d_outPre, b3, numAtoms, s.d_energy);
@@ -617,6 +782,7 @@ void gpuNnEnergyDEdcSum(int numAtoms, int numIn, int numHidden1, int numHidden2,
 }
 
 void gpuNnForceDFdcSum(int numAtoms, int numIn, int numHidden1, int numHidden2,
+                       int activation1, int activation2,
                        double const* connections,
                        double const* G, double const* dGdxyz,
                        double* energyOut, double* dEdGOut, double* dFdcSumOut)
@@ -661,12 +827,12 @@ void gpuNnForceDFdcSum(int numAtoms, int numIn, int numHidden1, int numHidden2,
 
     // --- Precompute once, batched over atoms, no k0 dependence yet -------
     gemmRowMajor(handle, numAtoms, numHidden1, numIn, s.d_G, s.d_W1, s.d_H1pre);
-    biasTanhD2Kernel<<<(numAtoms * numHidden1 + blk - 1) / blk, blk>>>(
-        s.d_H1pre, s.d_b1, numAtoms, numHidden1, s.d_H1, s.d_dfdx1, s.d_d2fdx2_1);
+    biasActivationD2Kernel<<<(numAtoms * numHidden1 + blk - 1) / blk, blk>>>(
+        s.d_H1pre, s.d_b1, activation1, numAtoms, numHidden1, s.d_H1, s.d_dfdx1, s.d_d2fdx2_1);
 
     gemmRowMajor(handle, numAtoms, numHidden2, numHidden1, s.d_H1, s.d_W2, s.d_H2pre);
-    biasTanhD2Kernel<<<(numAtoms * numHidden2 + blk - 1) / blk, blk>>>(
-        s.d_H2pre, s.d_b2, numAtoms, numHidden2, s.d_H2, s.d_dfdx2, s.d_d2fdx2_2);
+    biasActivationD2Kernel<<<(numAtoms * numHidden2 + blk - 1) / blk, blk>>>(
+        s.d_H2pre, s.d_b2, activation2, numAtoms, numHidden2, s.d_H2, s.d_dfdx2, s.d_d2fdx2_2);
 
     gemmRowMajor(handle, numAtoms, numOut, numHidden2, s.d_H2, s.d_W3, s.d_outPre);
     addOutputBiasKernel<<<(numAtoms + blk - 1) / blk, blk>>>(s.d_outPre, b3, numAtoms, s.d_energy);

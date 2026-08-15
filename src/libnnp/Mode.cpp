@@ -1732,8 +1732,9 @@ void Mode::calculateAtomicNeuralNetworks(Structure& structure,
         // (the same math, generalized to whatever hidden-layer sizes this
         // dataset's input.nn actually configures). Falls back to the exact
         // CPU loop below, atom by atom, if ANY element's network doesn't
-        // match the fixed architecture (two tanh hidden layers, single
-        // identity output neuron) src/libnnpgpu was hand-specialized for --
+        // match the fixed architecture (two hidden layers of any
+        // supported activation, single identity output neuron)
+        // src/libnnpgpu was hand-specialized for --
         // see NeuralNetwork::hasGpuCompatibleArchitecture()'s doc comment
         // for why that's a real run-time possibility, not a formality.
         bool allElementsGpuCompatible = true;
@@ -1765,6 +1766,8 @@ void Mode::calculateAtomicNeuralNetworks(Structure& structure,
                 int const numIn = nn.getNumNeuronsInLayer(0);
                 int const numHidden1 = nn.getNumNeuronsInLayer(1);
                 int const numHidden2 = nn.getNumNeuronsInLayer(2);
+                int const activation1 = (int)nn.getActivationFunctionOfLayer(1);
+                int const activation2 = (int)nn.getActivationFunctionOfLayer(2);
 
                 vector<double> connections(nn.getNumConnections());
                 nn.getConnections(connections.data());
@@ -1779,6 +1782,7 @@ void Mode::calculateAtomicNeuralNetworks(Structure& structure,
                 vector<double> energyOut(numAtoms);
                 vector<double> dEdGOut((size_t)numAtoms * numIn);
                 gpuNnForwardDEdG(numAtoms, numIn, numHidden1, numHidden2,
+                                 activation1, activation2,
                                  connections.data(), G.data(),
                                  energyOut.data(), dEdGOut.data());
 
@@ -1863,6 +1867,8 @@ void Mode::calculateAtomicNeuralNetworks(Structure& structure,
                     int const numIn = nn.getNumNeuronsInLayer(0);
                     int const numHidden1 = nn.getNumNeuronsInLayer(1);
                     int const numHidden2 = nn.getNumNeuronsInLayer(2);
+                    int const activation1 = (int)nn.getActivationFunctionOfLayer(1);
+                    int const activation2 = (int)nn.getActivationFunctionOfLayer(2);
 
                     vector<double> connections(nn.getNumConnections());
                     nn.getConnections(connections.data());
@@ -1878,6 +1884,7 @@ void Mode::calculateAtomicNeuralNetworks(Structure& structure,
                     vector<double> chiOut(numAtoms);
                     vector<double> dChidGOut((size_t)numAtoms * numIn);
                     gpuNnForwardDEdG(numAtoms, numIn, numHidden1, numHidden2,
+                                     activation1, activation2,
                                      connections.data(), G.data(),
                                      chiOut.data(), dChidGOut.data());
 
@@ -1978,6 +1985,8 @@ void Mode::calculateAtomicNeuralNetworks(Structure& structure,
                     int const numIn = nn.getNumNeuronsInLayer(0);
                     int const numHidden1 = nn.getNumNeuronsInLayer(1);
                     int const numHidden2 = nn.getNumNeuronsInLayer(2);
+                    int const activation1 = (int)nn.getActivationFunctionOfLayer(1);
+                    int const activation2 = (int)nn.getActivationFunctionOfLayer(2);
 
                     vector<double> connections(nn.getNumConnections());
                     nn.getConnections(connections.data());
@@ -1994,6 +2003,7 @@ void Mode::calculateAtomicNeuralNetworks(Structure& structure,
                     vector<double> energyOut(numAtoms);
                     vector<double> dEdGOut((size_t)numAtoms * numIn);
                     gpuNnForwardDEdG(numAtoms, numIn, numHidden1, numHidden2,
+                                     activation1, activation2,
                                      connections.data(), G.data(),
                                      energyOut.data(), dEdGOut.data());
 
