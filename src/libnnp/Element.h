@@ -232,6 +232,20 @@ public:
      * @return #symmetryFunctionGroups
      */
     std::vector<SymGrp*> const& getSymmetryFunctionGroups() const;
+    /** Check whether this element's symmetry function groups are ones
+     *  the GPU dispatch (GpuSymmetryFunction.h) supports.
+     *
+     * @return `True` if every one of this element's symmetry function
+     *         groups is a SymGrpExpRad (type 2) or SymGrpExpAngn (type 3)
+     *         using the CT_TANHU cutoff function -- the only symmetry
+     *         function types and cutoff this project's real datasets
+     *         have needed so far (H2O_2G uses exclusively these two).
+     *         `False` otherwise, in which case callers must fall back to
+     *         the CPU path -- see Mode::calculateSymmetryFunctionGroups().
+     *         Mirrors NeuralNetwork::hasGpuCompatibleArchitecture()'s role
+     *         for the NN forward-pass GPU dispatch.
+     */
+    bool                     hasGpuCompatibleSymmetryFunctions() const;
 #ifndef N2P2_NO_SF_CACHE
     /** Set cache indices for all symmetry functions of this element.
      *

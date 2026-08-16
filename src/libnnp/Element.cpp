@@ -459,6 +459,20 @@ void Element::calculateSymmetryFunctionGroups(Atom&      atom,
     return;
 }
 
+bool Element::hasGpuCompatibleSymmetryFunctions() const
+{
+    for (SymGrp* g : symmetryFunctionGroups)
+    {
+        size_t const type = g->getType();
+        if (type != 2 && type != 3) return false;
+
+        SymGrpBaseCutoff const* gc = dynamic_cast<SymGrpBaseCutoff const*>(g);
+        if (gc->getCutoffType() != CutoffFunction::CT_TANHU) return false;
+    }
+
+    return true;
+}
+
 size_t Element::updateSymmetryFunctionStatistics(Atom const& atom)
 {
     size_t countExtrapolationWarnings = 0;

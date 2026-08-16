@@ -22,6 +22,11 @@
 #include "GpuNeuralNetwork.h"
 #include "GpuForces.h"
 #include "GpuElecForces.h"
+#include "GpuSymmetryFunction.h"
+#include "SymGrp.h"
+#include "SymGrpBaseCutoff.h"
+#include "SymFncExpRad.h"
+#include "SymFncBaseExpAng.h"
 #endif
 #include <cmath>
 #ifdef _OPENMP
@@ -1642,6 +1647,35 @@ void Mode::calculateSymmetryFunctionGroups(Structure& structure,
     if (structure.hasSymmetryFunctionDerivatives) return;
     if (structure.hasSymmetryFunctions && !derivatives) return;
 
+#ifdef N2P2_GPU
+    // Phase 5 (soft-percolating-jellyfish.md): GPU dispatch for symmetry-
+    // function evaluation, on top of the NN forward-pass GPU dispatch
+    // already in calculateAtomicNeuralNetworks() above. Motivated by
+    // Stopwatch profiling of a real LAMMPS MD run showing this function at
+    // ~95% of per-timestep cost -- unlike nnp-train, where
+    // memorize_symfunc_results caches symmetry functions across epochs on
+    // a fixed dataset, LAMMPS recomputes them from scratch every single
+    // timestep since atoms move, so this is a much larger fraction of the
+    // real per-call cost here than it ever was for training. Same
+    // all-or-nothing-per-structure gate shape as the NN dispatch: falls
+    // back to the exact CPU loop below, per atom, if ANY element's
+    // symmetry function groups aren't ones GpuSymmetryFunction.h supports
+    // (SymGrpExpRad/SymGrpExpAngn with CT_TANHU cutoff -- see
+    // Element::hasGpuCompatibleSymmetryFunctions()'s doc comment for why
+    // that's a real run-time possibility, not a formality: only 2 of 11
+    // symmetry-function types are covered so far, ported because they're
+    // the only ones this project's real datasets have used).
+    bool allElementsGpuCompatibleSF = true;
+    for (size_t e = 0; e < elements.size(); ++e)
+    {
+        if (!elements.at(e).hasGpuCompatibleSymmetryFunctions())
+        {
+            allElementsGpuCompatibleSF = false;
+            break;
+        }
+    }
+#endif
+
     Atom* a = NULL;
     Element* e = NULL;
 #ifdef _OPENMP
@@ -1689,13 +1723,193 @@ void Mode::calculateSymmetryFunctionGroups(Structure& structure,
         // Allocate symmetry function data vectors in atom.
         a->allocate(derivatives, maxCutoffRadius);
 
-        // Calculate symmetry functions (and derivatives).
+        // Calculate symmetry functions (and derivatives) -- unless the GPU
+        // batch pass below will handle this element instead.
+#ifdef N2P2_GPU
+        if (!allElementsGpuCompatibleSF)
+        {
+            e->calculateSymmetryFunctionGroups(*a, derivatives);
+        }
+#else
         e->calculateSymmetryFunctionGroups(*a, derivatives);
+#endif
 
         // Remember that symmetry functions of this atom have been calculated.
         a->hasSymmetryFunctions = true;
         if (derivatives) a->hasSymmetryFunctionDerivatives = true;
     }
+
+#ifdef N2P2_GPU
+    if (allElementsGpuCompatibleSF)
+    {
+        // Group atoms by element (mirrors calculateAtomicNeuralNetworks()'s
+        // atomsByElement pattern above), then dispatch one GPU call per
+        // (element, symmetry function group) pair -- one call per
+        // SymGrpExpRad/SymGrpExpAngn instance an element owns, since
+        // different groups can have different neighbor-element filters
+        // (H2O_2G's H atoms, for instance, have two separate SymGrpExpRad
+        // groups, one per neighbor-element filter).
+        vector<vector<size_t>> atomsByElement(elements.size());
+        for (size_t i = 0; i < structure.atoms.size(); ++i)
+        {
+            atomsByElement.at(structure.atoms.at(i).element).push_back(i);
+        }
+
+        for (size_t ei = 0; ei < elements.size(); ++ei)
+        {
+            Element& elem = elements.at(ei);
+            vector<size_t> const& atomIdx = atomsByElement.at(ei);
+            if (atomIdx.empty()) continue;
+            int const numAtoms = (int)atomIdx.size();
+
+            for (SymGrp* g : elem.getSymmetryFunctionGroups())
+            {
+                size_t const type = g->getType();
+                SymGrpBaseCutoff* gc = dynamic_cast<SymGrpBaseCutoff*>(g);
+                double const rc = gc->getRc();
+                vector<size_t> const& memberIdx = g->getMemberIndices();
+                int const numMembers = (int)memberIdx.size();
+
+                // Flat neighbor CSR for this element's atoms, filtered to
+                // this group's cutoff, preserving each atom's own
+                // neighbor order (so neighbor-slot results below scatter
+                // back onto the matching Atom::Neighbor::dGdr by
+                // position) -- same construction validated in
+                // gpu/e2e_symfnc_check/symfnc_e2e_check.cpp.
+                vector<int> neighOffset(numAtoms + 1, 0);
+                for (int t = 0; t < numAtoms; ++t)
+                {
+                    Atom const& at = structure.atoms.at(atomIdx.at(t));
+                    int cnt = 0;
+                    for (auto const& n : at.neighbors) if (n.d < rc) ++cnt;
+                    neighOffset.at(t + 1) = neighOffset.at(t) + cnt;
+                }
+                int const totalNeigh = neighOffset.at(numAtoms);
+                vector<int> neighElem(totalNeigh);
+                vector<double> neighDist(totalNeigh), neighDx(totalNeigh),
+                               neighDy(totalNeigh), neighDz(totalNeigh);
+                vector<size_t> neighRealIdx(totalNeigh);
+                for (int t = 0; t < numAtoms; ++t)
+                {
+                    Atom const& at = structure.atoms.at(atomIdx.at(t));
+                    int k = neighOffset.at(t);
+                    for (size_t j = 0; j < at.neighbors.size(); ++j)
+                    {
+                        Atom::Neighbor const& n = at.neighbors.at(j);
+                        if (n.d < rc)
+                        {
+                            neighElem.at(k)     = (int)n.element;
+                            neighDist.at(k)     = n.d;
+                            neighDx.at(k)       = n.dr[0];
+                            neighDy.at(k)       = n.dr[1];
+                            neighDz.at(k)       = n.dr[2];
+                            neighRealIdx.at(k)  = j;
+                            ++k;
+                        }
+                    }
+                }
+
+                vector<double> G((size_t)numAtoms * numMembers, 0.0);
+                vector<double> dGdx(G.size(), 0.0), dGdy(G.size(), 0.0),
+                               dGdz(G.size(), 0.0);
+                vector<double> neighborDGdx((size_t)totalNeigh * numMembers, 0.0);
+                vector<double> neighborDGdy(neighborDGdx.size(), 0.0);
+                vector<double> neighborDGdz(neighborDGdx.size(), 0.0);
+
+                if (type == 2)
+                {
+                    SymFncExpRad const& first = dynamic_cast<SymFncExpRad const&>(
+                        elem.getSymmetryFunction(memberIdx.at(0)));
+                    int const e1 = (int)first.getE1();
+                    vector<double> eta(numMembers), rs(numMembers);
+                    for (int m = 0; m < numMembers; ++m)
+                    {
+                        SymFncExpRad const& sf = dynamic_cast<SymFncExpRad const&>(
+                            elem.getSymmetryFunction(memberIdx.at(m)));
+                        eta.at(m) = sf.getEta();
+                        rs.at(m)  = sf.getRs();
+                    }
+                    gpuSfExpRadGroup(numAtoms, neighOffset.data(), neighElem.data(),
+                                     neighDist.data(), neighDx.data(), neighDy.data(),
+                                     neighDz.data(), e1, rc, numMembers,
+                                     eta.data(), rs.data(),
+                                     G.data(), dGdx.data(), dGdy.data(), dGdz.data(),
+                                     neighborDGdx.data(), neighborDGdy.data(),
+                                     neighborDGdz.data());
+                }
+                else // type == 3
+                {
+                    vector<int> e1(numMembers), e2(numMembers);
+                    vector<double> eta(numMembers), lambda(numMembers), zeta(numMembers);
+                    for (int m = 0; m < numMembers; ++m)
+                    {
+                        SymFncBaseExpAng const& sf = dynamic_cast<SymFncBaseExpAng const&>(
+                            elem.getSymmetryFunction(memberIdx.at(m)));
+                        e1.at(m) = (int)sf.getE1();
+                        e2.at(m) = (int)sf.getE2();
+                        eta.at(m) = sf.getEta();
+                        lambda.at(m) = sf.getLambda();
+                        zeta.at(m) = sf.getZeta();
+                    }
+                    gpuSfExpAngnGroup(numAtoms, neighOffset.data(), neighElem.data(),
+                                      neighDist.data(), neighDx.data(), neighDy.data(),
+                                      neighDz.data(), rc, numMembers,
+                                      e1.data(), e2.data(), eta.data(), lambda.data(),
+                                      zeta.data(),
+                                      G.data(), dGdx.data(), dGdy.data(), dGdz.data(),
+                                      neighborDGdx.data(), neighborDGdy.data(),
+                                      neighborDGdz.data());
+                }
+
+                // Scatter results: apply the real production
+                // scale()/getScalingFactor() (not reimplemented on GPU --
+                // see GpuSymmetryFunction.h's doc comment), write into
+                // Atom::G/dGdr (owner) and Atom::Neighbor::dGdr
+                // (neighbor-side, requires N2P2_FULL_SFD_MEMORY so the
+                // global symmetry-function index is used directly).
+                for (int t = 0; t < numAtoms; ++t)
+                {
+                    Atom& at = structure.atoms.at(atomIdx.at(t));
+                    for (int m = 0; m < numMembers; ++m)
+                    {
+                        SymFnc const& sf = elem.getSymmetryFunction(memberIdx.at(m));
+                        size_t const gIdx = (size_t)t * numMembers + m;
+                        size_t const globalIdx = memberIdx.at(m);
+                        at.G.at(globalIdx) = sf.scale(G.at(gIdx));
+                        if (derivatives)
+                        {
+                            double const sfac = sf.getScalingFactor();
+                            at.dGdr.at(globalIdx)[0] = sfac * dGdx.at(gIdx);
+                            at.dGdr.at(globalIdx)[1] = sfac * dGdy.at(gIdx);
+                            at.dGdr.at(globalIdx)[2] = sfac * dGdz.at(gIdx);
+                        }
+                    }
+
+                    if (derivatives)
+                    {
+                        int const off = neighOffset.at(t);
+                        int const nCount = neighOffset.at(t + 1) - off;
+                        for (int jLocal = 0; jLocal < nCount; ++jLocal)
+                        {
+                            size_t const realJ = neighRealIdx.at(off + jLocal);
+                            Atom::Neighbor& n = at.neighbors.at(realJ);
+                            for (int m = 0; m < numMembers; ++m)
+                            {
+                                SymFnc const& sf = elem.getSymmetryFunction(memberIdx.at(m));
+                                double const sfac = sf.getScalingFactor();
+                                size_t const idx = (size_t)(off + jLocal) * numMembers + m;
+                                size_t const globalIdx = memberIdx.at(m);
+                                n.dGdr.at(globalIdx)[0] = sfac * neighborDGdx.at(idx);
+                                n.dGdr.at(globalIdx)[1] = sfac * neighborDGdy.at(idx);
+                                n.dGdr.at(globalIdx)[2] = sfac * neighborDGdz.at(idx);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+#endif
 
     // If requested, check extrapolation warnings or update statistics.
     // Needed to shift this out of the loop above to make it thread-safe.

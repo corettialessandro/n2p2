@@ -53,10 +53,19 @@ ARFLAGS=$(PROJECT_ARFLAGS)
 INCLUDES=-I./ -I$(PROJECT_EIGEN)
 
 # GPU acceleration: Mode.cpp's #ifdef N2P2_GPU branch needs both the define
-# and to find GpuNeuralNetwork.h (src/libnnpgpu is not otherwise on the
-# include path since it's a separate, nvcc-built library).
+# and to find GpuNeuralNetwork.h/GpuSymmetryFunction.h (src/libnnpgpu is
+# not otherwise on the include path since it's a separate, nvcc-built
+# library). -DN2P2_FULL_SFD_MEMORY is required by the symmetry-function
+# GPU dispatch (Mode::calculateSymmetryFunctionGroups()'s GPU path) --
+# it writes Atom::Neighbor::dGdr indexed by global symmetry-function
+# index directly, which is only correct under the full (uncompacted)
+# memory layout; auto-adding it here (rather than expecting callers to
+# remember a second flag) means GPU=1 alone still fully controls the
+# build, same as every other GPU toggle in this project. Costs ~30-50%
+# more memory for that one array (confirmed via n2p2's own docs to never
+# change results, negligible at this project's real dataset scales).
 ifeq ($(GPU), 1)
-OPTIONS+= -DN2P2_GPU
+OPTIONS+= -DN2P2_GPU -DN2P2_FULL_SFD_MEMORY
 INCLUDES+= -I$(PROJECT_DIR)/src/libnnpgpu
 endif
 
