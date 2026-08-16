@@ -227,6 +227,11 @@ public:
      * @return Symmetry function object.
      */
     SymFnc const&            getSymmetryFunction(std::size_t index) const;
+    /** Get all symmetry function group instances of this element.
+     *
+     * @return #symmetryFunctionGroups
+     */
+    std::vector<SymGrp*> const& getSymmetryFunctionGroups() const;
 #ifndef N2P2_NO_SF_CACHE
     /** Set cache indices for all symmetry functions of this element.
      *
@@ -359,6 +364,11 @@ inline SymFnc const& Element::getSymmetryFunction(
                                                        std::size_t index) const
 {
     return *(symmetryFunctions.at(index));
+}
+
+inline std::vector<SymGrp*> const& Element::getSymmetryFunctionGroups() const
+{
+    return symmetryFunctionGroups;
 }
 
 }

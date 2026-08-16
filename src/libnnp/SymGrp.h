@@ -97,6 +97,10 @@ public:
     /** Get private #ec member variable.
      */
     std::size_t  getEc() const;
+    /** Get private #memberIndex member variable (global symmetry-function
+     *  index of each member, in group order).
+     */
+    std::vector<std::size_t> const& getMemberIndices() const;
 
 protected:
     typedef std::map<std::string,
@@ -184,6 +188,11 @@ inline void SymGrp::setIndex(size_t index)
 inline std::size_t SymGrp::getIndex() const { return index; }
 inline std::size_t SymGrp::getType() const { return type; }
 inline std::size_t SymGrp::getEc() const { return ec; }
+
+inline std::vector<std::size_t> const& SymGrp::getMemberIndices() const
+{
+    return memberIndex;
+}
 
 }
 
