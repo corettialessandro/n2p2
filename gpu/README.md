@@ -4138,3 +4138,49 @@ ratio at any given rank count, giving a cleaner and more representative
 read closer to what a real production MD run's economics would actually
 look like. Deferred, not urgent -- to be run once Phase 5 (or whatever
 else is worth a comprehensive final validation) is far enough along.
+
+### Follow-up: Stopwatch profiling confirms it -- symmetry functions are ~95% of the per-timestep cost, NN evaluation only ~3.3%
+
+Phase 5 step 1, attempt 3 (after `perf`'s dead end above): manual
+`Stopwatch` instrumentation, mirroring `Training.cpp`'s `_err`/`_com`/
+`_upd` pattern exactly. Added three temporary timers to
+`InterfaceLammps` (`swProfile["sf"]`/`["nn"]`/`["forces"]`, wrapping
+`calculateSymmetryFunctionGroups()`, `calculateAtomicNeuralNetworks()`,
+and `getForces()` respectively), printed to stderr every 500 calls to
+`process()`. One bug caught and fixed along the way: the header edit
+initially dropped the class's closing `};`, producing a cascading
+"extra qualification"/Eigen-template pile of unrelated-looking errors
+downstream -- not a `perf`-style environment issue this time, just a
+missed brace, fixed by re-adding it.
+
+Single-rank, 2000-step H2O_2G run (CPU, Booster), 4 printouts across
+the run, remarkably stable throughout:
+
+| Calls | SF | NN | Forces |
+|---|---|---|---|
+| 500 | 169.10s (94.87%) | 5.85s (3.28%) | 3.29s (1.84%) |
+| 1000 | 337.67s (94.85%) | 11.72s (3.29%) | 6.60s (1.86%) |
+| 1500 | 506.73s (94.84%) | 17.61s (3.30%) | 9.95s (1.86%) |
+| **2000** | **676.36s (94.84%)** | **23.49s (3.29%)** | **13.30s (1.87%)** |
+
+Sums to 713.15s against LAMMPS's own reported "Pair" bucket of 730.82s
+for the same run (~17.7s/2.4% unaccounted, presumably other overhead in
+`process()`/`PairHDNNP::compute()` not wrapped by these three timers) --
+close enough to trust the split.
+
+**This is a much more decisive confirmation than the earlier indirect
+reasoning** (CPU-vs-GPU converging at 32 ranks). It directly answers
+the question the whole Phase 5 motivation was built on: symmetry-function
+evaluation is ~95% of the real per-timestep cost, not just "the likely
+dominant piece" -- NN evaluation (the part already GPU-accelerated) is
+capped at ~3.3% of the total, meaning the existing GPU port's ceiling on
+this workload was always going to be small, exactly as observed (1.4%
+at matched Booster hardware). Force assembly, despite being flagged as
+the single largest cost for `nnp-train` (46.5% there), is only ~1.9%
+here -- a reminder that these fractions are workload-shape-dependent,
+not universal constants, and confirming this directly rather than
+assuming it carried over was the right call.
+
+Instrumentation reverted after collecting this data -- it was marked
+temporary in the code from the start, not meant to become permanent
+production logging.
