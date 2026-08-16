@@ -4072,3 +4072,69 @@ symmetry functions' exponential radial/angular terms). Not pursuing
 call sites in `Mode.cpp` (matching the pattern `Training.cpp` already
 uses for its `_err`/`_com`/`_upd` buckets) is the likely next attempt,
 since it doesn't depend on `perf`'s symbol resolution working at all.
+
+### Follow-up: why DCGP loses to Booster for this MD case, when it consistently won for `nnp-train` -- not a contradiction, a different bottleneck
+
+Fair question raised: this file has repeatedly shown DCGP CPU beating
+Booster CPU for `nnp-train`, sometimes decisively even at matched core
+count (see the earlier "DCGP CPU, 32 cores (same core count, newer
+silicon)... 14.1x" entry). So why did the DCGP-112 production run above
+come in slowest of the three? Checked directly rather than assumed.
+
+**Compilation ruled out.** A dedicated check job on each partition
+(`lscpu`, `mpicxx --version`, `gcc --version`) confirmed identical
+toolchain: GCC 12.2.0 (Spack), OpenMPI 4.1.6, same modules on both.
+Both CPU `lmp_mpi` binaries were freshly, natively rebuilt on their own
+partition (`-march=native` requires this -- see the earlier
+cross-partition `.o`-file cleanup notes), so this isn't a stale-binary
+artifact either.
+
+**Hardware topology is the real answer, and it's stark:**
+
+| | DCGP | Booster |
+|---|---|---|
+| CPU | Xeon Platinum 8480+ (Sapphire Rapids) | Xeon Platinum 8358 (Ice Lake) |
+| Sockets | 2 | 1 |
+| NUMA nodes | **8** (14 cores/domain) | **2** (16 cores/domain) |
+
+DCGP's cores are individually newer/faster -- that's exactly why it
+still wins `nnp-train` at matched core count. But `nnp-train`'s
+communication is one large `MPI_Gatherv`/`Allgatherv` of the weight
+Jacobian **once per mini-batch update** -- infrequent, throughput-bound,
+so DCGP's per-core speed advantage comes through cleanly. LAMMPS/MD on
+this 630-atom system exchanges small ghost-atom messages **every single
+timestep** -- frequent, latency-bound -- and crossing DCGP's 2 sockets
+and up to 8 NUMA domains costs real, repeated latency that Booster's
+much tighter single-socket/2-NUMA layout doesn't pay.
+
+**Matched-rank-count scan confirms it's not close, and not a crossover
+effect** (`gpu/lammps_e2e/scan_cpu_booster_ranks.slurm`, companion to
+the DCGP scan, same 2000-step H2O_2G case):
+
+| Ranks | DCGP loop time | Booster loop time | Booster advantage |
+|---|---|---|---|
+| 4 | 527.0s | 194.1s | 2.7x |
+| 8 | 278.5s | 104.0s | 2.7x |
+| 16 | 152.0s | 55.8s | 2.7x |
+| 32 | 85.5s | 35.1s | 2.4x |
+
+Booster wins by a remarkably *consistent* ~2.5-2.7x at every rank count
+tested -- not DCGP-catches-up-eventually, a persistent gap. Even DCGP's
+full 112-core node (43.6s, scaled from the production run) never
+catches Booster's 32 cores (35.1s) -- DCGP's 3.5x core-count advantage
+isn't enough to overcome the per-message latency penalty on this
+workload.
+
+**Conclusion**: not a contradiction -- `nnp-train` is compute-throughput-
+bound (DCGP wins), this small 630-atom MD case is communication-
+latency-bound (Booster wins). A small system spread across many ranks
+is close to a worst case for exposing NUMA/topology latency, precisely
+because there's so little compute per rank to amortize communication
+against. **This is why the 8640-atom `examples/interface-LAMMPS/H2O_RPBE-D3`
+case is designated the final check** (Phase 6, plan doc) before drawing
+any final conclusion about GPU-vs-CPU or DCGP-vs-Booster for this
+project -- a larger system should have a much better compute-to-comm
+ratio at any given rank count, giving a cleaner and more representative
+read closer to what a real production MD run's economics would actually
+look like. Deferred, not urgent -- to be run once Phase 5 (or whatever
+else is worth a comprehensive final validation) is far enough along.
