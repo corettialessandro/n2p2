@@ -71,9 +71,38 @@ int main(int argc, char** argv)
     TestPrediction p;
     p.setup();
     p.readStructureFromFile((dir + "/input.data").c_str());
-    p.predict();
 
+    // Deliberately NOT calling p.predict(): this input.nn has unit
+    // normalization active (mean_energy/conv_energy/conv_length all set,
+    // confirmed by grep), and predict() converts back to physical units
+    // (structure.toPhysicalUnits()) *after* evaluateNNP() -- calling it
+    // would leave a window where re-reading Atom::neighbors afterward
+    // risks a units mismatch against the G/dGdr that were actually
+    // computed in normalized-unit space. Instead, replicate
+    // Mode::evaluateNNP()'s own sequence up to (and stopping at) symmetry
+    // functions -- calculateNeighborList() then
+    // calculateSymmetryFunctionGroups() -- so Atom::G/dGdr/neighbors are
+    // read in exactly the coordinate space they were computed in, no
+    // conversion round-trip involved at all.
     Structure& structure = p.structure;
+
+    // rc per SymGrp is already in whatever units this model was trained
+    // in (read directly from input.nn, never itself re-normalized) --
+    // take the max across every group this harness will test to size one
+    // neighbor list covering all of them, same as evaluateNNP() does with
+    // its own maxCutoffRadius.
+    double maxRc = 0.0;
+    for (size_t e = 0; e < p.elements.size(); ++e)
+    {
+        for (SymGrp* g : p.elements.at(e).getSymmetryFunctionGroups())
+        {
+            if (g->getType() != 2 && g->getType() != 3) continue;
+            SymGrpBaseCutoff* gc = dynamic_cast<SymGrpBaseCutoff*>(g);
+            maxRc = max(maxRc, gc->getRc());
+        }
+    }
+    structure.calculateNeighborList(maxRc, false);
+    p.calculateSymmetryFunctionGroups(structure, true);
     printf("Structure: %zu atoms, %zu elements\n", structure.atoms.size(),
            p.elements.size());
 
