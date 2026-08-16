@@ -1,0 +1,8 @@
+# Run outputs (LAMMPS build tree lives in $SCRATCH, not here -- but logs,
+# dumps and slurm stdout/stderr from these scripts land in this directory)
+# are large and reproducible from the scripts here -- not tracked in git.
+*.out
+*.err
+log.*
+dump.*
+*.lammpstrj
