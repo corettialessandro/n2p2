@@ -3919,3 +3919,114 @@ were measured at. This generalization makes the softplus/relu/etc. path
 *available* and *correct* for smaller real datasets -- it doesn't by
 itself make GPU dispatch worth using at every scale, same caveat as
 always in this file.
+
+### Follow-up: ported the LAMMPS interface (2G) to GPU -- turned out to be a link-flag fix, not new code, and the honest performance story has a real twist
+
+New, separate phase (`gpu/lammps_e2e/`, plan at
+`soft-percolating-jellyfish.md`): n2p2 ships a LAMMPS pair style
+(`pair_style hdnnp`, the ML-HDNNP package) for running MD with
+n2p2-trained potentials. Goal: get it GPU-accelerated, 2G first.
+
+**Two findings up front.** (1) LAMMPS's own built-in `PKG_GPU` package
+does not cover custom/external pair styles like `hdnnp` -- confirmed via
+LAMMPS's own docs -- so building it would add zero acceleration here;
+the only real axis is CPU-vs-GPU inside n2p2's own interface code, not
+"LAMMPS's GPU build" as a separate thing. (2) `InterfaceLammps`
+(`src/libnnpif/LAMMPS/InterfaceLammps.cpp`) is `class InterfaceLammps :
+public Mode`, and its `process()` (what `pair_hdnnp::compute()` calls
+every timestep) calls `calculateAtomicNeuralNetworks()` directly -- the
+exact same GPU-dispatch-gated method the `nnp-train` port already built
+and validated. `InterfaceLammps::getForces()` is a pure CPU reduction
+over `atom->dEdG`/`atom->dGdr`, already backend-agnostic. So **no new
+kernel code was needed** -- porting this was a build/link task: get
+LAMMPS's generated `Makefile.lammps-extra` (produced by
+`src/libnnpif/makefile`'s `lammps-mf` rule) to also carry
+`-lnnpgpu`/CUDA link flags when `GPU=1`, mirroring the existing pattern
+in `application/makefile`. Also fixed a real, unrelated gap hit along
+the way: `hdnnp_SYSINC` never carried the Eigen include path, so LAMMPS's
+own compile of `pair_hdnnp.cpp` failed to find `Eigen/Core` on any
+system without Eigen installed system-wide (this cluster included).
+
+**Built LAMMPS from the official stable tarball**
+(`download.lammps.org/tars/lammps-stable.tar.gz`, `22Jul2025`) via its
+own recommended package/make path (`make yes-ml-hdnnp && make lib-hdnnp
+args="-p n2p2_devel" && make mpi`), not n2p2's own discouraged dev-build
+script -- the ML-HDNNP package is already upstream in stock LAMMPS,
+unmodified, so nothing from `src/interface/LAMMPS/` needed copying in.
+
+**Correctness validated before any performance claim**, same rule as
+every prior GPU step here: GPU-linked `lmp_mpi` reproduced a CPU
+2000-step H2O_2G run's thermo trajectory (temperature, potential energy)
+*exactly* (`0.0` max diff) at every one of 21 printed steps, with
+per-atom forces matching to `1e-10` across all dumped frames.
+
+**Honest performance story -- and it depends entirely on what CPU
+config you compare against.** A 4-config rank/GPU-count scan on Booster
+(2000-step H2O_2G, 630 atoms) found:
+
+| Config | Pair time (2000 steps) | Loop time |
+|---|---|---|
+| 4 ranks / 1 GPU | 174.4s | 186.4s |
+| 8 ranks / 2 GPU | 88.5s | 99.5s |
+| 16 ranks / 4 GPU | 45.3s | 55.6s |
+| **32 ranks / 4 GPU (8/GPU)** | **25.1s** | **34.6s** |
+
+32/4 (matching the `nnp-train` MPS precedent exactly) won, Comm share
+rising with rank count (6%->27%) but never overtaking the Pair-time
+gain. So far this looks like the familiar "GPU wins, scale it up"
+story -- except a same-hardware CPU comparison at the same 32 ranks
+(no GPU) measured **25.45s Pair / 35.06s loop**, essentially tied with
+GPU's 25.1s/34.6s. The earlier "2.8x GPU win" (4-rank comparison) was
+really "GPU beats a lightly-parallel CPU run," not "GPU beats CPU at
+full node utilization."
+
+Full 200000-step production runs confirmed this holds at scale, plus a
+third data point requested to separate hardware from rank-count effects:
+
+| Config | Ranks | Loop time | Pair (% total) | Comm (% total) |
+|---|---|---|---|---|
+| CPU, DCGP | 112 | 4356s (1:12:36) | 2231s (51%) | 2110s (48%) |
+| GPU, Booster | 32 (4 GPU, 8/GPU) | 3462s (0:57:43) | 2490s (72%) | 955s (28%) |
+| CPU, Booster | 32 (no GPU) | 3510s (0:58:29) | 2503s (71%) | 990s (28%) |
+
+DCGP-112 -- despite 3.5x more ranks than either Booster config -- is the
+*slowest* of the three: 630 atoms split 112 ways is badly
+over-decomposed, and Comm balloons to 48% of wall-clock, erasing the
+extra parallelism (its Pair time alone, 2231s, is genuinely the smallest
+of the three, consistent with finer-grained decomposition -- Comm is
+what sinks it). On matched Booster hardware, GPU beats CPU by only
+**1.4%** (3462s vs 3510s) -- Pair time itself is nearly identical
+(2490s vs 2503s, ~0.5% apart). All three runs' thermo statistics agree
+(mean temp 299.3-300.1K against the 300K NVT target, mean PotEng
+-105.3 to -105.6) -- exact trajectory agreement isn't expected or
+checked for at this length (chaotic MD trajectory, same reasoning as
+every long-run comparison in this file), just statistical consistency.
+
+**Why the GPU edge is so small here, and the real next target.** The
+NN-forward GPU dispatch this reuses is only part of what LAMMPS's "Pair"
+bucket measures. `InterfaceLammps::process()` calls
+`calculateSymmetryFunctionGroups()` *before*
+`calculateAtomicNeuralNetworks()` -- confirmed zero `N2P2_GPU`
+references in either symmetry-function evaluation function
+(`Mode::calculateSymmetryFunctions`/`calculateSymmetryFunctionGroups`,
+~40 `SymFnc*`/`SymGrp*` classes) -- entirely CPU-only, same cost for
+both the CPU and GPU `lmp_mpi` builds. `GPU_PORTING_PLAN.md`'s Phase 0
+profiling measured this at only ~4.1% of `nnp-train`'s wall-clock and
+deprioritized it on that basis -- but that profiling run's `input.nn`
+had `memorize_symfunc_results` active, which caches symmetry-function
+results across epochs since training revisits the same fixed structures
+repeatedly; the 4.1% figure is the *amortized*, near-free-after-epoch-1
+cost. LAMMPS/MD has no such luxury -- atoms move every timestep, so
+every symmetry function and derivative is recomputed from scratch, in
+full, every single step, with nothing to memorize. That's the leading
+(not yet profiled) explanation for why CPU and GPU converge to the same
+Pair time at 32 ranks: both pay the same unamortized SF cost, and only
+a shrinking NN slice actually differs. Real prototype CUDA kernels for
+symmetry functions already exist and were never wired into production
+(`gpu/soa/symfnc_exprad_soa_test.cu`, `gpu/soa/symfnc_exprad_group_test.cu`,
+`gpu/soa/symfnc_expangn_group_test.cu`, `gpu/smoke/symfnc_exprad_test.cu`,
+`gpu/smoke/symfnc_family_test.cu`) -- this is the planned next phase
+(Phase 5 in the plan doc), starting with a real `perf` profile of the
+MD case to confirm the SF-vs-NN-vs-Comm split before implementing
+anything, same "measure before assuming" discipline as every phase in
+this file.
