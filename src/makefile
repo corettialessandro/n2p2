@@ -160,7 +160,7 @@ clean-libnnptrain:
 # libnnpif #
 ############
 libnnpif: libnnp
-	cd $@ && $(MAKE) COMP=$(COMP) MODE=$(MODE) INTERFACES="$(INTERFACES)"
+	cd $@ && $(MAKE) COMP=$(COMP) MODE=$(MODE) INTERFACES="$(INTERFACES)" GPU=$(GPU)
 
 clean-libnnpif: LIBDIR=$(subst clean-,,$@)
 clean-libnnpif:

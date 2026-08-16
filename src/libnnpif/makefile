@@ -19,6 +19,16 @@ COMP=gnu
 # Possible modes are "static", "shared" and "test".
 MODE=static
 
+# GPU acceleration (src/libnnpgpu), off by default -- set GPU=1 on the make
+# command line. Needed here (not just in libnnp/application) so that when
+# this library is consumed by an external build (e.g. LAMMPS's ML-HDNNP
+# package, via the generated lib/Makefile.lammps-extra below) that final
+# link also gets libnnpgpu.a + the CUDA link flags -- libnnp.a built with
+# GPU=1 has unresolved references to gpuNnForwardDEdG() etc. that are only
+# resolved at whichever binary's final link step (see application/makefile
+# for the same pattern applied to our own nnp-* binaries).
+GPU=
+
 # Include global (project-wide) settings.
 include $(PROJECT_DIR)/src/makefile.$(COMP)
 
@@ -110,7 +120,11 @@ lammps-prep: lammps-mf lammps-cmake
 lammps-mf:
 	cp LAMMPS/Makefile.lammps $(PROJECT_LIB)/Makefile.lammps-extra
 	@sed -i.bak -E "s,(hdnnp_SYSINC =).*,\1 $(LAMMPS_OPTIONS) -I$(PROJECT_EIGEN)," $(PROJECT_LIB)/Makefile.lammps-extra
+ifeq ($(GPU), 1)
+	@sed -i.bak -E "s,(hdnnp_SYSLIB =.*),\1 $(PROJECT_LDFLAGS_BLAS) -lnnpgpu $(PROJECT_LDFLAGS_GPU)," $(PROJECT_LIB)/Makefile.lammps-extra
+else
 	@sed -i.bak -E "s,(hdnnp_SYSLIB =.*),\1 $(PROJECT_LDFLAGS_BLAS)," $(PROJECT_LIB)/Makefile.lammps-extra
+endif
 	@rm $(PROJECT_LIB)/Makefile.lammps-extra.bak
 
 lammps-cmake:
