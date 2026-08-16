@@ -35,6 +35,7 @@ public:
     CutoffFunction::CutoffType getCutoffType() const;
 
 protected:
+
     /// Cutoff radius @f$r_c@f$ (common feature).
     double                     rc;
     /// Cutoff function parameter @f$\alpha@f$ (common feature).
@@ -53,6 +54,11 @@ protected:
      */
     SymGrpBaseCutoff(std::size_t type, ElementMap const& elementMap);
 };
+
+inline double SymGrpBaseCutoff::getRc() const
+{
+    return rc;
+}
 
 inline CutoffFunction::CutoffType SymGrpBaseCutoff::getCutoffType() const
 {

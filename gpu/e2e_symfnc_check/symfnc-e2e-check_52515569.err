@@ -1,0 +1,28 @@
+Loading cuda/12.2
+  Loading requirement: libiconv/1.17-nhc3mhm xz/5.4.6-xxxg42c
+    zlib-ng/2.1.6-jkgunjc libxml2/2.10.3-zbbe7lm
+Structure.cpp: In member function ‘void nnp::Structure::calculateDQdr(const std::vector<long unsigned int>&, const std::vector<long unsigned int>&, double, const std::vector<nnp::Element>&)’:
+Structure.cpp:1290:57: warning: unused parameter ‘elements’ [-Wunused-parameter]
+                                 vector<Element> const&  elements)
+                                 ~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~
+Atom.cpp: In member function ‘nnp::Vec3D nnp::Atom::calculatePairForceShort(const nnp::Atom::Neighbor&, const std::vector<std::vector<long unsigned int> >*) const’:
+Atom.cpp:384:65: warning: unused parameter ‘tableFull’ [-Wunused-parameter]
+                                     vector<vector<size_t> >
+                                     ~~~~~~~~~~~~~~~~~~~~~~~      
+                                     const *const                tableFull) const
+                                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~
+Atom.cpp: In member function ‘nnp::Vec3D nnp::Atom::calculateDChidr(size_t, double, const std::vector<std::vector<long unsigned int> >*) const’:
+Atom.cpp:406:66: warning: unused parameter ‘tableFull’ [-Wunused-parameter]
+                             vector<vector<size_t> > const *const tableFull) const
+                             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~
+symfnc_e2e_check.o: In function `main':
+symfnc_e2e_check.cpp:(.text.startup+0x317): undefined reference to `nnp::SymGrpBaseCutoff::getRc() const'
+libnnpgpu.a(GpuQeqSolver.o): In function `nnp::(anonymous namespace)::handle()':
+tmpxft_0029e4dc_00000000-6_GpuQeqSolver.cudafe1.cpp:(.text+0x17f): undefined reference to `cusolverDnCreate'
+libnnpgpu.a(GpuQeqSolver.o): In function `nnp::(anonymous namespace)::ensureFactorBuffers(nnp::(anonymous namespace)::QeqState&, int)':
+tmpxft_0029e4dc_00000000-6_GpuQeqSolver.cudafe1.cpp:(.text+0x469): undefined reference to `cusolverDnDgetrf_bufferSize'
+libnnpgpu.a(GpuQeqSolver.o): In function `nnp::gpuQeqSolve(unsigned long, int, int, double const*, double*)':
+tmpxft_0029e4dc_00000000-6_GpuQeqSolver.cudafe1.cpp:(.text+0x1453): undefined reference to `cusolverDnDgetrs'
+libnnpgpu.a(GpuQeqSolver.o): In function `nnp::gpuQeqFactorize(unsigned long, int, double const*)':
+tmpxft_0029e4dc_00000000-6_GpuQeqSolver.cudafe1.cpp:(.text+0x2057): undefined reference to `cusolverDnDgetrf'
+collect2: error: ld returned 1 exit status
