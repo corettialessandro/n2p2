@@ -1,0 +1,10 @@
+# Staged potential files, built libraries/binaries, and slurm job logs --
+# large, regenerable from the scripts in this directory -- not tracked.
+input.nn
+scaling.data
+weights.*.data
+*.a
+*.o
+symfnc_e2e_check
+*.out
+*.err
