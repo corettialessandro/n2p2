@@ -4030,3 +4030,45 @@ symmetry functions already exist and were never wired into production
 MD case to confirm the SF-vs-NN-vs-Comm split before implementing
 anything, same "measure before assuming" discipline as every phase in
 this file.
+
+### Follow-up: DCGP core-count scaling scan (112 is optimal, no interior peak) -- and a `perf` profiling dead end
+
+Two side-quests while Phase 5's real work was queued.
+
+**DCGP scaling**: scanned 4/8/16/32/56/64/112 ranks (2000-step H2O_2G,
+`gpu/lammps_e2e/scan_cpu_dcgp_ranks.slurm`) to answer "what's the
+optimal core count on DCGP" directly, rather than assuming the full
+node. Loop time falls monotonically the entire way -- 527.0s -> 278.5s
+-> 152.0s -> 85.5s -> 60.4s -> 54.3s -> 43.6s -- with parallel efficiency
+dropping from 95% (8 ranks) to 43% (112 ranks) as Comm share grows from
+11% to 49%. No interior optimum in this range: more cores always won on
+wall-clock, right up to the physical limit of one node, even though
+efficiency kept falling. So 112 (the full node) is the answer, which is
+exactly what the already-completed full-scale production run
+(job 52496567, 1:12:36) used -- no rerun needed. Worth remembering this
+isn't "efficient" in a core-hours sense (8-16 ranks would be 87-95%
+efficient) -- it's optimal only if wall-clock is what's being optimized,
+which is what was asked.
+
+**`perf` profiling dead end**: attempted Phase 5 step 1 (profile a
+single-rank CPU LAMMPS run to split SF-vs-NN-vs-force-assembly time,
+matching `GPU_PORTING_PLAN.md`'s Phase 0 methodology) twice --
+`gpu/lammps_e2e/profile_cpu_lammps.slurm`, then
+`profile_cpu_lammps_debug.slurm` after rebuilding n2p2 with `-g` added
+(kept `-O3`/`-march=native` unchanged) when the first attempt resolved
+almost no n2p2 symbols. Adding `-g` didn't help -- `perf report` still
+shows the same ~50% of samples as dozens of near-identical ~1%-each
+raw addresses, and checking with `--sort=dso,symbol` shows they're not
+even attributed to a known shared object (`[unknown]` DSO, not just an
+unresolved symbol within a known one). Real tooling limitation on this
+cluster, not a missing-debug-info problem -- the recording itself
+warned about lost chunks/IO overload, consistent with missed `MMAP`
+events for dynamically-loaded libraries. The ~16% of samples that *did*
+resolve (`libm`'s `tanhf32x`/`expf32x`/`expm1f32x`) doesn't help isolate
+SF from NN anyway, since both use these (NN's tanh activation,
+symmetry functions' exponential radial/angular terms). Not pursuing
+`perf` further here -- manual `Stopwatch` instrumentation around the
+`calculateSymmetryFunctionGroups()`/`calculateAtomicNeuralNetworks()`
+call sites in `Mode.cpp` (matching the pattern `Training.cpp` already
+uses for its `_err`/`_com`/`_upd` buckets) is the likely next attempt,
+since it doesn't depend on `perf`'s symbol resolution working at all.
