@@ -14,6 +14,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cmath>
 #include <cuda_runtime.h>
 
@@ -261,93 +262,160 @@ __global__ void sfExpAngnGroupKernel(
     }
 }
 
-// --- Persistent, grow-on-demand device buffers -----------------------
-// Same rationale as GpuNeuralNetwork.cu: cudaMalloc/cudaFree carry fixed
-// driver overhead independent of size, and this is called every MD
-// timestep, so allocating fresh every call would repeat the exact mistake
-// found and fixed there. One static, never-shrinking buffer set per
-// function (not per element) -- sequential calls for different elements
-// within the same timestep just reuse/grow the same buffers, which is
-// fine since this is single-threaded per MPI rank and buffers are tiny
-// relative to the NN weight/G buffers already cached this way.
+// --- Persistent, grow-on-demand device buffers, PLUS pinned host mirror
+// buffers on a dedicated stream -----------------------------------------
+// Same cudaMalloc/cudaFree-avoidance rationale as GpuNeuralNetwork.cu
+// (fixed driver overhead independent of size, called every MD timestep).
+//
+// Added after profiling the first working version end to end (Phase 5
+// step 8, soft-percolating-jellyfish.md): correct, but ~10x SLOWER than
+// CPU-only, even at a single MPI rank with zero GPU contention. Root
+// cause: each group call issued ~16 *synchronous* cudaMemcpy/
+// cudaDeviceSynchronize calls in a row -- and cudaMemcpy on ordinary
+// pageable host memory (plain heap/std::vector, what Mode.cpp's CSR
+// arrays are) blocks the calling host thread until the transfer AND any
+// prior work on the device complete, with each block/wake potentially
+// paying OS-level scheduling latency, not just the transfer time itself
+// (this compounds badly at ~9 group calls/timestep x ~16 blocking calls
+// each x 2000 timesteps). cudaMemcpyAsync only actually avoids that
+// per-call blocking round trip when the HOST side is pinned
+// (page-locked) memory -- on pageable memory the driver silently
+// degrades it to synchronous behavior anyway, so both changes are
+// required together, not either alone.
+//
+// Fix: every device buffer now has a same-shape pinned host mirror
+// (cudaMallocHost, not malloc). Mode.cpp's ordinary pageable arrays are
+// staged into these mirrors with a plain memcpy (fast, no driver
+// round-trip), then every H2D/D2H transfer and the memsets run as
+// *Async on one dedicated stream, with a single cudaStreamSynchronize()
+// as the only blocking point per call -- collapsing ~16 blocking
+// round-trips into 1. Mode.cpp's calling convention (plain pointers, no
+// CUDA types) is unchanged; this is entirely internal to this file.
 struct SfBuffers
 {
+    cudaStream_t stream = nullptr;
+
     int    *d_neighOffset = nullptr, *d_neighElem = nullptr;
     double *d_neighDist = nullptr, *d_neighDx = nullptr, *d_neighDy = nullptr,
            *d_neighDz = nullptr;
     double *d_G = nullptr, *d_dGdx = nullptr, *d_dGdy = nullptr, *d_dGdz = nullptr;
     double *d_neighborDGdx = nullptr, *d_neighborDGdy = nullptr,
            *d_neighborDGdz = nullptr;
-    size_t capAtoms = 0, capNeigh = 0, capG = 0, capNeighG = 0;
-    // Per-function parameter buffers (numMembers-sized, tiny, but still
-    // cached rather than malloc'd every call for the same reason).
     int    *d_e1 = nullptr, *d_e2 = nullptr;
     double *d_eta = nullptr, *d_rs = nullptr, *d_lambda = nullptr, *d_zeta = nullptr;
-    size_t capMembers = 0;
+
+    int    *h_neighOffset = nullptr, *h_neighElem = nullptr;
+    double *h_neighDist = nullptr, *h_neighDx = nullptr, *h_neighDy = nullptr,
+           *h_neighDz = nullptr;
+    double *h_G = nullptr, *h_dGdx = nullptr, *h_dGdy = nullptr, *h_dGdz = nullptr;
+    double *h_neighborDGdx = nullptr, *h_neighborDGdy = nullptr,
+           *h_neighborDGdz = nullptr;
+    int    *h_e1 = nullptr, *h_e2 = nullptr;
+    double *h_eta = nullptr, *h_rs = nullptr, *h_lambda = nullptr, *h_zeta = nullptr;
+
+    size_t capAtoms = 0, capNeigh = 0, capG = 0, capNeighG = 0, capMembers = 0;
+
+    void ensureStream()
+    {
+        if (!stream) CUDA_CHECK(cudaStreamCreate(&stream));
+    }
 
     void ensureAtoms(int numAtoms)
     {
         if ((size_t)(numAtoms + 1) <= capAtoms) return;
-        if (d_neighOffset) cudaFree(d_neighOffset);
+        if (d_neighOffset) { cudaFree(d_neighOffset); cudaFreeHost(h_neighOffset); }
         capAtoms = numAtoms + 1;
         CUDA_CHECK(cudaMalloc(&d_neighOffset, capAtoms * sizeof(int)));
+        CUDA_CHECK(cudaMallocHost(&h_neighOffset, capAtoms * sizeof(int)));
     }
 
     void ensureNeigh(size_t totalNeigh)
     {
         if (totalNeigh <= capNeigh) return;
-        if (d_neighElem) { cudaFree(d_neighElem); cudaFree(d_neighDist);
-            cudaFree(d_neighDx); cudaFree(d_neighDy); cudaFree(d_neighDz); }
+        if (d_neighElem) {
+            cudaFree(d_neighElem); cudaFree(d_neighDist);
+            cudaFree(d_neighDx); cudaFree(d_neighDy); cudaFree(d_neighDz);
+            cudaFreeHost(h_neighElem); cudaFreeHost(h_neighDist);
+            cudaFreeHost(h_neighDx); cudaFreeHost(h_neighDy); cudaFreeHost(h_neighDz);
+        }
         capNeigh = totalNeigh;
         CUDA_CHECK(cudaMalloc(&d_neighElem, capNeigh * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&d_neighDist, capNeigh * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&d_neighDx, capNeigh * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&d_neighDy, capNeigh * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&d_neighDz, capNeigh * sizeof(double)));
+        CUDA_CHECK(cudaMallocHost(&h_neighElem, capNeigh * sizeof(int)));
+        CUDA_CHECK(cudaMallocHost(&h_neighDist, capNeigh * sizeof(double)));
+        CUDA_CHECK(cudaMallocHost(&h_neighDx, capNeigh * sizeof(double)));
+        CUDA_CHECK(cudaMallocHost(&h_neighDy, capNeigh * sizeof(double)));
+        CUDA_CHECK(cudaMallocHost(&h_neighDz, capNeigh * sizeof(double)));
     }
 
     void ensureG(size_t gSize)
     {
         if (gSize <= capG) return;
-        if (d_G) { cudaFree(d_G); cudaFree(d_dGdx); cudaFree(d_dGdy); cudaFree(d_dGdz); }
+        if (d_G) {
+            cudaFree(d_G); cudaFree(d_dGdx); cudaFree(d_dGdy); cudaFree(d_dGdz);
+            cudaFreeHost(h_G); cudaFreeHost(h_dGdx); cudaFreeHost(h_dGdy); cudaFreeHost(h_dGdz);
+        }
         capG = gSize;
         CUDA_CHECK(cudaMalloc(&d_G, capG * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&d_dGdx, capG * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&d_dGdy, capG * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&d_dGdz, capG * sizeof(double)));
+        CUDA_CHECK(cudaMallocHost(&h_G, capG * sizeof(double)));
+        CUDA_CHECK(cudaMallocHost(&h_dGdx, capG * sizeof(double)));
+        CUDA_CHECK(cudaMallocHost(&h_dGdy, capG * sizeof(double)));
+        CUDA_CHECK(cudaMallocHost(&h_dGdz, capG * sizeof(double)));
     }
 
     void ensureNeighG(size_t neighGSize)
     {
         if (neighGSize <= capNeighG) return;
-        if (d_neighborDGdx) { cudaFree(d_neighborDGdx); cudaFree(d_neighborDGdy);
-            cudaFree(d_neighborDGdz); }
+        if (d_neighborDGdx) {
+            cudaFree(d_neighborDGdx); cudaFree(d_neighborDGdy); cudaFree(d_neighborDGdz);
+            cudaFreeHost(h_neighborDGdx); cudaFreeHost(h_neighborDGdy); cudaFreeHost(h_neighborDGdz);
+        }
         capNeighG = neighGSize;
         CUDA_CHECK(cudaMalloc(&d_neighborDGdx, capNeighG * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&d_neighborDGdy, capNeighG * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&d_neighborDGdz, capNeighG * sizeof(double)));
+        CUDA_CHECK(cudaMallocHost(&h_neighborDGdx, capNeighG * sizeof(double)));
+        CUDA_CHECK(cudaMallocHost(&h_neighborDGdy, capNeighG * sizeof(double)));
+        CUDA_CHECK(cudaMallocHost(&h_neighborDGdz, capNeighG * sizeof(double)));
     }
 
     void ensureMembersRad(int numMembers)
     {
         if ((size_t)numMembers <= capMembers) return;
-        if (d_eta) { cudaFree(d_eta); cudaFree(d_rs); }
+        if (d_eta) { cudaFree(d_eta); cudaFree(d_rs); cudaFreeHost(h_eta); cudaFreeHost(h_rs); }
         capMembers = numMembers;
         CUDA_CHECK(cudaMalloc(&d_eta, capMembers * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&d_rs, capMembers * sizeof(double)));
+        CUDA_CHECK(cudaMallocHost(&h_eta, capMembers * sizeof(double)));
+        CUDA_CHECK(cudaMallocHost(&h_rs, capMembers * sizeof(double)));
     }
 
     void ensureMembersAngn(int numMembers)
     {
         if ((size_t)numMembers <= capMembers) return;
-        if (d_e1) { cudaFree(d_e1); cudaFree(d_e2); cudaFree(d_eta);
-            cudaFree(d_lambda); cudaFree(d_zeta); }
+        if (d_e1) {
+            cudaFree(d_e1); cudaFree(d_e2); cudaFree(d_eta);
+            cudaFree(d_lambda); cudaFree(d_zeta);
+            cudaFreeHost(h_e1); cudaFreeHost(h_e2); cudaFreeHost(h_eta);
+            cudaFreeHost(h_lambda); cudaFreeHost(h_zeta);
+        }
         capMembers = numMembers;
         CUDA_CHECK(cudaMalloc(&d_e1, capMembers * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&d_e2, capMembers * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&d_eta, capMembers * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&d_lambda, capMembers * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&d_zeta, capMembers * sizeof(double)));
+        CUDA_CHECK(cudaMallocHost(&h_e1, capMembers * sizeof(int)));
+        CUDA_CHECK(cudaMallocHost(&h_e2, capMembers * sizeof(int)));
+        CUDA_CHECK(cudaMallocHost(&h_eta, capMembers * sizeof(double)));
+        CUDA_CHECK(cudaMallocHost(&h_lambda, capMembers * sizeof(double)));
+        CUDA_CHECK(cudaMallocHost(&h_zeta, capMembers * sizeof(double)));
     }
 };
 
@@ -385,6 +453,7 @@ void gpuSfExpRadGroup(int numAtoms, int const* neighOffset,
         exit(1);
     }
     SfBuffers& b = radBuffers();
+    b.ensureStream();
     int const totalNeigh = neighOffset[numAtoms];
     size_t const gSize = (size_t)numAtoms * numMembers;
     size_t const neighGSize = (size_t)totalNeigh * numMembers;
@@ -395,36 +464,55 @@ void gpuSfExpRadGroup(int numAtoms, int const* neighOffset,
     b.ensureNeighG(neighGSize);
     b.ensureMembersRad(numMembers);
 
-    CUDA_CHECK(cudaMemcpy(b.d_neighOffset, neighOffset, (numAtoms + 1) * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(b.d_neighElem, neighElement, totalNeigh * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(b.d_neighDist, neighDist, totalNeigh * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(b.d_neighDx, neighDx, totalNeigh * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(b.d_neighDy, neighDy, totalNeigh * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(b.d_neighDz, neighDz, totalNeigh * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(b.d_eta, eta, numMembers * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(b.d_rs, rs, numMembers * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(b.d_neighborDGdx, 0, neighGSize * sizeof(double)));
-    CUDA_CHECK(cudaMemset(b.d_neighborDGdy, 0, neighGSize * sizeof(double)));
-    CUDA_CHECK(cudaMemset(b.d_neighborDGdz, 0, neighGSize * sizeof(double)));
+    memcpy(b.h_neighOffset, neighOffset, (numAtoms + 1) * sizeof(int));
+    memcpy(b.h_neighElem, neighElement, totalNeigh * sizeof(int));
+    memcpy(b.h_neighDist, neighDist, totalNeigh * sizeof(double));
+    memcpy(b.h_neighDx, neighDx, totalNeigh * sizeof(double));
+    memcpy(b.h_neighDy, neighDy, totalNeigh * sizeof(double));
+    memcpy(b.h_neighDz, neighDz, totalNeigh * sizeof(double));
+    memcpy(b.h_eta, eta, numMembers * sizeof(double));
+    memcpy(b.h_rs, rs, numMembers * sizeof(double));
+
+    cudaStream_t s = b.stream;
+    CUDA_CHECK(cudaMemcpyAsync(b.d_neighOffset, b.h_neighOffset, (numAtoms + 1) * sizeof(int), cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.d_neighElem, b.h_neighElem, totalNeigh * sizeof(int), cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.d_neighDist, b.h_neighDist, totalNeigh * sizeof(double), cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.d_neighDx, b.h_neighDx, totalNeigh * sizeof(double), cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.d_neighDy, b.h_neighDy, totalNeigh * sizeof(double), cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.d_neighDz, b.h_neighDz, totalNeigh * sizeof(double), cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.d_eta, b.h_eta, numMembers * sizeof(double), cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.d_rs, b.h_rs, numMembers * sizeof(double), cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemsetAsync(b.d_neighborDGdx, 0, neighGSize * sizeof(double), s));
+    CUDA_CHECK(cudaMemsetAsync(b.d_neighborDGdy, 0, neighGSize * sizeof(double), s));
+    CUDA_CHECK(cudaMemsetAsync(b.d_neighborDGdz, 0, neighGSize * sizeof(double), s));
 
     int const blockSize = 128;
     int const gridSize = (numAtoms + blockSize - 1) / blockSize;
-    sfExpRadGroupKernel<<<gridSize, blockSize>>>(
+    sfExpRadGroupKernel<<<gridSize, blockSize, 0, s>>>(
         numAtoms, e1, rc, numMembers, b.d_eta, b.d_rs,
         b.d_neighOffset, b.d_neighElem, b.d_neighDist,
         b.d_neighDx, b.d_neighDy, b.d_neighDz,
         b.d_G, b.d_dGdx, b.d_dGdy, b.d_dGdz,
         b.d_neighborDGdx, b.d_neighborDGdy, b.d_neighborDGdz);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
 
-    CUDA_CHECK(cudaMemcpy(G, b.d_G, gSize * sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(dGdx, b.d_dGdx, gSize * sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(dGdy, b.d_dGdy, gSize * sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(dGdz, b.d_dGdz, gSize * sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(neighborDGdx, b.d_neighborDGdx, neighGSize * sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(neighborDGdy, b.d_neighborDGdy, neighGSize * sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(neighborDGdz, b.d_neighborDGdz, neighGSize * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpyAsync(b.h_G, b.d_G, gSize * sizeof(double), cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.h_dGdx, b.d_dGdx, gSize * sizeof(double), cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.h_dGdy, b.d_dGdy, gSize * sizeof(double), cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.h_dGdz, b.d_dGdz, gSize * sizeof(double), cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.h_neighborDGdx, b.d_neighborDGdx, neighGSize * sizeof(double), cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.h_neighborDGdy, b.d_neighborDGdy, neighGSize * sizeof(double), cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.h_neighborDGdz, b.d_neighborDGdz, neighGSize * sizeof(double), cudaMemcpyDeviceToHost, s));
+
+    CUDA_CHECK(cudaStreamSynchronize(s));
+
+    memcpy(G, b.h_G, gSize * sizeof(double));
+    memcpy(dGdx, b.h_dGdx, gSize * sizeof(double));
+    memcpy(dGdy, b.h_dGdy, gSize * sizeof(double));
+    memcpy(dGdz, b.h_dGdz, gSize * sizeof(double));
+    memcpy(neighborDGdx, b.h_neighborDGdx, neighGSize * sizeof(double));
+    memcpy(neighborDGdy, b.h_neighborDGdy, neighGSize * sizeof(double));
+    memcpy(neighborDGdz, b.h_neighborDGdz, neighGSize * sizeof(double));
 }
 
 void gpuSfExpAngnGroup(int numAtoms, int const* neighOffset,
@@ -445,6 +533,7 @@ void gpuSfExpAngnGroup(int numAtoms, int const* neighOffset,
         exit(1);
     }
     SfBuffers& b = angnBuffers();
+    b.ensureStream();
     int const totalNeigh = neighOffset[numAtoms];
     size_t const gSize = (size_t)numAtoms * numMembers;
     size_t const neighGSize = (size_t)totalNeigh * numMembers;
@@ -455,39 +544,61 @@ void gpuSfExpAngnGroup(int numAtoms, int const* neighOffset,
     b.ensureNeighG(neighGSize);
     b.ensureMembersAngn(numMembers);
 
-    CUDA_CHECK(cudaMemcpy(b.d_neighOffset, neighOffset, (numAtoms + 1) * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(b.d_neighElem, neighElement, totalNeigh * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(b.d_neighDist, neighDist, totalNeigh * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(b.d_neighDx, neighDx, totalNeigh * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(b.d_neighDy, neighDy, totalNeigh * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(b.d_neighDz, neighDz, totalNeigh * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(b.d_e1, e1, numMembers * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(b.d_e2, e2, numMembers * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(b.d_eta, eta, numMembers * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(b.d_lambda, lambda, numMembers * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(b.d_zeta, zeta, numMembers * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemset(b.d_neighborDGdx, 0, neighGSize * sizeof(double)));
-    CUDA_CHECK(cudaMemset(b.d_neighborDGdy, 0, neighGSize * sizeof(double)));
-    CUDA_CHECK(cudaMemset(b.d_neighborDGdz, 0, neighGSize * sizeof(double)));
+    memcpy(b.h_neighOffset, neighOffset, (numAtoms + 1) * sizeof(int));
+    memcpy(b.h_neighElem, neighElement, totalNeigh * sizeof(int));
+    memcpy(b.h_neighDist, neighDist, totalNeigh * sizeof(double));
+    memcpy(b.h_neighDx, neighDx, totalNeigh * sizeof(double));
+    memcpy(b.h_neighDy, neighDy, totalNeigh * sizeof(double));
+    memcpy(b.h_neighDz, neighDz, totalNeigh * sizeof(double));
+    memcpy(b.h_e1, e1, numMembers * sizeof(int));
+    memcpy(b.h_e2, e2, numMembers * sizeof(int));
+    memcpy(b.h_eta, eta, numMembers * sizeof(double));
+    memcpy(b.h_lambda, lambda, numMembers * sizeof(double));
+    memcpy(b.h_zeta, zeta, numMembers * sizeof(double));
+
+    cudaStream_t s = b.stream;
+    CUDA_CHECK(cudaMemcpyAsync(b.d_neighOffset, b.h_neighOffset, (numAtoms + 1) * sizeof(int), cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.d_neighElem, b.h_neighElem, totalNeigh * sizeof(int), cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.d_neighDist, b.h_neighDist, totalNeigh * sizeof(double), cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.d_neighDx, b.h_neighDx, totalNeigh * sizeof(double), cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.d_neighDy, b.h_neighDy, totalNeigh * sizeof(double), cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.d_neighDz, b.h_neighDz, totalNeigh * sizeof(double), cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.d_e1, b.h_e1, numMembers * sizeof(int), cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.d_e2, b.h_e2, numMembers * sizeof(int), cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.d_eta, b.h_eta, numMembers * sizeof(double), cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.d_lambda, b.h_lambda, numMembers * sizeof(double), cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.d_zeta, b.h_zeta, numMembers * sizeof(double), cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemsetAsync(b.d_neighborDGdx, 0, neighGSize * sizeof(double), s));
+    CUDA_CHECK(cudaMemsetAsync(b.d_neighborDGdy, 0, neighGSize * sizeof(double), s));
+    CUDA_CHECK(cudaMemsetAsync(b.d_neighborDGdz, 0, neighGSize * sizeof(double), s));
 
     int const blockSize = 128;
     int const gridSize = (numAtoms + blockSize - 1) / blockSize;
-    sfExpAngnGroupKernel<<<gridSize, blockSize>>>(
+    sfExpAngnGroupKernel<<<gridSize, blockSize, 0, s>>>(
         numAtoms, rc, numMembers, b.d_e1, b.d_e2, b.d_eta, b.d_lambda, b.d_zeta,
         b.d_neighOffset, b.d_neighElem, b.d_neighDist,
         b.d_neighDx, b.d_neighDy, b.d_neighDz,
         b.d_G, b.d_dGdx, b.d_dGdy, b.d_dGdz,
         b.d_neighborDGdx, b.d_neighborDGdy, b.d_neighborDGdz);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
 
-    CUDA_CHECK(cudaMemcpy(G, b.d_G, gSize * sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(dGdx, b.d_dGdx, gSize * sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(dGdy, b.d_dGdy, gSize * sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(dGdz, b.d_dGdz, gSize * sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(neighborDGdx, b.d_neighborDGdx, neighGSize * sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(neighborDGdy, b.d_neighborDGdy, neighGSize * sizeof(double), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(neighborDGdz, b.d_neighborDGdz, neighGSize * sizeof(double), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpyAsync(b.h_G, b.d_G, gSize * sizeof(double), cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.h_dGdx, b.d_dGdx, gSize * sizeof(double), cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.h_dGdy, b.d_dGdy, gSize * sizeof(double), cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.h_dGdz, b.d_dGdz, gSize * sizeof(double), cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.h_neighborDGdx, b.d_neighborDGdx, neighGSize * sizeof(double), cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.h_neighborDGdy, b.d_neighborDGdy, neighGSize * sizeof(double), cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.h_neighborDGdz, b.d_neighborDGdz, neighGSize * sizeof(double), cudaMemcpyDeviceToHost, s));
+
+    CUDA_CHECK(cudaStreamSynchronize(s));
+
+    memcpy(G, b.h_G, gSize * sizeof(double));
+    memcpy(dGdx, b.h_dGdx, gSize * sizeof(double));
+    memcpy(dGdy, b.h_dGdy, gSize * sizeof(double));
+    memcpy(dGdz, b.h_dGdz, gSize * sizeof(double));
+    memcpy(neighborDGdx, b.h_neighborDGdx, neighGSize * sizeof(double));
+    memcpy(neighborDGdy, b.h_neighborDGdy, neighGSize * sizeof(double));
+    memcpy(neighborDGdz, b.h_neighborDGdz, neighGSize * sizeof(double));
 }
 
 } // namespace nnp

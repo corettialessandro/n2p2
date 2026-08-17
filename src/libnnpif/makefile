@@ -64,22 +64,30 @@ MPICC=${PROJECT_MPICC}
 CFLAGS=${PROJECT_CFLAGS} ${PROJECT_CFLAGS_MPI}
 endif
 OPTIONS+=$(PROJECT_OPTIONS)
-# GPU=1 must add the exact same defines here as libnnp/makefile does --
-# not just for symbol availability, but because -DN2P2_FULL_SFD_MEMORY
-# changes Atom's binary layout (Atom.h has #ifdef N2P2_FULL_SFD_MEMORY
-# guarding actual member declarations, not just runtime behavior).
-# InterfaceLammps.cpp (this library) creates/manipulates Atom/Structure
-# objects that Mode::calculateSymmetryFunctionGroups() (libnnp, built
-# with GPU=1's defines) later operates on -- if the two libraries
-# disagree on this define, that's a real ODR violation/ABI mismatch: one
-# side reads/writes members at offsets the other side didn't allocate,
-# which manifests as corrupted-looking data appearing well after the
-# point of actual mismatch (not a crash at the mismatch site itself,
-# making it easy to misdiagnose as a logic bug elsewhere -- confirmed
-# by hitting exactly this while validating the symmetry-function GPU
-# dispatch, soft-percolating-jellyfish.md Phase 5 step 8).
+# GPU=1/GPU_SF=1 must add the exact same defines here as libnnp/makefile
+# does -- not just for symbol availability, but because
+# -DN2P2_FULL_SFD_MEMORY changes Atom's binary layout (Atom.h has
+# #ifdef N2P2_FULL_SFD_MEMORY guarding actual member declarations, not
+# just runtime behavior). InterfaceLammps.cpp (this library) creates/
+# manipulates Atom/Structure objects that Mode::calculateSymmetryFunctionGroups()
+# (libnnp, built with the same defines) later operates on -- if the two
+# libraries disagree on this define, that's a real ODR violation/ABI
+# mismatch: one side reads/writes members at offsets the other side
+# didn't allocate, which manifests as corrupted-looking data appearing
+# well after the point of actual mismatch (not a crash at the mismatch
+# site itself, making it easy to misdiagnose as a logic bug elsewhere --
+# confirmed by hitting exactly this while validating the symmetry-function
+# GPU dispatch, soft-percolating-jellyfish.md Phase 5 step 8). GPU_SF is
+# a separate opt-in flag from GPU (see libnnp/makefile's comment for
+# why: SF-GPU dispatch is correct but only a performance win at low MPI
+# rank counts, a net loss at the higher rank counts real production runs
+# use -- folding it into plain GPU=1 would silently regress the
+# still-valid NN-only path's normal users).
 ifeq ($(GPU), 1)
-OPTIONS+= -DN2P2_GPU -DN2P2_FULL_SFD_MEMORY
+OPTIONS+= -DN2P2_GPU
+endif
+ifeq ($(GPU_SF), 1)
+OPTIONS+= -DN2P2_GPU_SF -DN2P2_FULL_SFD_MEMORY
 endif
 DEBUG=$(PROJECT_DEBUG)
 ifeq ($(MODE), test)

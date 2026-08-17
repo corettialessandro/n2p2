@@ -4184,3 +4184,186 @@ assuming it carried over was the right call.
 Instrumentation reverted after collecting this data -- it was marked
 temporary in the code from the start, not meant to become permanent
 production logging.
+
+### Follow-up: ported symmetry-function evaluation to GPU -- correct, and a real win, but only at low MPI rank counts; shipped as a separate opt-in flag, off by default
+
+Phase 5's remaining steps (3-8, `soft-percolating-jellyfish.md`), following
+directly from the ~95%-of-per-timestep-cost finding above. Two
+already-validated CUDA kernels (`gpu/soa/symfnc_exprad_group_test.cu`/
+`symfnc_expangn_group_test.cu`, covering the only two symmetry-function
+types (`SymGrpExpRad`/`SymGrpExpAngn`, type 2/3) and the only cutoff
+type (`CT_TANHU`) this project's real datasets use) were promoted into
+`src/libnnpgpu/GpuSymmetryFunction.h/.cu`, gated by a new
+`Element::hasGpuCompatibleSymmetryFunctions()` compatibility check (same
+all-or-nothing-per-structure shape as the existing NN dispatch gate),
+and wired into `Mode::calculateSymmetryFunctionGroups()`. Kernels return
+unscaled values by design -- the real `SymFnc::scale()`/
+`getScalingFactor()` is applied by the caller, same "don't re-derive
+validated production math" precedent as the NN port.
+
+**Kernel-level correctness validated first, standalone, before touching
+production** (`gpu/e2e_symfnc_check/`, matching `gpu/e2e_predict_check`/
+`e2e_train_check`'s precedent): GPU vs. CPU `G`/`dGdr` agreement on real
+H2O_2G neighbor geometry, both elements, all group-filter variants --
+**ALL PASS**, max errors 1.96E-15 (`G`, 23520 values), 1.49E-16 (owner
+derivative), 6.94E-17 (neighbor derivative, 2.5M values).
+
+**Two real, separate bugs found and fixed while validating end to end
+through LAMMPS** (neither was a symmetry-function math bug -- the
+kernels were correct from the first standalone validation onward):
+
+1. **A genuine ODR violation/ABI mismatch between `libnnp` and
+   `libnnpif`.** The GPU symmetry-function path requires
+   `-DN2P2_FULL_SFD_MEMORY` (the uncompacted per-neighbor derivative
+   layout, needed because the kernel writes `Atom::Neighbor::dGdr`
+   indexed by global symmetry-function index directly). `libnnp/makefile`
+   added this define under `GPU=1`; `libnnpif/makefile` -- which compiles
+   `InterfaceLammps.cpp`, the code that actually creates/manipulates
+   `Atom`/`Structure` objects -- did not. Since `N2P2_FULL_SFD_MEMORY`
+   guards actual member declarations in `Atom.h` (not just runtime
+   behavior), this was a real binary-layout mismatch between two
+   separately-compiled libraries: one side read/wrote members at offsets
+   the other side never allocated. It manifested as `structure.atoms.size()`
+   returning garbage (`0x3333333333333333`) well after the actual
+   mismatch site -- the same "corruption appears downstream of the real
+   bug" shape this file has hit before with stale `-march=native`
+   binaries, but a genuinely different root cause this time, found via
+   the same disciplined `fprintf`+`fflush` bisection debugging.
+2. **A pre-existing macro-name typo in `InterfaceLammps.cpp`.**
+   `getForces()`/`getForcesLambda()`/`getdChidxyz()` checked
+   `#ifndef NNP_FULL_SFD_MEMORY` (missing "2P2") instead of the real
+   `N2P2_FULL_SFD_MEMORY` used everywhere else in the codebase -- a dead
+   macro name that was always false, so these functions always took the
+   *compact*-layout branch regardless of the real build flag. Never
+   triggered before because nobody had built the LAMMPS interface with
+   `N2P2_FULL_SFD_MEMORY` defined until this port -- `Element::symmetryFunctionTable`
+   (the compact-layout lookup table these functions read) is never
+   populated when the full layout is active
+   (`setupSymmetryFunctionMemory()` is skipped), so indexing into it
+   threw exactly the observed `vector::_M_range_check` exceptions on
+   empty vectors. Fixed by correcting the macro name (6 occurrences).
+
+**With both fixed, full correctness validated end to end at LAMMPS
+level**, same two-step discipline as the NN-only port: full 2000-step
+H2O_2G MD trajectory matches the CPU baseline exactly -- `Max |Temp_cpu
+- Temp_gpu| = 0`, `Max |PotEng_cpu - PotEng_gpu| = 0`, forces agree to
+1E-7 across all dumped atoms/timesteps.
+
+**But the first honest performance measurement was a severe
+regression, not a win: ~10x slower than CPU**, not the 98%-of-workload
+win the ~95%-SF-cost finding above seemed to promise. `Loop time of
+5280.36s` for the same 2000-step smoke test (4 ranks/1 GPU, Booster) vs.
+~490s CPU-only Pair time for the equivalent NN-only-GPU-era baseline.
+
+**Root-caused via the same measure-don't-guess discipline used
+throughout this file**, in three rounds:
+
+1. **Isolated GPU contention from raw dispatch cost** with a 1-rank vs.
+   4-rank probe (630-atom H2O_2G, no MPS): per-rank cost scaled from
+   0.702s/step (1 rank) to 2.626s/step (4 ranks) -- almost exactly
+   linear with rank count, meaning the 4 ranks were essentially fully
+   serialized on the shared GPU. Real, but only part of the story: even
+   the *zero-contention* single-rank number was already ~2.85x slower
+   than the old CPU-only per-rank baseline.
+2. **First hypothesis (wrong, but a reasonable one): blocking
+   synchronous CUDA calls.** Each group call issued ~16 sequential
+   *synchronous* `cudaMemcpy`/`cudaDeviceSynchronize` calls (H2D
+   transfers, memsets, D2H transfers) on ordinary pageable host memory --
+   `cudaMemcpyAsync` only actually avoids the per-call blocking
+   round-trip with *pinned* host memory, so both a pinned-staging-buffer
+   rewrite and async transfers on one dedicated stream (collapsing ~16
+   blocking round-trips into 1 `cudaStreamSynchronize` per call) were
+   implemented together in `GpuSymmetryFunction.cu`. Re-validated
+   correct (`gpu/e2e_symfnc_check` still ALL PASS, same tolerances) --
+   but made **zero measurable timing difference** (0.702s -> 0.707s/step).
+   Worth recording as a real negative result: the obvious "too many
+   small synchronous driver calls" diagnosis was plausible and easy to
+   reach for, but wrong here.
+3. **Real root cause, found by adding actual `Stopwatch` phase
+   instrumentation** (CSR build / GPU call / scatter-back) instead of
+   guessing again:
+
+   | Phase | Time/step (1 rank, H2O_2G) | Share |
+   |---|---|---|
+   | CSR build (host) | 0.0038s | 0.5% |
+   | **GPU call (kernel + transfer)** | **0.66s** | **93%** |
+   | Scatter-back (host) | 0.019s | 2.7% |
+
+   The dispatch call itself dominates, and the reason is visible
+   directly in the launch config: `gridSize = ceil(numAtoms/128)` -- for
+   this system's ~210-420 atoms per (element, group) call, that's only
+   **2-4 CUDA thread blocks**, on a GPU with ~108 SMs. Over 95% of the
+   GPU sits idle for the entire kernel call. Combined with the angular
+   kernel's O(neighbors²) per-atom serial inner loop (~109 neighbors ->
+   ~5900 pairs x up to 26 members, branchy scalar code) and
+   `MAX_MEMBERS=64`-sized per-thread local arrays (likely spilling out
+   of registers), this is a kernel shaped for throughput on a large
+   batch, not latency on a small one -- validated for *correctness*
+   early (as it should be) but never benchmarked for *raw kernel speed*
+   against CPU before being wired into production, unlike the NN-forward
+   port (which had a documented 25.6x/27.9x prototype speedup measured
+   first).
+
+**Before attempting a real kernel-parallelization redesign (a much
+bigger, uncertain undertaking), checked whether the same unmodified
+kernel already does better at 8640-atom scale** (`examples/interface-LAMMPS/H2O_RPBE-D3`,
+Phase 6's previously-deferred "final check" case -- confirmed
+GPU-compatible first: `input.nn` uses only types 2/3 with `cutoff_type 2`
+= `CT_TANHU`, same as H2O_2G). The result flips completely, and the
+mechanism confirms the diagnosis: the GPU call's cost per step is
+**nearly unchanged** across a 14x increase in atoms (0.64-0.67s/step at
+both 630 and 8640 atoms) -- exactly what "underutilized, idle capacity
+absorbing the extra work for free" predicts. Single-rank, same Booster
+hardware:
+
+| System | Config | Pair time/step |
+|---|---|---|
+| H2O_2G (630 atoms) | GPU, 1 rank | 0.702s |
+| H2O_RPBE-D3 (8640 atoms) | GPU, 1 rank | 1.202s |
+| H2O_RPBE-D3 (8640 atoms) | CPU, 1 rank | 2.859s |
+
+GPU is **2.4x faster** than CPU at this scale, single rank. Correctness
+re-validated at this scale too, same discipline: full 41-step trajectory,
+exact match (`0` diff Temp/E_pair/Press, `0` diff forces).
+
+**But real production runs use far more than 1 rank, and a multi-rank
+scan tells a materially different story** -- 4/8/16/32 ranks, both
+backends, same 40-step H2O_RPBE-D3 config, Booster (GPU side using the
+established MPS + `rank_gpu_wrapper.sh` multi-GPU-sharing pattern from
+the `nnp-train` production runs):
+
+| Ranks | Atoms/rank | GPU s/step | CPU s/step | Result |
+|---|---|---|---|---|
+| 1 | 8640 | 1.202 | 2.859 | GPU 2.4x faster |
+| 4 | 2160 | 0.502 | 0.715 | GPU 1.4x faster |
+| 8 | 1080 | 0.403 | 0.359 | CPU 1.1x faster |
+| 16 | 540 | 0.349 | 0.186 | CPU 1.9x faster |
+| 32 | 270 | 0.322 | 0.104 | CPU 3.1x faster |
+
+CPU's Pair time scales down almost linearly with rank count (good
+parallel efficiency, as expected for ordinary per-atom CPU work).
+GPU's barely moves at all across the whole scan -- splitting the same
+total work across more ranks just means fewer atoms per GPU call,
+pushing the kernel straight back into the same underutilization regime
+that hurt it at H2O_2G's scale. The crossover from win to loss lands
+between 4 and 8 ranks, roughly 1000-2000 atoms/rank -- and this
+project's actual production LAMMPS runs (Phase 3 above) have
+consistently used 32 ranks, not 1-4.
+
+**Conclusion: correct, and a real win in a narrow regime (large system,
+low rank count), but a net loss at the rank counts this project
+actually deploys with.** Rather than reverting the feature (the
+underlying kernels and dispatch logic are real, working, validated
+code, and genuinely faster in the regime where GPU occupancy is
+adequate), it's shipped behind a **separate opt-in build flag,
+`GPU_SF=1`, deliberately distinct from the existing `GPU=1`** --
+`libnnp/makefile`/`libnnpif/makefile` only add `-DN2P2_GPU_SF`
+(and the `-DN2P2_FULL_SFD_MEMORY` it requires) when `GPU_SF=1` is
+explicitly passed, and `Mode.cpp`'s dispatch is gated on
+`defined(N2P2_GPU) && defined(N2P2_GPU_SF)` together. Plain `GPU=1`
+keeps exactly the NN-only dispatch (a genuine, if modest, win at any
+scale tested so far) without silently inheriting a feature that would
+regress a normal, higher-rank-count production run. Anyone deliberately
+running a large system at a small rank count (e.g. one powerful node,
+few ranks) can opt in and get a real ~1.4-2.4x speedup; everyone else's
+build is unaffected.

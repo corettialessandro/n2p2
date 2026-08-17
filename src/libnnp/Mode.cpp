@@ -22,6 +22,8 @@
 #include "GpuNeuralNetwork.h"
 #include "GpuForces.h"
 #include "GpuElecForces.h"
+#endif
+#if defined(N2P2_GPU) && defined(N2P2_GPU_SF)
 #include "GpuSymmetryFunction.h"
 #include "SymGrp.h"
 #include "SymGrpBaseCutoff.h"
@@ -1647,7 +1649,7 @@ void Mode::calculateSymmetryFunctionGroups(Structure& structure,
     if (structure.hasSymmetryFunctionDerivatives) return;
     if (structure.hasSymmetryFunctions && !derivatives) return;
 
-#ifdef N2P2_GPU
+#if defined(N2P2_GPU) && defined(N2P2_GPU_SF)
     // Phase 5 (soft-percolating-jellyfish.md): GPU dispatch for symmetry-
     // function evaluation, on top of the NN forward-pass GPU dispatch
     // already in calculateAtomicNeuralNetworks() above. Motivated by
@@ -1665,6 +1667,15 @@ void Mode::calculateSymmetryFunctionGroups(Structure& structure,
     // that's a real run-time possibility, not a formality: only 2 of 11
     // symmetry-function types are covered so far, ported because they're
     // the only ones this project's real datasets have used).
+    //
+    // Correct (bit-identical to CPU, see gpu/README.md) but only a real
+    // performance win at low MPI rank counts (roughly >=1000-2000
+    // atoms/rank) -- loses, increasingly badly, at the higher rank
+    // counts real production runs use, since the kernels are
+    // one-thread-per-atom and need a lot of atoms/rank to keep the GPU
+    // occupied. Gated behind the separate N2P2_GPU_SF opt-in (GPU_SF=1
+    // at build time, not implied by plain GPU=1) for exactly that
+    // reason -- see libnnp/makefile's comment for the full measurement.
     bool allElementsGpuCompatibleSF = true;
     for (size_t e = 0; e < elements.size(); ++e)
     {
@@ -1725,7 +1736,7 @@ void Mode::calculateSymmetryFunctionGroups(Structure& structure,
 
         // Calculate symmetry functions (and derivatives) -- unless the GPU
         // batch pass below will handle this element instead.
-#ifdef N2P2_GPU
+#if defined(N2P2_GPU) && defined(N2P2_GPU_SF)
         if (!allElementsGpuCompatibleSF)
         {
             e->calculateSymmetryFunctionGroups(*a, derivatives);
@@ -1739,7 +1750,7 @@ void Mode::calculateSymmetryFunctionGroups(Structure& structure,
         if (derivatives) a->hasSymmetryFunctionDerivatives = true;
     }
 
-#ifdef N2P2_GPU
+#if defined(N2P2_GPU) && defined(N2P2_GPU_SF)
     if (allElementsGpuCompatibleSF)
     {
         // Group atoms by element (mirrors calculateAtomicNeuralNetworks()'s

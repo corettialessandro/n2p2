@@ -1,0 +1,50 @@
+###############################################################################
+# MD simulation for HDNNP water
+###############################################################################
+
+###############################################################################
+# VARIABLES
+###############################################################################
+clear
+# Configuration files
+variable cfgFile         string "h2o_8640_liquid_NpT_RPBE-D3.data"
+# Timesteps
+variable numSteps equal 40 # correctness check
+variable dt              equal  0.0005
+# NN
+variable hdnnpCutoff     equal  6.36
+variable hdnnpDir        string "hdnnp-data"
+# Masses
+variable mass_H          equal  1.00794
+variable mass_O          equal  15.9994
+
+###############################################################################
+# GENERAL SETUP
+###############################################################################
+units metal
+boundary p p p
+atom_style atomic
+read_data ${cfgFile}
+mass 1 ${mass_H}
+mass 2 ${mass_O}
+timestep ${dt}
+thermo 1
+
+###############################################################################
+# HDNNP
+###############################################################################
+#pair_style hdnnp/4g emap "1:H,2:O" dir ${hdnnpDir} showew no showewsum 5 resetew no maxew 100 cflength 1.8897261328 cfenergy 0.0367493254
+pair_style hdnnp ${hdnnpCutoff} dir ${hdnnpDir} showew no showewsum 5 resetew no maxew 100 cflength 1.8897261328 cfenergy 0.0367493254
+pair_coeff * * H O
+
+###############################################################################
+# INTEGRATOR
+###############################################################################
+fix INT all nve
+dump 1 all custom 10 traj_forces.dump id type element x y z fx fy fz
+dump_modify 1 element H O sort id
+
+###############################################################################
+# SIMULATION
+###############################################################################
+run ${numSteps}

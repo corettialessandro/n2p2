@@ -55,17 +55,37 @@ INCLUDES=-I./ -I$(PROJECT_EIGEN)
 # GPU acceleration: Mode.cpp's #ifdef N2P2_GPU branch needs both the define
 # and to find GpuNeuralNetwork.h/GpuSymmetryFunction.h (src/libnnpgpu is
 # not otherwise on the include path since it's a separate, nvcc-built
-# library). -DN2P2_FULL_SFD_MEMORY is required by the symmetry-function
-# GPU dispatch (Mode::calculateSymmetryFunctionGroups()'s GPU path) --
-# it writes Atom::Neighbor::dGdr indexed by global symmetry-function
-# index directly, which is only correct under the full (uncompacted)
-# memory layout; auto-adding it here (rather than expecting callers to
-# remember a second flag) means GPU=1 alone still fully controls the
-# build, same as every other GPU toggle in this project. Costs ~30-50%
-# more memory for that one array (confirmed via n2p2's own docs to never
-# change results, negligible at this project's real dataset scales).
+# library). This is the NN-forward dispatch only (a genuine, if modest,
+# win -- see gpu/README.md) and is safe to enable on its own.
 ifeq ($(GPU), 1)
-OPTIONS+= -DN2P2_GPU -DN2P2_FULL_SFD_MEMORY
+OPTIONS+= -DN2P2_GPU
+INCLUDES+= -I$(PROJECT_DIR)/src/libnnpgpu
+endif
+
+# Symmetry-function GPU dispatch: a SEPARATE opt-in flag from GPU=1 above,
+# deliberately not folded into it. Validated correct (bit-identical to
+# CPU) but its performance is workload-shaped, not a clean win: measured
+# on real LAMMPS MD runs (H2O_2G 630 atoms, H2O_RPBE-D3 8640 atoms), it
+# only beats CPU at low MPI rank counts (roughly >=1000-2000 atoms/rank)
+# and LOSES -- increasingly badly -- at the higher rank counts real
+# production runs actually use (measured up to 3.1x slower than CPU at
+# 32 ranks/270 atoms-per-rank on H2O_RPBE-D3). Root cause: the SF GPU
+# kernels are one-thread-per-atom with a heavy per-thread inner loop, so
+# they need a lot of atoms per MPI rank to keep the GPU occupied; CPU
+# scales down with rank count far better than the kernel scales down
+# with shrinking batch size. See gpu/README.md for the full writeup.
+# Folding this into plain GPU=1 would silently regress anyone building
+# for the (still-valid) NN-only win at their normal, higher rank counts
+# -- hence the separate flag, off by default even when GPU=1 is set.
+# Requires GPU=1 to also be set (Mode.cpp checks N2P2_GPU && N2P2_GPU_SF
+# together); the include path is added again here defensively in case
+# GPU_SF=1 is ever passed on its own.
+# -DN2P2_FULL_SFD_MEMORY is required by this path specifically (it writes
+# Atom::Neighbor::dGdr indexed by global symmetry-function index
+# directly, only correct under the full/uncompacted memory layout) --
+# NOT needed by the NN-only path, so it stays out of the GPU=1 block too.
+ifeq ($(GPU_SF), 1)
+OPTIONS+= -DN2P2_GPU_SF -DN2P2_FULL_SFD_MEMORY
 INCLUDES+= -I$(PROJECT_DIR)/src/libnnpgpu
 endif
 
