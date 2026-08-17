@@ -463,11 +463,16 @@ bool Element::hasGpuCompatibleSymmetryFunctions() const
 {
     for (SymGrp* g : symmetryFunctionGroups)
     {
+        if (g == nullptr) return false;
+
         size_t const type = g->getType();
         if (type != 2 && type != 3) return false;
 
         SymGrpBaseCutoff const* gc = dynamic_cast<SymGrpBaseCutoff const*>(g);
+        if (gc == nullptr) return false;
         if (gc->getCutoffType() != CutoffFunction::CT_TANHU) return false;
+
+        if (g->getMemberIndices().empty()) return false;
     }
 
     return true;
