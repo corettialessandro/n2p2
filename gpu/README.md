@@ -4497,3 +4497,120 @@ for one run at real intended length -- both directions of error (too
 pessimistic before clocks/occupancy settle, potentially too optimistic
 before sustained-load effects appear) are live risks, and only the
 full-length run resolved which one actually applied here.
+
+### Follow-up: reproducibility-checked the 200000-step result and ruled out the two obvious environmental explanations via live GPU telemetry -- candidate next-phase approaches recorded, not yet attempted
+
+Before trusting the 28.6%-slower result as a real property of the
+workload rather than a one-off artifact of that particular run (the
+home filesystem happened to be at its 50GB capacity, 0 bytes free, at
+around the same time -- see below), reran the identical 200000-step
+H2O_2G GPU-vs-CPU comparison at the same best configuration (32
+ranks, Booster), from freshly rebuilt LAMMPS trees (the originals had
+been deleted as part of a separate output-cleanup pass) and a freshly
+regenerated MPS session:
+
+| | First run | Rerun |
+|---|---|---|
+| GPU Loop time | 4445.8s (74.1 min) | 4426.8s (73.8 min) |
+| CPU Loop time | 3458.2s (57.6 min) | 3426.6s (57.1 min) |
+| GPU vs. CPU | 28.6% slower | 29.2% slower |
+| GPU Pair time | 3964.9s | 3967.9s |
+| CPU Pair time | 2469.1s | 2465.1s |
+
+Essentially identical -- confirms the result is a real, robustly
+reproducible property of the current kernel at production scale, not
+noise, a stale build, or an artifact of whatever else was happening on
+the system during the first run.
+
+**The near-full home filesystem (50GB total, 0 bytes free at one
+point this session) was a real, separate problem -- but not this one.**
+It's the most plausible explanation for several odd tool-call
+timeouts/hiccups earlier in the session (filesystem I/O operations
+failing/stalling near capacity), and cleanup recovered ~21GB of
+headroom. But `Pair` time is pure GPU/CPU compute, not disk I/O, so
+disk capacity was never a plausible mechanism for the timing
+regression specifically -- worth being precise about, since the two
+issues surfaced around the same time and are easy to conflate.
+
+**Checked live GPU telemetry during the rerun** (`nvidia-smi` via
+`srun --overlap` into the running job's node) instead of continuing to
+guess -- this ruled out both obvious environmental explanations
+cleanly:
+
+| GPU | Temp | SM clock | Power draw | Utilization |
+|---|---|---|---|---|
+| 0 | 46°C | 1395 MHz (= max, no throttle) | 105W / 550W limit | 69% |
+| 1 | 45°C | 1395 MHz (= max) | 101W / 550W limit | 85% |
+| 2 | 46°C | 1395 MHz (= max) | 101W / 500W limit | 87% |
+| 3 | 46°C | 1395 MHz (= max) | 103W / 500W limit | 75% |
+
+**Thermal/clock throttling: ruled out.** Cold (throttle threshold is
+~85°C+), clocks pinned at their full rated maximum, power draw ~20% of
+budget -- the opposite of what sustained-load throttling would look
+like. This was the leading hypothesis in the previous entry;
+telemetry falsifies it directly. **Cluster contention: also ruled
+out.** `squeue -w <node>` showed only this job scheduled on the node,
+and the GPU process list showed exactly 8 client processes + 1 shared
+MPS server process per GPU (32 ranks / 4 GPUs, matching the configured
+`RANKS_PER_GPU=8`) -- all belonging to this job, no foreign PIDs.
+
+**What the telemetry does suggest**: utilization sitting at 69-87%
+(not saturated) with clocks/power/temp all showing headroom points at
+the GPUs sitting idle *between* dispatches rather than being
+compute-bound -- consistent with some form of per-call or
+per-launch overhead that compounds over a very long run (32 ranks x
+200000 steps x ~9 SF group calls ≈ 57 million total dispatches through
+MPS, vs. ~1.1 million for the 2000-step run that looked fast), rather
+than a raw compute-throughput problem. Not confirmed without deeper
+profiling.
+
+**Candidate approaches for the next phase, recorded but not yet
+attempted** -- roughly in order of how promising/cheap-to-check each
+is:
+
+1. **The bottleneck may have shifted from GPU to host CPU, and this
+   hasn't actually been checked.** The warp-per-atom fix made the GPU
+   kernel itself much faster; the per-timestep pipeline still
+   round-trips through host CPU multiple times (CSR build -> H2D ->
+   kernel -> D2H -> scatter into `Atom::G`/`dGdr` -> a separate NN-GPU
+   dispatch -> `InterfaceLammps::getForces()`, still pure CPU). That
+   host-side glue code was ~3% of Pair time against the *old*, slow
+   kernel -- against the *new*, much faster kernel, the same fixed
+   cost could now be a much larger fraction of a much smaller total,
+   and 32 independent MPI processes each paying it, sustained over 74
+   minutes, is a different regime than a 33-second burst. GPU
+   clocks/temps were checked directly this round; CPU-side clock/
+   frequency-scaling behavior during the long run was not. Cheapest
+   next check: resurrect the phase-level `Stopwatch` instrumentation
+   used for the original occupancy diagnosis, but sample it throughout
+   a long run rather than only early on, to see whether the
+   CPU-glue-to-GPU-call time ratio grows over the course of the run.
+2. **Batch multiple MPI ranks' local work into one shared-GPU call per
+   node**, instead of each of the 8 ranks/GPU independently dispatching
+   through MPS. Directly reduces the *count* of independent dispatches
+   (the likely-relevant quantity per the utilization pattern above).
+   A real architecture change (a GPU-owning worker process per node,
+   ranks feed it via shared memory/IPC) -- this is the "cross-rank
+   pooling" idea considered and set aside earlier as disproportionate
+   given the warp-per-atom fix looked sufficient at the time; worth
+   reconsidering now that the full-length result reopened the question.
+3. **Direct profiling with `nsys`/`ncu`** instead of continuing to
+   infer host-vs-device behavior from aggregate telemetry -- would show
+   the actual gap structure directly. Not yet set up.
+
+**Open question this raises for H2O_RPBE-D3 (the larger system)**: all
+of Phase 5's short/medium-duration measurements on both systems, and
+the *only* long-duration (200000-step) measurement, which is H2O_2G-only
+(H2O_RPBE-D3 at that length was estimated at ~11-12 GPU-hours and
+descoped for cost, see the 2K-comparison-report follow-up above). The
+mechanism diagnosed across this whole investigation (fixed per-call
+overhead amortized better by more atoms/call) predicts a larger system
+should be *more* robust against whatever causes H2O_2G's long-run
+reversal, not less -- but that is a reasoned prediction, not a
+validated one, and this session's own experience is a direct
+caution against trusting short-run-based predictions here. A
+moderate-duration (e.g. 20000-50000 step) H2O_RPBE-D3 run -- a
+fraction of full-200000-step cost -- would be the proportionate way to
+check whether the same short-run-optimistic/long-run-pessimistic
+divergence shows up there too, before treating "GPU_SF is fine for big
+systems" as anything more than an informed guess.
