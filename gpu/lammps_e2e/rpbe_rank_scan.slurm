@@ -47,7 +47,7 @@ echo "=== [0/2] Clean rebuild of GPU tree (reverted Mode.cpp, no profiling) ==="
 (cd "$N2P2_DEVEL/src/libnnpgpu" && make COMP=gnu MODE=static GPU=1)
 (cd "$N2P2_DEVEL/src/libnnp" && make clean > /dev/null 2>&1 || true)
 (cd "$N2P2_DEVEL/src/libnnpif" && make INTERFACES=LAMMPS clean > /dev/null 2>&1 || true)
-(cd "$N2P2_DEVEL/src" && make COMP=gnu MODE=static GPU=1 PROJECT_EIGEN="$EIGEN" \
+(cd "$N2P2_DEVEL/src" && make COMP=gnu MODE=static GPU=1 GPU_SF=1 PROJECT_EIGEN="$EIGEN" \
     INTERFACES=LAMMPS -j"$SLURM_NTASKS_PER_NODE" libnnp libnnpif)
 git -C "$N2P2_DEVEL" checkout -- src/libnnp/version.h
 (cd "$LAMMPS_GPU/src" && touch main.cpp && make mpi -j"$SLURM_NTASKS_PER_NODE")

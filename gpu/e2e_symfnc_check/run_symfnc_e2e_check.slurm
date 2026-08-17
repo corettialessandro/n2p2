@@ -70,7 +70,7 @@ g++ -O3 -std=c++11 -DN2P2_FULL_SFD_MEMORY \
     -I"$N2P2_DEVEL/include" -I"$EIGEN" -DEIGEN_DONT_PARALLELIZE \
     -o symfnc_e2e_check.o -c symfnc_e2e_check.cpp
 g++ -O3 -std=c++11 -o symfnc_e2e_check symfnc_e2e_check.o libnnp.a libnnpgpu.a \
-    -L"$CUDA_LIB" -lcudart -lcublas
+    -L"$CUDA_LIB" -lcudart -lcublas -lcusolver
 
 echo ""
 echo "=== Running (real H2O_2G structure, converged 100-epoch weights) ==="

@@ -4367,3 +4367,133 @@ regress a normal, higher-rank-count production run. Anyone deliberately
 running a large system at a small rank count (e.g. one powerful node,
 few ranks) can opt in and get a real ~1.4-2.4x speedup; everyone else's
 build is unaffected.
+
+### Follow-up: redesigned the SF kernels around the diagnosed occupancy problem -- fixed the short/medium-run regression completely, but the real production-length measurement still says no
+
+The rank-scan crossover above pointed at one specific, fixable cause:
+`gridSize = ceil(numAtoms/blockSize)` in the old one-thread-per-atom
+kernels meant a real MPI rank's local atom count (as low as ~20-270 at
+this project's actual 32-rank production configuration) launched only
+2-4 CUDA thread blocks against a 108-SM GPU. The fix: **warp-per-atom**
+kernels instead of thread-per-atom. Each atom now gets one warp (32
+threads); each lane processes a disjoint stride of that atom's neighbors
+(`ExpRad`) or outer pair-index `j` (`ExpAngn`), and the owner-atom
+accumulators (`result`/`dResultX/Y/Z`) are combined with a
+shuffle-based warp reduction -- no atomics needed for that part, since
+the reduction stays within one warp. This multiplies the number of
+concurrently active parallel units by up to 32x at the same atom count,
+directly targeting the diagnosed bottleneck. `ExpAngn`'s neighbor-side
+derivative writes are the one place real synchronization is required:
+a neighbor slot can receive contributions from multiple `(j,k)` pairs
+owned by different lanes, so those specifically use `atomicAdd` (native
+on this project's target compute capability, sm_80); `ExpRad` has no
+such problem, since each neighbor slot is touched by exactly one lane.
+Also reduced `MAX_MEMBERS` from 64 to 32 (real datasets need at most
+26) to ease the per-thread register/local-memory footprint that was
+plausibly compounding the occupancy problem.
+
+**A real bug was caught by the existing standalone harness, not missed
+by it.** The first version of the rewrite failed `gpu/e2e_symfnc_check`
+with `max|dG_own_gpu-dG_own_cpu| = 3.246E-02` while `G` (6.69E-15) and
+the neighbor-side derivative (6.94E-17) stayed at the established
+tight tolerance -- a strong, specific signal, since it isolated the bug
+to exactly one accumulator. The original serial code applies the
+`pow(2.0, 1.0-zeta[m])` normalization to `result[m]` (-> `G`) *only*,
+post-loop -- `dResultX/Y/Z[m]` already have it baked in earlier via
+`fgF = fg * pnorm` inside the pair loop, and must not be re-multiplied.
+The warp rewrite's final write-out applied that normalization to all
+four outputs, double-counting it for the three derivative components.
+Fixed by only scaling `G`'s output; re-ran the harness -- **ALL PASS**,
+same tolerances as before (6.69E-15 / 1.35E-16 / 6.94E-17).
+
+**Every short- and medium-duration measurement after the fix looked
+like a clean, complete reversal.** The identical H2O_RPBE-D3 rank scan
+that showed the crossover above, rerun with the new kernel (same 40-step
+config, same rank counts):
+
+| Ranks | Atoms/rank | GPU s/step | CPU s/step | Result |
+|---|---|---|---|---|
+| 4 | 2160 | 0.687 | 0.713 | GPU 1.04x faster |
+| 8 | 1080 | 0.345 | 0.360 | GPU 1.04x faster |
+| 16 | 540 | 0.179 | 0.187 | GPU 1.04x faster |
+| 32 | 270 | 0.101 | 0.104 | GPU 1.03x faster |
+
+No crossover at all -- GPU tracks CPU's scaling closely while staying
+consistently ahead across the whole range. H2O_2G's most extreme case
+(32 ranks, ~20 atoms/rank, previously ~30x slower) flipped too: 23.77s
+vs. 24.82s Pair time over 2000 steps, GPU **~4.4% faster**. A GPU-only
+rank scan for H2O_2G specifically (300-step, 4/8/16/32 ranks, always
+4 GPUs) found Pair time decreasing monotonically with rank count --
+0.0329 -> 0.0259 -> 0.0221 -> 0.0198 s/step -- confirming 32 ranks is
+GPU's best config too, matching CPU's already-established best
+single-node config, so "best vs. best" and "matched rank count" turned
+out to be the same comparison.
+
+**A two-tier validation (short-window exact match, full-trajectory
+statistical match, plus a GPU-vs-GPU repeat run to separate expected
+chaos from a real bug) confirmed correctness cleanly on a real 2000-step
+H2O_2G LAMMPS run, 32 ranks.** `ExpAngn`'s `atomicAdd` makes GPU results
+not bit-reproducible run-to-run (atomic completion order varies), and
+MD is chaotic, so some visible trajectory divergence over a long run
+was expected -- in practice, forces matched exactly (`0` diff) through
+step 1800 of 2000, with a single 1E-7 blip at step 2000 (right at the
+dump file's print precision) shared identically by *both* independent
+GPU runs against CPU, while the two GPU runs matched each other exactly
+throughout -- consistent with ordinary floating-point reassociation
+(GPU's warp-reduction sums in a different order than CPU's serial loop),
+not a bug. Temperature and PotEng means/stdevs matched to 4 decimal
+places across all three runs.
+
+**But the one measurement that matters most -- a real, full-length
+200,000-step production run at each backend's best configuration
+(32 ranks, Booster, H2O_2G) -- reversed again, back to a loss:**
+
+| | Loop time | Pair time/step | Comm time/step |
+|---|---|---|---|
+| GPU (32 ranks/4 GPUs) | 4445.8s (74.1 min) | 19.82 ms | 2.33 ms |
+| CPU (32 ranks) | 3458.2s (57.6 min) | 12.35 ms | 4.87 ms |
+
+GPU is **28.6% slower overall**, with Pair time specifically **1.6x
+higher** than CPU -- directly contradicting both the 2000-step
+validation run (GPU ahead) and, in the opposite direction, largely
+matching what the shorter 300-step scan already hinted at (GPU behind,
+though by less). Correctness held up regardless: temperature and
+PotEng means stayed statistically consistent between GPU and CPU
+(299.52 vs. 299.35 K, both near the 300 K target; -104.99 vs. -105.58,
+both well within a stdev) -- the expected chaotic divergence of a real
+200000-step trajectory, not a physics bug.
+
+**Three measurements at three different durations, in three different
+directions is a genuine, currently-unresolved puzzle** -- 300-step scan
+pessimistic, 2000-step run optimistic, 200000-step run pessimistic
+again, and by more than the 300-step scan alone predicted. The most
+likely explanation is sustained-load GPU clock/thermal behavior: a
+33-second run has no time to either reach full sustained boost clocks
+or trigger thermal throttling, while a 74-minute run has plenty of time
+for both effects to matter, potentially in opposite directions at
+different points in the run -- but this is *not confirmed*, since no
+GPU telemetry (clocks, temperature, power) was captured during the
+production run to distinguish throttling from shared-cluster contention
+from some other long-run-specific effect (e.g. driver-level bookkeeping
+across the ~57 million total kernel launches -- 32 ranks x 200000 steps
+x ~9 SF group calls -- that a 2000-step run would never approach).
+
+**Conclusion: the occupancy diagnosis and warp-per-atom fix were real
+and correct** -- they fixed the specific short/medium-run regression
+they targeted, cleanly and completely, and the standalone kernel-level
+and short-trajectory correctness validation is solid. **But the only
+measurement taken at this project's actual intended production
+duration is the 200000-step run, and it says GPU loses to CPU by a
+substantial margin (28.6%) even with the improved kernel.** That is the
+number that should be trusted over the shorter ones, precisely because
+it is the only one measured at real use-case scale. The `GPU_SF=1`
+opt-in-flag decision (kept separate from, and off by default relative
+to, plain `GPU=1`) stands -- if anything this result reinforces it more
+strongly than the original crossover finding did, since even the fixed
+kernel doesn't deliver a production-length win at this project's actual
+deployment configuration. The broader lesson: for GPU work in this
+project, a short or medium benchmark run is not a reliable substitute
+for one run at real intended length -- both directions of error (too
+pessimistic before clocks/occupancy settle, potentially too optimistic
+before sustained-load effects appear) are live risks, and only the
+full-length run resolved which one actually applied here.

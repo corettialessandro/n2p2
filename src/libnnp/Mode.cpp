@@ -1668,14 +1668,24 @@ void Mode::calculateSymmetryFunctionGroups(Structure& structure,
     // symmetry-function types are covered so far, ported because they're
     // the only ones this project's real datasets have used).
     //
-    // Correct (bit-identical to CPU, see gpu/README.md) but only a real
-    // performance win at low MPI rank counts (roughly >=1000-2000
-    // atoms/rank) -- loses, increasingly badly, at the higher rank
-    // counts real production runs use, since the kernels are
-    // one-thread-per-atom and need a lot of atoms/rank to keep the GPU
-    // occupied. Gated behind the separate N2P2_GPU_SF opt-in (GPU_SF=1
-    // at build time, not implied by plain GPU=1) for exactly that
-    // reason -- see libnnp/makefile's comment for the full measurement.
+    // Correct (bit-identical to CPU at short/medium trajectory lengths,
+    // statistically consistent at full production length -- see
+    // gpu/README.md) but NOT a net performance win at this project's
+    // actual production configuration. The kernels in GpuSymmetryFunction.cu
+    // are warp-per-atom (not thread-per-atom) specifically to fix a
+    // diagnosed GPU-occupancy problem, and that fix is real: every
+    // short/medium-duration measurement (rank scans, a 2000-step
+    // trajectory) shows GPU consistently ahead of CPU at every rank
+    // count tested, including this project's actual 32-rank production
+    // rank count. But the one measurement taken at this project's real
+    // 200000-step production LENGTH reversed that again -- GPU 28.6%
+    // SLOWER than CPU overall, Pair time 1.6x higher -- for reasons not
+    // yet confirmed (sustained-load GPU clock/thermal behavior is the
+    // leading hypothesis, not verified with telemetry). Gated behind the
+    // separate N2P2_GPU_SF opt-in (GPU_SF=1 at build time, not implied
+    // by plain GPU=1) because of that full-length result -- see
+    // libnnp/makefile's comment and gpu/README.md for the full
+    // measurement history.
     bool allElementsGpuCompatibleSF = true;
     for (size_t e = 0; e < elements.size(); ++e)
     {

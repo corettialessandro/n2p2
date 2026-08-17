@@ -64,19 +64,25 @@ endif
 
 # Symmetry-function GPU dispatch: a SEPARATE opt-in flag from GPU=1 above,
 # deliberately not folded into it. Validated correct (bit-identical to
-# CPU) but its performance is workload-shaped, not a clean win: measured
-# on real LAMMPS MD runs (H2O_2G 630 atoms, H2O_RPBE-D3 8640 atoms), it
-# only beats CPU at low MPI rank counts (roughly >=1000-2000 atoms/rank)
-# and LOSES -- increasingly badly -- at the higher rank counts real
-# production runs actually use (measured up to 3.1x slower than CPU at
-# 32 ranks/270 atoms-per-rank on H2O_RPBE-D3). Root cause: the SF GPU
-# kernels are one-thread-per-atom with a heavy per-thread inner loop, so
-# they need a lot of atoms per MPI rank to keep the GPU occupied; CPU
-# scales down with rank count far better than the kernel scales down
-# with shrinking batch size. See gpu/README.md for the full writeup.
-# Folding this into plain GPU=1 would silently regress anyone building
-# for the (still-valid) NN-only win at their normal, higher rank counts
-# -- hence the separate flag, off by default even when GPU=1 is set.
+# CPU at short/medium trajectory length, statistically consistent at
+# full 200000-step production length). Performance history is not a
+# simple story -- an initial one-thread-per-atom kernel design lost
+# badly at real production rank counts (up to 3.1x slower at 32
+# ranks/270 atoms-per-rank) due to GPU occupancy starvation (only 2-4
+# CUDA thread blocks launched per call on a 108-SM GPU); a warp-per-atom
+# redesign fixed that specific problem completely -- every short/medium
+# measurement after the fix (rank scans, a 2000-step trajectory) showed
+# GPU consistently AHEAD of CPU at every rank count tested, including
+# this project's actual 32-rank production configuration. But the one
+# measurement taken at real 200000-step production LENGTH reversed that
+# again: GPU 28.6% SLOWER than CPU overall (Pair time 1.6x higher), for
+# reasons not yet confirmed (sustained-load GPU thermal/clock behavior
+# is the leading hypothesis, unverified). That full-length number is the
+# one to trust, since it's the only one measured at real use-case scale
+# -- see gpu/README.md for the complete measurement history. Folding
+# this into plain GPU=1 would silently regress anyone building for the
+# (still-valid) NN-only win -- hence the separate flag, off by default
+# even when GPU=1 is set.
 # Requires GPU=1 to also be set (Mode.cpp checks N2P2_GPU && N2P2_GPU_SF
 # together); the include path is added again here defensively in case
 # GPU_SF=1 is ever passed on its own.

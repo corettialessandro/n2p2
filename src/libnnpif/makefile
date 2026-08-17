@@ -78,11 +78,13 @@ OPTIONS+=$(PROJECT_OPTIONS)
 # site itself, making it easy to misdiagnose as a logic bug elsewhere --
 # confirmed by hitting exactly this while validating the symmetry-function
 # GPU dispatch, soft-percolating-jellyfish.md Phase 5 step 8). GPU_SF is
-# a separate opt-in flag from GPU (see libnnp/makefile's comment for
-# why: SF-GPU dispatch is correct but only a performance win at low MPI
-# rank counts, a net loss at the higher rank counts real production runs
-# use -- folding it into plain GPU=1 would silently regress the
-# still-valid NN-only path's normal users).
+# a separate opt-in flag from GPU (see libnnp/makefile's comment and
+# gpu/README.md for the full story: SF-GPU dispatch is correct, and a
+# warp-per-atom kernel redesign fixed its original short/medium-run
+# regression completely, but the only measurement taken at real
+# 200000-step production length still shows it losing to CPU by ~29% --
+# folding it into plain GPU=1 would silently regress the still-valid
+# NN-only path's normal users).
 ifeq ($(GPU), 1)
 OPTIONS+= -DN2P2_GPU
 endif

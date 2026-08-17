@@ -56,43 +56,54 @@ __host__ __device__ inline double pow_int(double x, int n)
 
 // Per-thread scratch limits: real H2O_2G has at most 2 ExpRad members and
 // 26 ExpAngn members per element (see soft-percolating-jellyfish.md's
-// prototype survey) -- 64 gives headroom without the register pressure of
+// prototype survey) -- 32 gives headroom without the register pressure of
 // a much larger fixed size. gpuSfExpAngnGroup's kernel enforces this.
-int const MAX_MEMBERS = 64;
+int const MAX_MEMBERS = 32;
 
-__device__ inline void symFncExpRadGroup(
-    int numNeighbors, const int* neighElem,
-    const double* neighDist, const double* neighDx, const double* neighDy,
-    const double* neighDz, int e1, double rc,
-    int numMembers, const double* eta, const double* rs,
-    double* result, double* dResultX, double* dResultY, double* dResultZ,
-    double* neighDGdx, double* neighDGdy, double* neighDGdz)
+__device__ inline double warpReduceSum(double val)
 {
-    double rcinv = 1.0 / rc;
-    for (int j = 0; j < numNeighbors; ++j)
+    for (int offset = 16; offset > 0; offset >>= 1)
     {
-        if (neighElem[j] != e1) continue;
-        double rij = neighDist[j];
-        if (rij >= rc) continue;
-        double pfc, pdfc;
-        cutoffTANHU(rij, rcinv, pfc, pdfc);
-        for (int k = 0; k < numMembers; ++k)
-        {
-            double diff = rij - rs[k];
-            double pexp = exp(-eta[k] * diff * diff);
-            result[k] += pexp * pfc;
-            double p1 = (pdfc - 2.0 * eta[k] * diff * pfc) * pexp / rij;
-            double dijx = p1 * neighDx[j];
-            double dijy = p1 * neighDy[j];
-            double dijz = p1 * neighDz[j];
-            dResultX[k] += dijx; dResultY[k] += dijy; dResultZ[k] += dijz;
-            int idx = j * numMembers + k;
-            neighDGdx[idx] = -dijx;
-            neighDGdy[idx] = -dijy;
-            neighDGdz[idx] = -dijz;
-        }
+        val += __shfl_down_sync(0xffffffff, val, offset);
     }
+    return val;
 }
+
+// Warp-per-atom kernels (soft-percolating-jellyfish.md, Phase 5 follow-up):
+// the original one-thread-per-atom kernels below launched gridSize =
+// ceil(numAtoms/blockSize) blocks -- at the atom counts a real MPI rank
+// actually sees (measured as low as ~20-270 atoms/rank at realistic
+// production rank counts), that is only 1-4 thread blocks against an
+// A100's 108 SMs, and the GPU dispatch cost was measured to stay nearly
+// FLAT regardless of atoms/call across a 14x range (630 vs 8640 atoms,
+// single rank) -- strong evidence of severe occupancy-bound underuse, not
+// a compute-bound cost. Fix: assign one WARP (32 threads) per atom
+// instead of one thread. Each lane processes a disjoint stride of that
+// atom's neighbors (ExpRad) or outer pair-index j (ExpAngn), then the
+// owner-atom accumulators (result/dResultX/Y/Z) are combined via a
+// shuffle-based warp reduction -- no atomics needed for that part, since
+// the reduction stays within one warp. This multiplies the number of
+// concurrently active parallel units by up to 32x at the same atom
+// count, directly targeting the diagnosed bottleneck.
+//
+// ExpAngn's neighbor-side derivative writes (neighDGdx/y/z) are the one
+// place this needs real synchronization: a given neighbor slot's
+// accumulator receives contributions from MULTIPLE (j,k) pairs, and with
+// pair work spread across lanes by outer index j, a neighbor k can
+// receive writes from whichever lane owns each j<k -- generally a
+// DIFFERENT lane than whichever owns k itself as an outer index later.
+// That's an inherent many-writers-one-slot pattern, so both the idxJ and
+// idxK writes use atomicAdd (double atomicAdd is native on this
+// project's target compute capability, sm_80). ExpRad has no such
+// problem -- each neighbor slot's derivative is written by exactly one
+// lane (whichever lane's stride includes that neighbor), so it keeps the
+// original direct (non-atomic, single-write) form.
+//
+// Every arithmetic expression below is copied verbatim from the
+// validated original (not algebraically simplified, e.g. the seemingly-
+// redundant rijs/rij term in ExpAngn's p1) to avoid any risk of a subtle
+// floating-point reassociation changing results at the ~1e-16 level the
+// existing correctness harness checks against.
 
 __global__ void sfExpRadGroupKernel(
     int numAtoms, int e1, double rc, int numMembers,
@@ -102,59 +113,100 @@ __global__ void sfExpRadGroupKernel(
     double* G, double* dGdx, double* dGdy, double* dGdz,
     double* neighborDGdx, double* neighborDGdy, double* neighborDGdz)
 {
-    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    int globalThread = blockIdx.x * blockDim.x + threadIdx.x;
+    int t = globalThread / 32;
+    int lane = globalThread % 32;
     if (t >= numAtoms) return;
     int off = neighOffset[t], n = neighOffset[t + 1] - off;
 
     double result[MAX_MEMBERS] = {0}, dResultX[MAX_MEMBERS] = {0},
            dResultY[MAX_MEMBERS] = {0}, dResultZ[MAX_MEMBERS] = {0};
 
-    symFncExpRadGroup(n, &neighElem[off], &neighDist[off], &neighDx[off],
-                       &neighDy[off], &neighDz[off], e1, rc, numMembers,
-                       eta, rs, result, dResultX, dResultY, dResultZ,
-                       &neighborDGdx[(size_t)off * numMembers],
-                       &neighborDGdy[(size_t)off * numMembers],
-                       &neighborDGdz[(size_t)off * numMembers]);
+    double rcinv = 1.0 / rc;
+    for (int j = lane; j < n; j += 32)
+    {
+        int idxN = off + j;
+        if (neighElem[idxN] != e1) continue;
+        double rij = neighDist[idxN];
+        if (rij >= rc) continue;
+        double pfc, pdfc;
+        cutoffTANHU(rij, rcinv, pfc, pdfc);
+        for (int k = 0; k < numMembers; ++k)
+        {
+            double diff = rij - rs[k];
+            double pexp = exp(-eta[k] * diff * diff);
+            result[k] += pexp * pfc;
+            double p1 = (pdfc - 2.0 * eta[k] * diff * pfc) * pexp / rij;
+            double dijx = p1 * neighDx[idxN];
+            double dijy = p1 * neighDy[idxN];
+            double dijz = p1 * neighDz[idxN];
+            dResultX[k] += dijx; dResultY[k] += dijy; dResultZ[k] += dijz;
+            size_t idx = (size_t)idxN * numMembers + k;
+            neighborDGdx[idx] = -dijx;
+            neighborDGdy[idx] = -dijy;
+            neighborDGdz[idx] = -dijz;
+        }
+    }
 
     size_t base = (size_t)t * numMembers;
     for (int k = 0; k < numMembers; ++k)
     {
-        G[base + k]    = result[k];
-        dGdx[base + k] = dResultX[k];
-        dGdy[base + k] = dResultY[k];
-        dGdz[base + k] = dResultZ[k];
+        double r  = warpReduceSum(result[k]);
+        double dx = warpReduceSum(dResultX[k]);
+        double dy = warpReduceSum(dResultY[k]);
+        double dz = warpReduceSum(dResultZ[k]);
+        if (lane == 0)
+        {
+            G[base + k]    = r;
+            dGdx[base + k] = dx;
+            dGdy[base + k] = dy;
+            dGdz[base + k] = dz;
+        }
     }
 }
 
-__device__ inline void symFncExpAngnGroupReal(
-    int numNeighbors, const int* neighElem,
-    const double* neighDist, const double* neighDx, const double* neighDy,
-    const double* neighDz, double rc,
-    int numMembers, const int* e1, const int* e2, const double* eta,
-    const double* lambda, const double* zeta,
-    double* result, double* dResultX, double* dResultY, double* dResultZ,
-    double* neighDGdx, double* neighDGdy, double* neighDGdz)
+__global__ void sfExpAngnGroupKernel(
+    int numAtoms, double rc, int numMembers,
+    const int* e1, const int* e2, const double* eta, const double* lambda,
+    const double* zeta,
+    const int* neighOffset, const int* neighElem, const double* neighDist,
+    const double* neighDx, const double* neighDy, const double* neighDz,
+    double* G, double* dGdx, double* dGdy, double* dGdz,
+    double* neighborDGdx, double* neighborDGdy, double* neighborDGdz)
 {
+    int globalThread = blockIdx.x * blockDim.x + threadIdx.x;
+    int t = globalThread / 32;
+    int lane = globalThread % 32;
+    if (t >= numAtoms) return;
+    int off = neighOffset[t], n = neighOffset[t + 1] - off;
+
+    double result[MAX_MEMBERS] = {0}, dResultX[MAX_MEMBERS] = {0},
+           dResultY[MAX_MEMBERS] = {0}, dResultZ[MAX_MEMBERS] = {0};
+
     double rc2 = rc * rc;
     double rcinv = 1.0 / rc;
 
-    for (int j = 0; j < numNeighbors - 1; ++j)
+    for (int j = lane; j < n - 1; j += 32)
     {
-        double rij = neighDist[j];
+        int idxNJ = off + j;
+        double rij = neighDist[idxNJ];
         if (!(rij < rc)) continue;
-        int nej = neighElem[j];
+        int nej = neighElem[idxNJ];
         double pfcij, pdfcij;
         cutoffTANHU(rij, rcinv, pfcij, pdfcij);
+        double dijx = neighDx[idxNJ], dijy = neighDy[idxNJ], dijz = neighDz[idxNJ];
 
-        for (int k = j + 1; k < numNeighbors; ++k)
+        for (int k = j + 1; k < n; ++k)
         {
-            double rik = neighDist[k];
+            int idxNK = off + k;
+            double rik = neighDist[idxNK];
             if (!(rik < rc)) continue;
-            int nek = neighElem[k];
+            int nek = neighElem[idxNK];
 
-            double djkx = neighDx[k] - neighDx[j];
-            double djky = neighDy[k] - neighDy[j];
-            double djkz = neighDz[k] - neighDz[j];
+            double dikx = neighDx[idxNK], diky = neighDy[idxNK], dikz = neighDz[idxNK];
+            double djkx = dikx - dijx;
+            double djky = diky - dijy;
+            double djkz = dikz - dijz;
             double rjk2 = djkx * djkx + djky * djky + djkz * djkz;
             if (!(rjk2 < rc2)) continue;
             double rjk = sqrt(rjk2);
@@ -162,8 +214,6 @@ __device__ inline void symFncExpAngnGroupReal(
             double pfcik, pdfcik; cutoffTANHU(rik, rcinv, pfcik, pdfcik);
             double pfcjk, pdfcjk; cutoffTANHU(rjk, rcinv, pfcjk, pdfcjk);
 
-            double dijx = neighDx[j], dijy = neighDy[j], dijz = neighDz[j];
-            double dikx = neighDx[k], diky = neighDy[k], dikz = neighDz[k];
             double costijk0 = (dijx * dikx + dijy * diky + dijz * dikz) / (rij * rik);
 
             double pfc = pfcij * pfcik * pfcjk;
@@ -211,54 +261,37 @@ __device__ inline void symFncExpAngnGroupReal(
                 dResultY[m] += drijy + driky;
                 dResultZ[m] += drijz + drikz;
 
-                int idxJ = j * numMembers + m;
-                int idxK = k * numMembers + m;
-                neighDGdx[idxJ] -= drijx + drjkx;
-                neighDGdy[idxJ] -= drijy + drjky;
-                neighDGdz[idxJ] -= drijz + drjkz;
-                neighDGdx[idxK] -= drikx - drjkx;
-                neighDGdy[idxK] -= driky - drjky;
-                neighDGdz[idxK] -= drikz - drjkz;
+                size_t idxJ = (size_t)idxNJ * numMembers + m;
+                size_t idxK = (size_t)idxNK * numMembers + m;
+                atomicAdd(&neighborDGdx[idxJ], -(drijx + drjkx));
+                atomicAdd(&neighborDGdy[idxJ], -(drijy + drjky));
+                atomicAdd(&neighborDGdz[idxJ], -(drijz + drjkz));
+                atomicAdd(&neighborDGdx[idxK], -(drikx - drjkx));
+                atomicAdd(&neighborDGdy[idxK], -(driky - drjky));
+                atomicAdd(&neighborDGdz[idxK], -(drikz - drjkz));
             }
         }
     }
-    for (int m = 0; m < numMembers; ++m)
-    {
-        result[m] *= pow(2.0, 1.0 - zeta[m]);
-    }
-}
-
-__global__ void sfExpAngnGroupKernel(
-    int numAtoms, double rc, int numMembers,
-    const int* e1, const int* e2, const double* eta, const double* lambda,
-    const double* zeta,
-    const int* neighOffset, const int* neighElem, const double* neighDist,
-    const double* neighDx, const double* neighDy, const double* neighDz,
-    double* G, double* dGdx, double* dGdy, double* dGdz,
-    double* neighborDGdx, double* neighborDGdy, double* neighborDGdz)
-{
-    int t = blockIdx.x * blockDim.x + threadIdx.x;
-    if (t >= numAtoms) return;
-    int off = neighOffset[t], n = neighOffset[t + 1] - off;
-
-    double result[MAX_MEMBERS] = {0}, dResultX[MAX_MEMBERS] = {0},
-           dResultY[MAX_MEMBERS] = {0}, dResultZ[MAX_MEMBERS] = {0};
-
-    symFncExpAngnGroupReal(n, &neighElem[off], &neighDist[off], &neighDx[off],
-                           &neighDy[off], &neighDz[off], rc, numMembers,
-                           e1, e2, eta, lambda, zeta,
-                           result, dResultX, dResultY, dResultZ,
-                           &neighborDGdx[(size_t)off * numMembers],
-                           &neighborDGdy[(size_t)off * numMembers],
-                           &neighborDGdz[(size_t)off * numMembers]);
 
     size_t base = (size_t)t * numMembers;
-    for (int k = 0; k < numMembers; ++k)
+    for (int m = 0; m < numMembers; ++m)
     {
-        G[base + k] = result[k];
-        dGdx[base + k] = dResultX[k];
-        dGdy[base + k] = dResultY[k];
-        dGdz[base + k] = dResultZ[k];
+        double r  = warpReduceSum(result[m]);
+        double dx = warpReduceSum(dResultX[m]);
+        double dy = warpReduceSum(dResultY[m]);
+        double dz = warpReduceSum(dResultZ[m]);
+        if (lane == 0)
+        {
+            // Only G gets this normalization -- the derivative
+            // accumulators already have it baked in via fgF = fg * pnorm
+            // inside the pair loop above (matches the original serial
+            // code exactly: result[m] *= pow(...) post-loop, dResultX/Y/Z
+            // untouched).
+            G[base + m]    = r * pow(2.0, 1.0 - zeta[m]);
+            dGdx[base + m] = dx;
+            dGdy[base + m] = dy;
+            dGdz[base + m] = dz;
+        }
     }
 }
 
@@ -486,8 +519,10 @@ void gpuSfExpRadGroup(int numAtoms, int const* neighOffset,
     CUDA_CHECK(cudaMemsetAsync(b.d_neighborDGdy, 0, neighGSize * sizeof(double), s));
     CUDA_CHECK(cudaMemsetAsync(b.d_neighborDGdz, 0, neighGSize * sizeof(double), s));
 
-    int const blockSize = 128;
-    int const gridSize = (numAtoms + blockSize - 1) / blockSize;
+    // Warp-per-atom: each atom needs 32 threads (one warp), not one.
+    int const blockSize = 128;                 // 4 warps/block
+    int const warpsPerBlock = blockSize / 32;
+    int const gridSize = (numAtoms + warpsPerBlock - 1) / warpsPerBlock;
     sfExpRadGroupKernel<<<gridSize, blockSize, 0, s>>>(
         numAtoms, e1, rc, numMembers, b.d_eta, b.d_rs,
         b.d_neighOffset, b.d_neighElem, b.d_neighDist,
@@ -572,8 +607,10 @@ void gpuSfExpAngnGroup(int numAtoms, int const* neighOffset,
     CUDA_CHECK(cudaMemsetAsync(b.d_neighborDGdy, 0, neighGSize * sizeof(double), s));
     CUDA_CHECK(cudaMemsetAsync(b.d_neighborDGdz, 0, neighGSize * sizeof(double), s));
 
-    int const blockSize = 128;
-    int const gridSize = (numAtoms + blockSize - 1) / blockSize;
+    // Warp-per-atom: each atom needs 32 threads (one warp), not one.
+    int const blockSize = 128;                 // 4 warps/block
+    int const warpsPerBlock = blockSize / 32;
+    int const gridSize = (numAtoms + warpsPerBlock - 1) / warpsPerBlock;
     sfExpAngnGroupKernel<<<gridSize, blockSize, 0, s>>>(
         numAtoms, rc, numMembers, b.d_e1, b.d_e2, b.d_eta, b.d_lambda, b.d_zeta,
         b.d_neighOffset, b.d_neighElem, b.d_neighDist,
