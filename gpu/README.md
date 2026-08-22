@@ -4614,3 +4614,77 @@ fraction of full-200000-step cost -- would be the proportionate way to
 check whether the same short-run-optimistic/long-run-pessimistic
 divergence shows up there too, before treating "GPU_SF is fine for big
 systems" as anything more than an informed guess.
+
+### Follow-up: candidate approach #1 ruled out cleanly -- the real cause is a time-correlated environment change, not run length, node identity, or a within-run degradation
+
+Implemented candidate #1 from the previous entry: resurrected the
+phase-level `Stopwatch` instrumentation (CSR build / GPU call /
+scatter-back), but reporting *windowed* deltas (last 2000 calls) every
+2000 timesteps throughout a full 200000-step H2O_2G run, instead of a
+single early snapshot -- directly testing whether the CPU-glue-to-GPU
+ratio grows over the course of a long run.
+
+**Result: flat.** First 10% of the run vs. last 10%: GPU-call time
+-0.5%, CSR+scatter time +2.4%, ratio +2.9% -- noise-level, no trend.
+**Candidate #1 is ruled out** -- nothing about the SF-GPU dispatch's
+own internal phase balance changes over the course of a long run.
+
+That same data pointed somewhere more useful, though: the *first* 2000
+steps of this 200000-step run were *already* running at the slow rate
+(SF-only ~0.0186s/step) -- not something that develops gradually. That
+reopened the node-identity question from the previous entry's
+telemetry check, since "slow from step 1, on whichever node this
+particular job happened to land on" is exactly what node-to-node
+hardware variance would look like too.
+
+**Directly tested node identity by forcing repeat runs onto specific
+nodes (`--nodelist`).** The original fast measurement (job 52576480,
+2000 steps, 0.0119s/step aggregate SF+NN Pair time) ran on `lrdn3271`.
+Forcing an identical 2000-step run onto `lrdn1600` (the node behind
+the slow 200000-step runs) reproduced the slow rate exactly
+(0.0198s/step) -- consistent with node identity mattering. But forcing
+the *same* identical config back onto `lrdn3271` itself, the
+originally "fast" node, **also came back slow** (0.0198s/step) --
+four days after the original fast measurement. A single physical node
+cannot be fast once and slow later while every other node stays
+uniformly slow in between if the cause were a fixed hardware property
+of that node. **Node identity is therefore also ruled out.**
+
+**The real pattern is time-correlated, not node-correlated or
+duration-correlated:**
+
+| Job | Time (Aug 2026) | Node | Result |
+|---|---|---|---|
+| 52576480 | 17th, 11:40 | `lrdn3271` | fast (0.0119s/step) |
+| 52588528 | 17th, 13:46 | `lrdn1818` | slow (0.0198s/step) |
+| 52597485 | 17th, 17:08 | `lrdn1700` | slow (0.0198s/step) |
+| 52603120 | 17th, 19:59 | `lrdn1600` | slow (0.0199s/step) |
+| 52664763 | 19th, 14:45 | `lrdn1600` | slow (0.0198s/step) |
+| 52787816 | 22nd, 00:18 | `lrdn3271` | slow (0.0198s/step) |
+
+Five different nodes, spanning five days, all uniformly slow --
+except the single earliest measurement. Something changed, cluster-wide
+or in the immediate run environment, in the roughly two-hour window
+between 11:40 and 13:46 on the 17th, after which every subsequent
+measurement on every tested node has been consistently ~67% slower per
+step than that one early result. No git commits landed in that window
+(checked directly), so it isn't attributable to a code change on this
+project's side that's visible in version control. One job ran in that
+window whose log was later deleted during an unrelated output-cleanup
+pass, so the boundary can't be narrowed past that ~2-hour range with
+data currently available.
+
+**Conclusion: the root cause of the short-run/long-run divergence is
+an environment change correlated with time, not with run length, node
+identity, or GPU thermal/clock/contention state (all directly ruled
+out across this and the previous entry).** What actually changed is
+not identified -- a driver/MPS update, a scheduler or cluster
+configuration change, or something else outside this project's
+visibility are all plausible, none confirmed. Not pursued further this
+session given the compute and wall-clock already spent chasing it;
+flagged here for anyone revisiting this with access to cluster-side
+change logs for that window. The practical conclusion for `GPU_SF=1`
+is unchanged either way: every measurement taken since that window --
+which is to say, the environment this code will actually run in going
+forward -- shows a real, substantial loss at this project's production
+configuration, so it stays a separate, off-by-default opt-in flag.
