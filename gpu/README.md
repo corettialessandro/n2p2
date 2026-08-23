@@ -4688,3 +4688,152 @@ is unchanged either way: every measurement taken since that window --
 which is to say, the environment this code will actually run in going
 forward -- shows a real, substantial loss at this project's production
 configuration, so it stays a separate, off-by-default opt-in flag.
+
+### Follow-up: benchmarking three new real-world systems (water, magnetite,
+feldspar) found a genuine race condition in the GPU force-computation path
+
+A colleague (Pablo) provided three new 2G-HDNNP training sets to
+benchmark CPU-vs-GPU on: `water` (H/O, softplus activation, 1495
+structures), `magnetite` (Fe/O/H, tanh, 26789 structures, plus
+`committee_mode`/`committee_data`/`committee_cutoff` settings this n2p2
+fork doesn't implement -- confirmed via grep across `src/libnnp`/
+`src/application`, harmless since `Settings.cpp` only warns on unknown
+keywords, doesn't error), and `feldspar` (H/O/K/Al/Si, tanh, 12575
+structures). Three hardware configs per system (Booster 32-core CPU,
+Booster 32-core+4-GPU, DCGP 112-core), 10-epoch preliminary runs first,
+100-epoch full runs to follow.
+
+**Checked whether the recent LAMMPS-interface/SF-GPU work (this file's
+last several entries) affected `nnp-train`'s code path before running
+anything** -- it doesn't: every change since the H2O_2G 100-epoch
+reference artifact (`8784c3e`/`567d14e`) that touches
+`Mode.cpp`/`Element.{h,cpp}`/the two `libnnp*/makefile`s is inside
+`#if defined(N2P2_GPU_SF)`-gated blocks (confirmed by diffing
+`Mode.cpp` against the pre-LAMMPS-work commit and reading every hunk),
+which plain `GPU=1` builds never enable. The one thing that *did*
+change since that reference artifact -- the activation-function
+generalization (`4ee5b0f`/`cd5de23`) -- is unrelated to the LAMMPS work
+and is required here anyway: water uses softplus, and pre-generalization
+`hasGpuCompatibleArchitecture()` silently fell back to CPU-only for
+anything but tanh. So: current `HEAD` used as-is, no revert.
+
+**Host-memory OOM risk, checked before running anything expensive.**
+Naive scaling from structure counts alone suggested magnetite/feldspar
+(21x/10x more structures than H2O_2G) would blow past a node's ~514GB
+RAM -- but `nnp-scaling`'s own built-in memory estimator (it prints
+this unprompted) gave much more reassuring, dataset-composition-aware
+numbers: water 12.6 GiB, magnetite 253.9 GiB, feldspar 177.4 GiB --
+both comfortably under one node's capacity. Real measured peak RSS
+during the 10-epoch runs ran ~25-30% over that estimate (magnetite
+317GB, feldspar 223GB) -- consistent enough to trust the estimator as
+a planning tool, not exact. Practical lesson: `--mem=` should be sized
+per system from this estimate (with margin), not copy-pasted from
+H2O_2G's ~75GB baseline -- one job (feldspar's Booster-GPU run, capped
+at a copy-pasted 280GB) hit a real `slurmstepd oom_kill` this way.
+
+**A second, different kind of OOM: `GpuForces.cu`'s persistent
+per-structure device-memory cache is unbounded** (topology uploaded
+once per structure, never evicted -- a design gap deliberately deferred
+back when H2O_2G, ~1254 structures, was the only dataset this ever ran
+on). Per-GPU cached-structure count works out to
+`(total dataset structures) / (total GPUs)`, independent of how many
+MPI ranks share each GPU. Magnetite's single-node (4-GPU) run hit this
+directly -- `GPU error at GpuForces.cu:114/117: out of memory`, crashing
+during the very first pass over the data. Fix (resource-level, no code
+change): spread across more nodes/GPUs -- 2 nodes (8 GPUs) halves the
+per-GPU load and both magnetite's and feldspar's Booster-GPU 10-epoch
+runs completed cleanly at that setting. `gpu/pablo_benchmark/
+train_booster_gpu_multinode.slurm` generalizes the single-node GPU
+training script: rank/GPU counts computed from `$SLURM_NTASKS`/
+`$SLURM_JOB_NUM_NODES` instead of hardcoded, and (the part the
+single-node script didn't need) an MPS control daemon started via
+`srun --ntasks-per-node=1` across the *whole* allocation, since MPS is
+per-node and the original script only started one on the launch node.
+
+**The important finding: water's GPU training run doesn't just run
+slower or faster -- it silently diverges to NaN.** Epoch-by-epoch
+energy RMSE: `5.3E-4` (epoch 1, CPU, converging normally) vs. `1.29E+34`
+(epoch 1, GPU) -> `INF` (epoch 4) -> `NaN` (epoch 6 onward). Both CPU
+variants (Booster, DCGP; identical `input.nn`) converge smoothly from
+epoch 1. Magnetite/feldspar's GPU runs show no such thing -- their
+CPU-vs-GPU differences are modest and look like ordinary Kalman-filter
+run-to-run chaos (different rounding, different but still-converging
+trajectory), not corruption. Water is also the only one of the three
+using softplus rather than tanh, which was the first suspect --
+checked `GpuNeuralNetwork.cu`'s `AF_SOFTPLUS` forward/backward
+formulas directly against `NeuralNetwork.cpp`'s reference (including
+the `EXP_LIMIT=35.0` overflow clamp): bit-for-bit identical. Not the
+activation math.
+
+**Isolated via a dedicated `gpu/pablo_benchmark/debug_water_force/`
+harness** (built CPU and GPU `nnp-dataset` in the already-built worktrees,
+compared predicted forces structure-by-structure against a known-good
+CPU baseline on water's *epoch-0* weights -- CPU and GPU matched
+exactly at epoch 0 with 32 ranks each, so this is a clean, apples-to-
+apples starting point, not confounded by different random weight
+initialization):
+- Energy always matched exactly, at every scale tested -- the bug is
+  isolated to `GpuForces.cu`'s force path specifically, not the NN
+  forward pass.
+- A 20-structure subset at 4 ranks/1 GPU (no MPS) matched CPU exactly.
+  The full 140-structure test set at 4, 8, or 32 ranks (with or
+  without the MPS wrapper) showed **every single structure** disagreeing.
+- Bisecting ruled out rank count and GPU-sharing density directly:
+  holding rank/GPU config fixed at the known-good 4-ranks/1-GPU/no-MPS
+  setting and only swapping in the full 140-structure set still broke
+  *all* 140, including the first 20 that matched perfectly in isolation.
+  So it isn't rank count, GPU count, or MPS/wrapper presence.
+- At 1 rank processing all 140 structures sequentially (no MPI
+  complexity at all), only 38 of 140 disagreed -- always the *first*
+  38 in file order, not a fixed set tied to specific structure content.
+- Wrapping the 1-rank/140-structure case in `compute-sanitizer`
+  (`--tool memcheck`, after working around two rounds of unrelated
+  `CUDA_ERROR_INVALID_CONTEXT` noise from OpenMPI's own UCX transport
+  probing CUDA devices during `MPI_Init` -- fixed with
+  `OMPI_MCA_pml=ob1 OMPI_MCA_osc=^ucx UCX_TLS=^cuda,...`) reported
+  **zero errors, and the bug disappeared** -- forces matched CPU
+  exactly under the sanitizer.
+
+**That combination -- correct under `memcheck`'s heavy serialization,
+wrong under normal unsynchronized execution, and triggered by
+processing enough structures in one process -- is the standard
+signature of a genuine race condition**, not a formula bug or an
+indexing mistake. `GpuForces.cu`'s topology upload/compute both use
+synchronous `cudaMemcpy` and default-stream kernel launches, which
+*should* already serialize correctly within one rank; the actual
+missing synchronization point hasn't been pinned to a line yet --
+`memcheck` isn't the right sanitizer tool for this (`racecheck`/
+`synccheck` are, or manual `cudaDeviceSynchronize()` bisection), and
+that's the natural next step if this gets picked back up.
+
+**Decision, given the investigation cost already spent (~15 short
+diagnostic jobs)**: paused here rather than continuing into
+`racecheck`/`synccheck`. Practical scope for now: water's GPU number is
+not trustworthy and shouldn't be used -- CPU (Booster) and DCGP-112 are
+the valid comparison for water until this is root-caused and fixed.
+Magnetite and feldspar's GPU results are trustworthy (no divergence,
+differences from CPU are the expected kind) and their 100-epoch runs
+proceed normally, on 2 nodes/8 GPUs per the OOM fix above. This is a
+real, shipped-code bug independent of any of this file's other GPU_SF
+findings -- worth fixing on its own merits, not just for this benchmark.
+
+10-epoch timing summary (wall-clock, Booster CPU / Booster GPU / DCGP-112):
+
+| System | Booster CPU (32 cores) | Booster GPU | DCGP-112 |
+| --- | --- | --- | --- |
+| water | 481.7s (48.2s/ep) | 77.8s (7.8s/ep) -- **diverged, not valid** | 283.9s (28.4s/ep) |
+| magnetite | 32514s / 9.04h | 12045s / 3.35h (2 nodes/8 GPUs) | 15695s / 4.36h |
+| feldspar | 81825s / 22.7h | 11049s / 3.07h (2 nodes/8 GPUs) | 46848s / 13.0h |
+
+GPU's magnetite/feldspar numbers used 2 nodes (8 GPUs) vs. CPU/DCGP's 1
+node, per the OOM fix above -- not a resource-matched comparison, real
+single-node-equivalent speedup would be smaller. 100-epoch runs (with
+`write_trainpoints`/`write_trainforces` disabled -- Pablo's water/
+feldspar `input.nn` had these at `1`, which would have written a full
+per-epoch force-comparison file, 425MB for feldspar alone, every
+epoch; ~42GB for feldspar over 100 epochs. Matches H2O_2G's/magnetite's
+already-sensible `0` convention) follow, results routed directly to
+`/leonardo_work/L-AUT_Giane_26/acoretti/NEURALCPM/gpu_porting/
+pablo_benchmark/` instead of home -- home hit its 50GB cap during the
+10-epoch runs and had to be freed by moving feldspar/magnetite's
+results there mid-session.
