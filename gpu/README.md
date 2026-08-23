@@ -4689,6 +4689,60 @@ which is to say, the environment this code will actually run in going
 forward -- shows a real, substantial loss at this project's production
 configuration, so it stays a separate, off-by-default opt-in flag.
 
+### RETRACTED -- everything from here to the "corrected understanding" entry at the end of this file is INVALID. Do not cite, trust, or act on any specific number, structure count, or "X vs Y" claim in this range.
+
+**Read this box first if you're jumping into the file anywhere below.**
+Every entry from this line through the final "### Follow-up: corrected
+understanding" entry at the end of the file describes an investigation
+built on a broken comparison script. The specific claims below --
+"38 of 140 structures disagree," "median force diff 0.43," "systemic
+across all three systems," "root cause is normalization-constant
+magnitude," the whole "race condition" framing, all of it -- are
+**not real findings**. They are artifacts of a scripting bug, described
+in full at the end of this file. The bug: every `nnp-dataset`
+CPU-vs-GPU force comparison in this range joined the two `forces.comp`
+files using `join -j 1` on the key `structure-index_atom-index` --
+but each atom appears on **three** consecutive lines in that file (one
+per force *x/y/z* component), so the key is not unique. POSIX `join`
+on a non-unique key emits the **cartesian product** of every matching
+line on both sides, which silently cross-paired components (e.g.
+CPU's *x* value against GPU's *y* or *z* value) and manufactured large
+"disagreements" that reflect nothing more than the fact that force
+components have different values from each other -- not any actual
+CPU-vs-GPU discrepancy.
+
+**What actually happened when this was redone correctly** (row-aligned
+comparison instead of the broken join, plus an independent manual
+Python recomputation of the force from the raw values fed into
+`GpuForces.cu`'s kernels): CPU and GPU produce **bit-identical-to-
+floating-point-precision forces** for water, magnetite, feldspar, and
+H2O_2G, under every normalization configuration tested. `GpuForces.cu`
+is correct. There is no per-structure GPU force corruption, no
+activation-function sensitivity, no normalization-magnitude
+sensitivity, and no cross-system pattern -- none of that was ever
+real.
+
+**What IS still real and unaffected by this bug**: water's actual
+`nnp-train` GPU run (full iterative Kalman-filter training over
+multiple epochs) genuinely diverges to `NaN` -- that observation came
+directly from `nnp-train`'s own printed per-epoch log output, never
+touched by the flawed comparison script. With the force computation
+itself now conclusively cleared, the real open question is why water's
+training *loop* (not the force kernel) diverges over epochs -- most
+likely chaotic amplification, over many sequential Kalman updates, of
+some ordinary and otherwise harmless CPU-vs-GPU floating-point
+reassociation difference (already documented as expected, bounded
+behavior for H2O_2G elsewhere in this file) that for water's specific
+configuration runs away instead of staying bounded. Not yet
+investigated with a correct methodology -- treat this as the next
+thing to look at, not as an answered question.
+
+The entries below are preserved, unedited, exactly as originally
+written, so the mistake and how it was found are on the record --
+**not** because any conclusion in them should be trusted.
+
+---
+
 ### Follow-up: benchmarking three new real-world systems (water, magnetite,
 feldspar) found a genuine race condition in the GPU force-computation path
 
@@ -5121,3 +5175,123 @@ variable explanations (magnitude alone, `force`-mode-vs-fixed alone)
 are each falsified by at least one row in this table. Not yet resolved;
 the honest state is "two real, interacting factors, second one
 unidentified" rather than a clean single root cause.
+
+---
+
+### Follow-up: corrected understanding -- every entry above since the "RETRACTED" marker was chasing a scripting bug, not a real GPU bug
+
+Everything from the "RETRACTED" box earlier in this file through the
+entry directly above this one is invalid. This entry explains exactly
+how that was found, what was actually re-verified, and what's really
+still true and still open. Read this entry, not the retracted ones,
+for the current state of knowledge.
+
+**How the bug was found.** Debugging this "systemic GPU force
+corruption" properly required tracing actual numbers, not just
+aggregate output -- so `Mode.cpp` was temporarily instrumented (gated
+behind an env var, never committed to the shared build) to dump the
+exact inputs `GpuForces.cu`'s kernels receive (the CSR self-term
+`dGdrSelf`, the neighbor edge list `edgeTarget`/`edgeOwnerDEdGIndex`/
+`edgeDGdr`, and `dEdG`) and its raw output force, for one chosen
+structure at a time. The plan: manually recompute the force from the
+dumped inputs in Python (double precision, the exact same summation
+`selfForceKernel`/`pairForceKernel` do), and compare that recomputation
+against both the GPU's actual dumped output and the CPU-trusted force
+for the same structure -- if the bug were real, this would show
+exactly where it lives (CPU-side topology construction vs. the GPU
+kernel itself).
+
+Traced structure 0 for both water and H2O_2G first, as a sanity check
+before hunting the "worst" structures the retracted entries had
+identified. Both matched the GPU's actual output to the recomputation
+to machine precision (~1e-16) -- already suspicious, since structure 0
+"shouldn't" have been clean if the corruption were as pervasive as
+claimed. Went straight for the previously-identified worst offender
+instead: water structure 86, atom 163, reported earlier (in the now-
+retracted entries) as showing a `0.171` disagreement -- the single
+largest in the whole dataset. Traced it directly, twice (once at 1
+rank, once at 4 ranks, matching the exact rank count the original
+"bad structure" identification used). **Both traces showed perfect
+agreement** -- GPU actual, Python recomputation, and CPU-trusted force
+all matched to machine precision, for the *exact* atom that had been
+reported as the worst-disagreeing case in the whole investigation.
+
+That result -- a structure independently and specifically flagged as
+badly wrong, found to be perfectly correct under direct inspection --
+was the signal that the measurement itself, not the GPU code, was
+broken. Went back to the comparison script and found it: every
+CPU-vs-GPU `forces.comp` comparison in the retracted entries used
+
+```
+join -j 1 <(awk '{printf "%s_%s %s\n",$1,$2,$4}' cpu.forces.comp | sort) \
+          <(awk '{printf "%s_%s %s\n",$1,$2,$4}' gpu.forces.comp | sort)
+```
+
+keyed on `structure-index_atom-index`. `forces.comp` prints **three**
+consecutive rows per atom (the *x*, *y*, and *z* force components),
+all sharing that same key. `join` on a non-unique key emits the
+cartesian product of every matching line on each side -- for 3
+matching rows per file per key, that's 9 output lines per atom instead
+of 3, most of them cross-pairing *mismatched* components (CPU's *x*
+joined to GPU's *y*, etc.). The resulting "differences" were mostly
+just the size of ordinary inter-component variation in a force vector,
+not any real CPU-vs-GPU disagreement -- and large enough, sampled
+across enough atoms, to look exactly like a genuine, reproducible,
+structure-dependent corruption pattern.
+
+**Redid every key comparison correctly** (row-aligned via `paste`,
+after verifying both files list the same structures/atoms in the same
+order -- true whenever `<shuffle>=0` and rank counts match, which
+every retracted test used) instead of the broken `join`:
+
+| System | Retracted (broken) result | Corrected result |
+| --- | --- | --- |
+| water, `normalize_data_set force` | median `0.43`, max `3.83` | max `0` (bit-identical) |
+| water, `nnp-norm` calibration | median `0.019`, max `0.171` | max `1e-10` |
+| magnetite | 150/150 structures "disagree" | max `1e-11` |
+| feldspar | 150/150 structures "disagree" | max `0` |
+| H2O_2G, `normalize_data_set force` | median `0.00748`, max `0.082` | max `1e-10` |
+
+Every single one is clean. `GpuForces.cu` produces the same forces as
+the CPU implementation, full stop -- across every system, every
+normalization configuration, every activation function, every rank
+count tested in this whole investigation. There was never a per-
+structure corruption pattern, never an activation-function dependence,
+never a normalization-magnitude dependence, never a "second system-
+specific factor." All of that was the shape of noise from a broken
+join, mistaken for a signal because it was consistent enough (across
+many re-runs of the *same broken script*) to look reproducible.
+
+**What survives, because it never touched the broken script**: water's
+real `nnp-train` GPU run -- full iterative Kalman-filter training, not
+a single-shot force evaluation -- genuinely diverges to `NaN` by epoch
+6 (energy RMSE `1.29E+34` already at epoch 1). That number came
+straight from `nnp-train`'s own log, printed independently of any of
+this investigation's comparison tooling. It's real.
+
+**Where that leaves the actual open question**: given `GpuForces.cu` is
+now conclusively correct, water's training-time divergence can't be a
+force-computation bug. The far more likely explanation, and one this
+file already documented as expected behavior in H2O_2G's own 100-epoch
+validation earlier on ("Kalman-filter training is a recursive,
+chaotically-sensitive process where tiny floating-point order-of-
+operation differences between CPU and GPU math compound fast over many
+sequential updates"): ordinary, harmless run-to-run floating-point
+noise (different summation order between CPU and GPU reductions,
+present in *every* run, GPU or not) gets chaotically amplified over
+many sequential weight updates -- bounded and harmless for H2O_2G
+(its trajectory diverges from CPU's but both still converge), but for
+water's specific configuration the amplification runs away to `NaN`
+instead of staying bounded. This is a genuine, unresolved question
+about Kalman-filter training-loop numerical stability for water's
+configuration specifically -- not a GPU correctness bug, and not yet
+investigated with a methodology anyone should trust without triple-
+checking the comparison script first this time.
+
+**Practical takeaway for anyone touching this in the future**: never
+compare two `forces.comp` files with a join/merge keyed on anything
+less specific than a genuinely unique row identifier (structure index
++ atom index + component index, or just row order if both files are
+verified to list rows in identical order first). A non-unique-key join
+silently produces a cartesian product with no error or warning --
+exactly the trap this whole investigation fell into.
