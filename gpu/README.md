@@ -4958,3 +4958,42 @@ much bigger structures vs. many smaller ones. Something about
 per-structure edge-list/topology *shape* (not the number of structures
 visited) is the more likely axis to chase next, though this hasn't
 been tested directly yet either.
+
+### Follow-up: ruled out a global-normalization-corruption mechanism; input.nn diffing and normalization tracing found real differences but not the cause
+
+Comparing water's and H2O_2G's `input.nn` directly surfaced a real
+structural difference worth checking: H2O_2G has `mean_energy`/
+`conv_energy`/`conv_length` pre-baked as fixed constants (computed once,
+offline, by `nnp-norm` -- the older, optional workflow, per n2p2's own
+docs), while water/magnetite/feldspar all use `normalize_data_set
+force`, which computes this calibration *on-the-fly* inside `nnp-train`
+itself every run (the newer, documented-as-preferred path -- no
+`nnp-norm` step needed).
+
+Reading `Training.cpp`'s handling of `normalize_data_set == "force"`
+directly confirms the calibration depends on GPU-dispatched force
+predictions: `convLength = sigmaForceNnp` (std. dev. of the *NNP's own
+predicted* forces from an initial pass over the whole training set --
+literally the same `calculateForces()`/`GpuForces.cu` path already
+isolated as producing wrong per-structure forces), `convEnergy =
+sigmaForceNnp / sigmaForceRef`. `meanEnergy` comes from reference data
+only, unaffected -- fitting neatly with energy always matching exactly
+while forces don't. A very plausible causal chain: `GpuForces.cu`
+corrupts raw forces -> corrupts the `sigmaForceNnp` statistic -> a
+wrong global scaling constant gets baked in and applied to everything
+downstream for the rest of the run.
+
+**Tested directly and ruled out**: ran a GPU-linked `nnp-train` and a
+CPU-linked `nnp-train` on identical fresh `input.nn` (same
+`random_seed`, tanh, 1 epoch) and diffed the resulting computed
+`mean_energy`/`conv_energy`/`conv_length`. **Identical to all 16
+significant digits.** The aggregate `sigmaForceNnp` statistic --
+computed from ~337 structures/rank of the real training set -- comes
+out the same between backends, even though the same-scale, same-rank-
+count `nnp-dataset` comparison on the 140-structure *test* set showed
+every single structure's individual force prediction disagreeing.
+Whatever's wrong doesn't corrupt this particular aggregate statistic
+detectably, which rules out the clean "one wrong global constant
+explains everything" story -- the actual per-call force corruption in
+`GpuForces.cu` is still the real site of the bug, unexplained mechanism
+still not identified.
