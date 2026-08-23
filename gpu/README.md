@@ -5594,3 +5594,37 @@ training is out of scope this pass and untested this session
 stage 1); if 4G training work resumes and uses `force`-based
 normalization, this cache needs the identical fix and verification
 before its forces can be trusted.
+
+### Follow-up: honest, resource-matched DCGP comparison for magnetite (2 nodes/224 ranks, matching GPU's 2-node/8-GPU footprint)
+
+The original 10-epoch timing table above compared GPU's 2-node/8-GPU
+magnetite run against a **1-node** DCGP-112 run -- not resource-matched
+(GPU's OOM fix, spreading `GpuForces.cu`'s per-structure device cache
+across 2 nodes, was a correctness necessity, not a choice). Reran
+magnetite on DCGP at 2 nodes/224 ranks (`train_dcgp_112.slurm`,
+generalized earlier to read `$SLURM_NTASKS`/`$SLURM_JOB_NUM_NODES`
+dynamically) for a real apples-to-apples comparison, mirroring the
+feldspar request:
+
+| Config | Per-epoch time |
+| --- | --- |
+| Booster CPU, 32 cores, 1 node | 3244.2s (54.07 min) |
+| Booster GPU, 2 nodes/8 GPUs | 1201.1s (20.02 min) |
+| DCGP-112, 1 node/112 ranks | 1562.5s (26.04 min) |
+| **DCGP-112, 2 nodes/224 ranks** | **1180.7s (19.68 min)** |
+
+At matched 2-node scale, **DCGP is marginally faster than GPU** (19.68
+vs. 20.02 min/epoch, ~2% -- within noise, effectively a tie), not the
+2.6x-3x GPU lead the 1-node-DCGP comparison implied. DCGP's own 1-node
+&rarr; 2-node scaling (26.04 &rarr; 19.68 min, ~1.32x from 2x the ranks)
+shows the same sub-linear-but-real improvement already established for
+feldspar and the earlier core-count scan (Phase 3b) -- consistent, not
+a new finding. This 2-node DCGP run predates the stale-force-topology-
+cache fix documented above; since magnetite's GPU forces were never
+observed to diverge like water's (this fix's correctness impact on
+magnetite, if any, is a still-open follow-up noted above), these timing
+numbers stand on their own regardless -- timing is unaffected by force
+correctness either way, same reasoning as the original 10-epoch table.
+Feldspar's matching 2-node DCGP run was still in progress at the time
+of writing; see the next entry (or `sacct -j 53821293`) for its result
+once complete.
