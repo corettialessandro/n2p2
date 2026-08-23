@@ -4927,16 +4927,34 @@ GPU run in this benchmark is unverified and likely wrong. CPU (Booster)
 and DCGP-112 are the only currently-trustworthy comparison for all
 three systems.
 
-**Open question, not yet checked**: does this affect the H2O_2G
-100-epoch GPU validation earlier in this file (the `17.8x`/`5.6x`
-follow-ups)? That validation's force comparison was also an aggregate
-metric (test-set RMSE, `3.865e-4` CPU vs `3.862e-4` GPU, a ~0.08%
-difference) -- much closer agreement than the ~30-100% relative
-differences implied by this entry's per-structure magnitudes, which is
-some evidence H2O_2G's case might genuinely be clean rather than just
-diluted (118 test structures is a similar order of magnitude to
-water's 140, so dilution alone seems like a weaker explanation there
-than it would be for magnetite/feldspar's much larger test sets) -- but
-this is inference, not a direct check, and a direct per-structure
-`nnp-dataset` comparison on H2O_2G the same way would settle it
-properly. Not done yet.
+**Checked directly (was left as an open question, now settled): H2O_2G
+does NOT have this bug.** Same exact methodology -- fresh epoch-0
+weights (already on hand from the original 100-epoch comparison),
+CPU-vs-GPU `nnp-dataset` on the full 118-structure `test.data`, reusing
+the already-built binaries (H2O_2G is the same architecture family,
+tanh/2x25 nodes, no rebuild needed):
+
+| System | Median \|CPU-GPU\| force diff | Max | Verdict |
+| --- | --- | --- | --- |
+| H2O_2G | `0.00027` | `0.0041` | Consistent with ordinary floating-point noise |
+| water (softplus or tanh) | `0.43` | `3.83` | Real corruption |
+| magnetite | `0.21` | `4.85` | Real corruption |
+| feldspar | `0.41` | `4.68` | Real corruption |
+
+H2O_2G's differences are ~1000x smaller than the other three -- the
+right order of magnitude for `pairForceKernel`'s known, harmless
+`atomicAdd` summation-order non-determinism, not the same O(1)
+corruption. **The original "17.8x, no drift" H2O_2G validation earlier
+in this file stands; it was never affected by this bug.**
+
+This is also a useful negative clue for root-causing, not just a relief:
+H2O_2G's test set (118 structures) is a similar *count* to water's
+(140), so "number of structures processed in one call" alone doesn't
+explain the split between clean and corrupted -- ruling out (or at
+least weakening) dataset-size-in-structure-count as the real trigger.
+What differs is per-structure *size*: H2O_2G's structures are ~630
+atoms each vs. water's ~190/magnetite's ~171/feldspar's ~233 -- fewer,
+much bigger structures vs. many smaller ones. Something about
+per-structure edge-list/topology *shape* (not the number of structures
+visited) is the more likely axis to chase next, though this hasn't
+been tested directly yet either.
