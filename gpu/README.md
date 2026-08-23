@@ -5063,3 +5063,61 @@ fix. `normalize_data_set force`'s specific calibration -- deriving
 `conv_length` from an untrained network's own arbitrary force-
 prediction scale -- looks like the actual footgun, independent of
 whether a deeper GPU code fix is ever pursued.
+
+### Follow-up: the clean "magnitude alone" story doesn't survive further corroboration -- there's a real second, system-specific factor still unidentified
+
+Two direct challenges (rightly skeptical of a single-experiment
+conclusion) led to two more corroborating tests, and the picture got
+messier, not cleaner -- worth recording exactly as found rather than
+forcing a tidy narrative.
+
+**Test 1: a genuine, water-specific `nnp-norm` calibration** (not
+H2O_2G's borrowed numbers) -- built and ran `nnp-norm` on water's own
+dataset, giving `conv_energy=61.6`/`conv_length=51.4` (derived from
+reference/DFT statistics, unlike `force` mode's untrained-network
+statistics). Verified directly (via the program's own "SETUP:
+NORMALIZATION" printout, in both the CPU and GPU runs) that these
+values were actually parsed and used, not a test-harness artifact.
+Result: median force diff `0.0192`, max `0.171` -- a real 22x
+improvement over the `force`-mode baseline (`0.43`), but ~30x worse
+than the H2O_2G-borrowed test's `0.00059`, even though `nnp-norm`'s own
+`conv_length` (`51.4`) is *larger* than H2O_2G's (`32.5`). That already
+breaks a clean "`conv_length` magnitude alone" story.
+
+**Test 2: the missing complementary direction** -- take H2O_2G (the
+clean system) and switch *it* to `normalize_data_set force` instead of
+its fixed constants, same 1-epoch-then-`nnp-dataset` methodology.
+Result: H2O_2G's `force`-mode calibration gives `conv_energy=41.7`/
+`conv_length=0.679` (smaller than water's own `force`-mode
+`conv_length=2.29`!), and its force disagreement is median `0.00748`,
+max `0.082` -- **measurably worse than H2O_2G's own clean state
+(`0.00027`, ~28x)**, so H2O_2G is not fully immune to this bug either.
+But it's dramatically *milder* than water's `force`-mode corruption
+(`0.43`, ~57x better), despite H2O_2G's `conv_length` being smaller.
+
+**All five data points together:**
+
+| System | Calibration | conv_energy | conv_length | Median \|force diff\| |
+| --- | --- | --- | --- | --- |
+| water | `force` mode (own) | `2.75` | `2.29` | `0.43` |
+| water | `nnp-norm` (own) | `61.6` | `51.4` | `0.0192` |
+| water | H2O_2G-borrowed | `1997` | `32.5` | `0.00059` |
+| H2O_2G | `force` mode | `41.7` | `0.679` | `0.00748` |
+| H2O_2G | own fixed (`nnp-norm`) | `1997` | `32.5` | `0.00027` |
+
+Neither `conv_length` alone nor `conv_energy` alone is monotonic across
+all five rows (e.g. H2O_2G's `force`-mode `conv_length` is smaller than
+water's, yet its error is 57x better; `nnp-norm`'s `conv_energy` for
+water, `61.6`, is *larger* than H2O_2G `force`-mode's `41.7`, yet gives
+a *worse* result, `0.0192` vs `0.00748`). **Conclusion, stated
+honestly**: normalization-constant magnitude is real and reproducibly
+matters *within* a given system (water's own three tests are cleanly
+ordered: smaller constants -> worse), and `force` mode measurably hurts
+even H2O_2G -- but there is a second, still-unidentified factor tied to
+the system itself (water vs. H2O_2G -- structure size/count,
+composition, symmetry function set, or something else not yet isolated)
+that determines *how much* a given normalization scale hurts. Single-
+variable explanations (magnitude alone, `force`-mode-vs-fixed alone)
+are each falsified by at least one row in this table. Not yet resolved;
+the honest state is "two real, interacting factors, second one
+unidentified" rather than a clean single root cause.
