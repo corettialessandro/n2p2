@@ -4997,3 +4997,69 @@ detectably, which rules out the clean "one wrong global constant
 explains everything" story -- the actual per-call force corruption in
 `GpuForces.cu` is still the real site of the bug, unexplained mechanism
 still not identified.
+
+### Follow-up: root cause narrowed to the magnitude of the normalization constants -- not units, not calibration correctness, the actual numeric scale
+
+Pushed back on directly (rightly) when the working theory drifted
+toward "different physical unit systems" -- units alone shouldn't
+matter to unit-agnostic code, and a re-read of `input.nn` confirmed
+water/magnetite/feldspar's data is in Angstrom while H2O_2G's is in
+Bohr (confirmed via characteristic O-H bond lengths: water ~0.93,
+H2O_2G ~1.82, ratio matching the Bohr/Angstrom conversion factor almost
+exactly), but this alone doesn't explain a real bug in correctly-
+normalized code. Redirected to comparing `input.nn` more carefully
+instead, specifically around normalization.
+
+**That comparison surfaced the real lead**: water's `normalize_data_set
+force`-computed `conv_energy`/`conv_length` (`~2.75`/`~2.29`) are
+727x/14x *smaller* in magnitude than H2O_2G's fixed, `nnp-norm`-computed
+values (`~1997`/`~32.5`) -- not just "present vs. absent" as the
+previous entry treated it, but genuinely different numeric scale. This
+makes sense mechanistically: `force` mode calibrates `convLength` from
+`sigmaForceNnp`, the standard deviation of the *untrained, randomly-
+initialized* network's own force predictions -- an inherently small,
+somewhat arbitrary number, unlike H2O_2G's presumably `ref`-mode-or-
+similar calibration from actual reference-data statistics.
+
+**Tested directly, and it's decisive**: substituted H2O_2G's actual
+`conv_energy`/`conv_length` values into water's `input.nn` (same
+weights, same data, same everything else) and reran the CPU-vs-GPU
+`nnp-dataset` force comparison:
+
+| Config | conv_energy | conv_length | Median \|force diff\| | Max |
+| --- | --- | --- | --- | --- |
+| water, own on-the-fly calibration | `2.75` | `2.29` | `0.43` | `3.83` |
+| water, H2O_2G-scale constants substituted in | `1997` | `32.5` | `0.00059` | `0.0053` |
+| H2O_2G, own fixed calibration | `1997` | `32.5` | `0.00027` | `0.0041` |
+
+Same weights, same dataset, same code, same `GpuForces.cu` -- changing
+only the normalization scale takes water from catastrophic corruption
+to the same clean, floating-point-noise-level agreement H2O_2G already
+had. **This is the real trigger.**
+
+**Why this magnitude would matter mechanistically**: `Mode.cpp:739`
+(`it->changeLengthUnitSymmetryFunctions(convLength)`) rescales every
+symmetry function's length parameters (`eta`, `rs`, `rc`) by
+`convLength` at setup time -- this is the *internal*, normalized
+representation that actually flows through the rest of the
+computation, including into `GpuForces.cu`'s kernels. Computed the
+actual internal-unit cutoff radius for both systems (same *physical*
+cutoff, per the earlier Bohr/Angstrom-conversion finding):
+`rc_physical / convLength` gives water `2.77` vs. H2O_2G `0.369` --
+water's internal geometric quantities are **~7.5x larger in magnitude**
+for the identical physical system, purely because of its much smaller
+`convLength`. Something in the GPU force-computation path is evidently
+sensitive to this internal magnitude -- the exact operation/line
+hasn't been pinned yet (this is a scale *trigger*, not yet the
+mechanism itself), but the trigger is now solid, reproducible, and
+mechanistically explained rather than mysterious.
+
+**Practical mitigation, validated**: using fixed, appropriately-scaled
+`mean_energy`/`conv_energy`/`conv_length` (the traditional `nnp-norm`-
+style approach H2O_2G already uses, or `normalize_data_set ref` instead
+of `force`) avoids the bug entirely, at least for water -- worth
+verifying on magnetite/feldspar too before treating this as a general
+fix. `normalize_data_set force`'s specific calibration -- deriving
+`conv_length` from an untrained network's own arbitrary force-
+prediction scale -- looks like the actual footgun, independent of
+whether a deeper GPU code fix is ever pursued.
