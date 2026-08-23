@@ -1,5 +1,6 @@
 data/
 results/
 logs/
+debug_water_force/
 *.out
 *.err

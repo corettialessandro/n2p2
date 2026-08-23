@@ -4806,16 +4806,17 @@ missing synchronization point hasn't been pinned to a line yet --
 `synccheck` are, or manual `cudaDeviceSynchronize()` bisection), and
 that's the natural next step if this gets picked back up.
 
-**Decision, given the investigation cost already spent (~15 short
-diagnostic jobs)**: paused here rather than continuing into
-`racecheck`/`synccheck`. Practical scope for now: water's GPU number is
-not trustworthy and shouldn't be used -- CPU (Booster) and DCGP-112 are
-the valid comparison for water until this is root-caused and fixed.
-Magnetite and feldspar's GPU results are trustworthy (no divergence,
-differences from CPU are the expected kind) and their 100-epoch runs
-proceed normally, on 2 nodes/8 GPUs per the OOM fix above. This is a
-real, shipped-code bug independent of any of this file's other GPU_SF
-findings -- worth fixing on its own merits, not just for this benchmark.
+**Correction (superseded by the next follow-up entry): magnetite and
+feldspar's GPU results are NOT trustworthy either.** The paragraph
+below originally said the opposite -- wrong, and left visible so the
+mistake and its correction are both on the record. The
+"no divergence, differences look like normal Kalman chaos" read was
+based only on aggregate epoch-RMSE trends over 12M+/2.9M+ force
+components; a direct per-structure check (same methodology as water's,
+done right after this entry was first written) found the identical
+100%-of-structures-wrong pattern in both, just diluted below visibility
+at that aggregate scale. See the next entry for the full correction and
+what's now known.
 
 10-epoch timing summary (wall-clock, Booster CPU / Booster GPU / DCGP-112):
 
@@ -4837,3 +4838,105 @@ already-sensible `0` convention) follow, results routed directly to
 pablo_benchmark/` instead of home -- home hit its 50GB cap during the
 10-epoch runs and had to be freed by moving feldspar/magnetite's
 results there mid-session.
+
+(All six magnetite/feldspar 100-epoch jobs were subsequently cancelled
+before running -- extrapolating from the 10-epoch numbers above, every
+one of them exceeds the cluster's 24h single-job limit, from `1.3
+days` (feldspar GPU) up to `9.5 days` (feldspar CPU, needing ~10
+chained restart jobs). Water's 100-epoch CPU/DCGP jobs were also
+cancelled per explicit direction, in favor of a direct per-epoch
+timing comparison from the 10-epoch data instead -- see the numbers
+above.)
+
+### Follow-up: correction -- the GpuForces divergence is NOT water-
+specific or softplus-specific. It's systemic across all three systems,
+and it's real corruption, not floating-point noise
+
+Two direct questions from the user prompted this: (1) had softplus
+actually been tested against tanh, not just checked at the formula
+level, and (2) given the divergence turned out activation-independent,
+were magnetite/feldspar's GPU results -- only checked at the aggregate
+epoch-RMSE level -- actually clean, or just diluted?
+
+**Both were real gaps, and both changed the picture.**
+
+**Tanh control, same architecture/dataset as water, isolates the
+variable cleanly**: generated fresh epoch-0 weights for water's exact
+network (2 hidden layers, 25/25 nodes, H/O) with `global_activation_short`
+changed from `p p l` to `t t l`, then ran the same CPU-vs-GPU
+`nnp-dataset` force comparison on the full 140-structure test set.
+**Identical result to softplus** -- energy matches exactly, all 140
+structures show force disagreements. Rules out softplus/the activation
+function entirely, which fits the code-level picture: `GpuForces.cu`
+only consumes already-computed `dEdG`, with zero dependency on which
+activation produced it.
+
+**Applying the same per-structure force check to magnetite and
+feldspar (never done before -- their 10-epoch runs were only checked
+via aggregate epoch-RMSE trends) found the identical pattern**: fresh
+epoch-0 weights, CPU-vs-GPU `nnp-dataset` on a 150-structure subset of
+each system's real test set -- **150/150 structures disagree for both**,
+energy exact, same shape as water. The earlier read ("differences look
+like normal Kalman-filter chaos") wasn't wrong about what the
+*aggregate* epoch-RMSE trend showed -- it was wrong to trust that
+aggregate as sufficient evidence of correctness. Averaged over
+12M+/2.9M+ force components, a systematic per-structure corruption is
+easy to miss; averaged over water's 140-structure test set, it isn't.
+
+**Checked whether this is genuine corruption or expected numerical
+noise before concluding anything** -- `pairForceKernel`'s `atomicAdd`
+accumulation has a real, known, harmless non-deterministic summation
+order (order of floating-point addition affects the last few ULPs),
+so a naive ">1e-6 absolute difference" threshold could in principle be
+flagging normal noise, not a bug. Checked the actual *magnitude* of
+disagreements directly: median absolute force-component difference is
+`0.43` (water/tanh), `0.21` (magnetite), `0.41` (feldspar), with maxes
+around `4-5` -- the same order of magnitude as the force values
+themselves. This is real corruption, not ULP-level noise.
+
+**Two more hypotheses tested and ruled out, both empirically:**
+- Added `cudaDeviceSynchronize()` after each kernel launch in
+  `GpuForces.cu::gpuForcesCompute()` (testing whether default-stream
+  ordering wasn't actually providing the serialization it should) --
+  rebuilt, reran the reliably-failing 4-rank/140-structure config:
+  **no change**, still 140/140 wrong.
+- Added host-side bounds checking on the edge-list indices
+  (`edgeTarget`/`edgeOwnerDEdGIndex`) that `Mode.cpp` builds before
+  uploading topology to the GPU -- testing whether a bad index sends a
+  force contribution into a *different* structure's device buffer
+  (memory-layout-dependent, which would explain why `compute-sanitizer
+  --tool memcheck`'s redzone padding "fixes" it: padding moves buffers
+  apart, breaking the accidental aliasing). **Zero violations found** --
+  every index is correctly within range for its own structure.
+
+**Where this leaves things**: the race-condition read from the
+previous entry (correct under `memcheck`'s heavy instrumentation,
+wrong under normal execution, wrong under the lighter `racecheck`/
+`synccheck` tools too) still stands as the best-supported observation,
+but two of the more obvious concrete mechanisms for it (missing
+kernel-completion sync, cross-structure buffer aliasing via bad
+indices) are now ruled out directly rather than just suspected. The
+actual mechanism remains unidentified.
+
+**Practical consequence, corrected from the previous entry**: none of
+the three systems' GPU force numbers from this benchmark should be
+trusted -- not just water's. All three GPU timing numbers (wall-clock)
+remain valid as *timing* measurements, since they don't depend on force
+correctness, but the trained-model quality/force-error side of every
+GPU run in this benchmark is unverified and likely wrong. CPU (Booster)
+and DCGP-112 are the only currently-trustworthy comparison for all
+three systems.
+
+**Open question, not yet checked**: does this affect the H2O_2G
+100-epoch GPU validation earlier in this file (the `17.8x`/`5.6x`
+follow-ups)? That validation's force comparison was also an aggregate
+metric (test-set RMSE, `3.865e-4` CPU vs `3.862e-4` GPU, a ~0.08%
+difference) -- much closer agreement than the ~30-100% relative
+differences implied by this entry's per-structure magnitudes, which is
+some evidence H2O_2G's case might genuinely be clean rather than just
+diluted (118 test structures is a similar order of magnitude to
+water's 140, so dilution alone seems like a weaker explanation there
+than it would be for magnetite/feldspar's much larger test sets) -- but
+this is inference, not a direct check, and a direct per-structure
+`nnp-dataset` comparison on H2O_2G the same way would settle it
+properly. Not done yet.

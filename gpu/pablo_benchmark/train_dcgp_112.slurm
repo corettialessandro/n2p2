@@ -28,7 +28,7 @@ N2P2_ORIG=/leonardo/home/userexternal/acoretti/Projects/NEURALCPM/Code/n2p2_deve
 EIGEN=/leonardo/home/userexternal/acoretti/Projects/NEURALCPM/Code/eigen-3.4.0
 DATA="$N2P2_ORIG/gpu/pablo_benchmark/data/$SYS"
 RESULTS_BASE=/leonardo_work/L-AUT_Giane_26/acoretti/NEURALCPM/gpu_porting/pablo_benchmark
-OUT="$RESULTS_BASE/${SYS}_dcgp-112_${EPOCHS}ep"
+OUT="$RESULTS_BASE/${SYS}_dcgp-112-mn${SLURM_JOB_NUM_NODES}_${EPOCHS}ep"
 
 mkdir -p "$RESULTS_BASE"
 rm -rf "$OUT" && mkdir -p "$OUT" && cd "$OUT"
@@ -45,8 +45,8 @@ git -C "$N2P2_DEVEL" checkout -- src/libnnp/version.h
 cp "$N2P2_DEVEL/bin/nnp-train" ./nnp-train-cpu
 
 echo ""
-echo "=== Running CPU build (DCGP, 112 ranks, full node), $SYS, $EPOCHS epochs ==="
-mpirun -np 112 ./nnp-train-cpu
+echo "=== Running CPU build (DCGP, $SLURM_NTASKS ranks across $SLURM_JOB_NUM_NODES node(s)), $SYS, $EPOCHS epochs ==="
+mpirun -np "$SLURM_NTASKS" ./nnp-train-cpu
 
 echo ""
 echo "=== timing.out (all epochs) ==="
