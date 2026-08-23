@@ -388,6 +388,23 @@ public:
      * computation to atomic forces. Results are stored in Atom::f.
      */
     void                     calculateForces(Structure& structure) const;
+#ifdef N2P2_GPU
+    /** Invalidate calculateForces()'s cached GPU force topology.
+     *
+     * calculateForces()'s GPU path uploads each structure's topology
+     * (dGdrSelf/edge list, derived from the neighbor list at the cutoff
+     * radius in effect at the time) exactly once per structure index and
+     * reuses it on every later call, since geometry is assumed constant
+     * for the rest of a run. That assumption is violated exactly once:
+     * Training::dataSetNormalization()'s "force"-based normalization
+     * calibration calls calculateForces() using the pre-rescale cutoff,
+     * before that same routine rescales the cutoff radius. Call this
+     * once, right after any such cutoff change, so the next
+     * calculateForces() call per structure re-uploads the corrected
+     * topology instead of silently reusing the stale one.
+     */
+    void                     resetForceTopologyCache();
+#endif
     /** Evaluate neural network potential (includes total energy, optionally
      *  forces and in some cases charges.
      *  @param[in] structure Input structure.

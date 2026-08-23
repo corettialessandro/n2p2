@@ -52,6 +52,22 @@ using namespace std;
 using namespace nnp;
 using namespace Eigen;
 
+#ifdef N2P2_GPU
+namespace
+{
+    // calculateForces()'s GPU topology cache -- see Mode::
+    // resetForceTopologyCache()'s doc comment (Mode.h) for why this
+    // needs to be invalidated once, right after Training::
+    // dataSetNormalization()'s "force"-based cutoff rescale.
+    set<size_t> gpuForceTopologyUploaded;
+}
+
+void Mode::resetForceTopologyCache()
+{
+    gpuForceTopologyUploaded.clear();
+}
+#endif
+
 Mode::Mode() : nnpType                   (NNPType::HDNNP_2G),
                normalize                 (false            ),
                checkExtrapolationWarnings(false            ),
@@ -2468,13 +2484,22 @@ void Mode::calculateForces(Structure& structure) const
     // three NN dispatch functions ever moved, and re-uploading it up to
     // 4x per force update under 32-way MPS contention dominated. Fix:
     // topology (dEdGOffset/dGdrSelf/edge list) is purely geometric and
-    // never changes during training, so it's uploaded to the GPU exactly
-    // ONCE per structure (gpuForcesUploadTopology(), keyed by
+    // never changes during actual training, so it's uploaded to the GPU
+    // exactly once per structure (gpuForcesUploadTopology(), keyed by
     // structure.index) and cached there; only the small dEdG array is
-    // rebuilt and re-uploaded every call (gpuForcesCompute()).
+    // rebuilt and re-uploaded every call (gpuForcesCompute()). "Never
+    // changes during actual training" is doing real work in that
+    // sentence: Training::dataSetNormalization()'s "force"-based
+    // calibration evaluates forces (hence populates this cache) using
+    // the pre-rescale cutoff radius, before that same routine rescales
+    // it -- found (see gpu/README.md) after this stale cache silently
+    // fed rescaled-cutoff-era dEdG through pre-rescale-cutoff topology
+    // for the rest of a run, corrupting every subsequent force by a
+    // structure/atom-dependent factor. Training::dataSetNormalization()
+    // calls resetForceTopologyCache() right after any such rescale so
+    // the next per-structure call here re-uploads the corrected one.
     if (nnpType == NNPType::HDNNP_2G || nnpType == NNPType::HDNNP_4G)
     {
-        static set<size_t> gpuForceTopologyUploaded;
         bool const firstCallForThisStructure =
             gpuForceTopologyUploaded.insert(structure.index).second;
 
@@ -2653,6 +2678,20 @@ void Mode::calculateForces(Structure& structure) const
         // solves above (confirmed cheap, <1ms/call combined, thanks to
         // the earlier factorize-once fix -- this loop was ~148ms/call).
         {
+            // CAUTION: same process-lifetime, structure.index-keyed
+            // topology cache pattern as calculateForces()'s short-range
+            // GPU path above -- which turned out to go stale exactly
+            // once, when Training::dataSetNormalization()'s "force"-
+            // based calibration rescales the cutoff radius after
+            // already populating the cache with pre-rescale topology
+            // (see Mode::resetForceTopologyCache(), and gpu/README.md).
+            // Not fixed here: 4G/HDNNP_Q training is out of scope this
+            // pass (untested this session, dataSetNormalization()
+            // itself throws for 4G/Q at stage 1), so this cache isn't
+            // cleared by resetForceTopologyCache() yet -- if 4G
+            // training work resumes and uses "force"-based
+            // normalization, re-check this exactly the way the
+            // short-range cache was fixed before trusting its forces.
             static set<size_t> gpuElecForcesTopologyUploaded;
             bool const firstCallForThisStructure =
                 gpuElecForcesTopologyUploaded.insert(s.index).second;

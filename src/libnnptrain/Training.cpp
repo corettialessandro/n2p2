@@ -734,6 +734,21 @@ void Training::dataSetNormalization()
     log << "*****************************************"
            "**************************************\n";
 
+#ifdef N2P2_GPU
+    // The force-evaluation loop above (over `structures`, computing
+    // sigmaForceNnp/etc.) ran calculateForces() once per structure using
+    // whatever cutoff radius was in effect at that point -- for
+    // normalize_data_set force|ref this is the PRE-rescale cutoff, since
+    // the rescale (via the "if (normalize)" symmetry-function-setup
+    // redo above) only happens afterward. calculateForces()'s GPU path
+    // caches per-structure topology (dGdrSelf/edge list) keyed only by
+    // structure.index, uploaded once and reused for the rest of the
+    // run -- so without this reset, every subsequent call would
+    // silently keep using topology built from the wrong (pre-rescale)
+    // cutoff. See Mode::resetForceTopologyCache()'s doc comment.
+    resetForceTopologyCache();
+#endif
+
     return;
 }
 

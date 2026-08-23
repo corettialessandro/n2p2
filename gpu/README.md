@@ -5404,3 +5404,193 @@ question, not obviously related to the `ts` bug just fixed), and
 check whether the fixed `ts` bug changes anything about magnetite/
 feldspar's (so far apparently healthy) GPU training given it affects
 every multi-rank run, not just water's.
+
+### Follow-up: found and fixed the real cause -- a stale GPU force-topology cache, populated once with the wrong cutoff radius and never invalidated
+
+Picked the candidate-selection thread back up and ruled it out cleanly
+before finding the real mechanism.
+
+**Dead ends, each tested directly, not assumed:**
+- **Candidate selection isn't it.** Water's `input.nn` uses
+  `selection_mode 2` (`SM_THRESHOLD`), which *recomputes* energy/force
+  live (via GPU-dispatched `calculateAtomicNeuralNetworks`/
+  `calculateForces`) as part of deciding the next update candidate --
+  a real, GPU-sensitive feedback path in principle. But switching to
+  `selection_mode 0` (`SM_RANDOM`, a deterministic, pre-shuffled
+  round-robin with zero live-error-based decisions, hence provably
+  identical candidate selection on CPU and GPU) **did not stop the
+  explosion** -- if anything it was worse (`ENERGY` to `6.5E+39` by
+  epoch 1 vs. the baseline's `7E+29`). Candidate selection was a red
+  herring.
+- **Not MPI/rank-count.** The exact same divergence reproduces at a
+  single rank (`FORCE` epoch-0 RMSE `1.22489` CPU vs. `10.3339` GPU,
+  `ENERGY` NaN by epoch 1) -- actually faster/worse than at 4 ranks.
+  Rules out `Dataset::sendStructure`/`recvStructure` (the already-fixed
+  `ts` bug and anything else in that path) entirely, since a 1-rank run
+  never calls them.
+- **Not a fresh memory-safety bug.** Rebuilt both CPU and GPU with
+  AddressSanitizer again and reran the 1-rank reproduction: **0 ASan
+  errors on both**, divergence still present and identical in
+  magnitude. Whatever this is, it's stale-but-valid data, not an
+  out-of-bounds access.
+- **Not `memorize_symfunc_results`.** Disabling this cache (which
+  memoizes each structure's symmetry-function `G`/`dGdr` across calls)
+  changed nothing -- GPU `FORCE` at epoch 0 stayed at `10.3339`.
+
+**The break: compared inputs, not just outputs, for the single worst
+atom found in the original (correctly, `paste`-based) per-atom trace**
+(water structure 164, atom 110 -- `Fnnp` CPU `-4.008` vs. GPU `-27.03`
+in that trace). Instrumented `Training::calculateError`'s own loop
+(temporary, env-var-gated dump, not part of the fix) to print, right
+after `calculateSymmetryFunctionGroups()` and right after
+`calculateForces()`, for this exact atom: the symmetry-function vector
+`G`, the neighbor count, `Mode::maxCutoffRadius`, the NN backprop
+vector `dEdG`, and the final force. Result, CPU vs. GPU, same weights,
+same 1-rank run:
+
+| Quantity | CPU | GPU | Agreement |
+|---|---|---|---|
+| neighbor count | 89 | 89 | exact |
+| `G` (27 values) | -3.2118385392636684E-01 ... | -3.2118385392636639E-01 ... | ~13 significant digits |
+| `dEdG` (27 values) | -1.3127141953446186E+00 ... | -1.3127141953446220E+00 ... | ~13 significant digits |
+| structure energy | 5.3775638709580016E+02 | 5.3775638709580085E+02 | ~14 significant digits |
+| **force** | **(0.9909, -0.0553, 0.7572)** | **(11.698, -0.6527, 8.940)** | **~11.8x off, all 3 components, same ratio** |
+
+Every quantity that feeds `calculateForces()` matched to ordinary
+floating-point precision -- **except the force itself**, which was
+wrong by a strikingly *uniform* scalar multiple across all three
+components. A uniform multiplicative error from otherwise-correct
+inputs is the signature of a stale scaling/geometry factor baked into
+one specific number, not a scattered numerical bug.
+
+**Root cause, found by reading `Mode::calculateForces()`'s GPU branch
+directly (`src/libnnp/Mode.cpp`, short-range self+pair force kernel
+added by this project's own GPU port, documented in the "GpuForces.cu"
+follow-up entry above):**
+
+```cpp
+// Mode.cpp, calculateForces(), original code:
+static set<size_t> gpuForceTopologyUploaded;
+bool const firstCallForThisStructure =
+    gpuForceTopologyUploaded.insert(structure.index).second;
+...
+if (firstCallForThisStructure)
+{
+    // build dGdrSelf/edge list from the CURRENT neighbor list...
+    gpuForcesUploadTopology(...);   // uploaded ONCE per structure.index, ever
+}
+// dEdG rebuilt and re-uploaded every call, unconditionally
+gpuForcesCompute(...);
+```
+
+This cache is a real, deliberate, and previously-validated performance
+optimization (topology -- `dGdrSelf`/the pair edge list, derived from
+the neighbor list -- is one to two orders of magnitude bigger than
+`dEdG`, and re-uploading it every call measured markedly worse). Its
+premise: geometry never changes during training, so upload the
+expensive part once per structure and just refresh the cheap,
+weights-dependent `dEdG` every call. **True for the actual training
+loop -- false exactly once, at startup.**
+
+`Training::dataSetNormalization()` (only for `normalize_data_set force`
+or `ref`, water's config) calibrates `conv_energy`/`conv_length` by
+running one real forward+force pass per structure *using the network's
+fresh random weights*:
+
+```cpp
+// Training.cpp, dataSetNormalization(), the calibration loop:
+s.calculateNeighborList(maxCutoffRadius);   // pre-rescale cutoff
+calculateSymmetryFunctionGroups(s, true);
+calculateAtomicNeuralNetworks(s, true);
+calculateEnergy(s);
+if (useForcesLocal) calculateForces(s);     // <- first-ever call: caches PRE-rescale topology
+s.clearNeighborList();
+```
+
+This is the very first time `calculateForces()` is called for each
+structure in the process -- so it's the call that populates the
+topology cache, using whatever cutoff radius was in effect *before*
+normalization. Later in that same function, once the force statistics
+are in hand, `conv_length` gets set and every symmetry function's
+length parameters are rescaled (`if (normalize) { ... setupSymmetryFunctions(); ... }`),
+which changes the cutoff radius and hence the *real* neighbor
+list/topology going forward. `Training::calculateNeighborLists()`
+(called once more, right after, from `nnp-train.cpp`'s driver) rebuilds
+the CPU-side neighbor list correctly with the new cutoff -- but the
+GPU-side topology cache, keyed only by `structure.index` with no
+notion of "this structure's cutoff changed," has no way to know its
+cached `dGdrSelf`/edge list are now stale. Every `calculateForces()`
+call for the rest of the entire run -- all of real training --
+silently combines **fresh, correctly-rescaled `dEdG`** with **stale,
+pre-rescale topology**, for every structure that was part of the
+calibration pass (i.e. all of them). Whether a given atom's force
+comes out visibly wrong depends on whether that atom's actual
+neighbor set differs between the old and new cutoff radius -- which is
+exactly why atom 0 of structure 0 (unaffected, topology happened to be
+identical either way) showed no divergence at all while atom 110 of
+structure 164 showed an 11.8x error: same bug, different local
+geometry.
+
+This also explains, retroactively and correctly this time, the
+earlier-retracted observation that `normalize_data_set force` looked
+implicated and `ref`/`stats-only` looked clean: `force` and `ref` both
+run this same force-calibration loop (only `stats-only` skips it,
+reusing already-correct normalization from a previous run) -- it was
+never about the *magnitude* of `conv_length`, it was about which
+normalization modes call `calculateForces()` before the one-time
+cutoff rescale.
+
+**Fixed**: added `Mode::resetForceTopologyCache()` (`Mode.h`/`Mode.cpp`,
+`#ifdef N2P2_GPU`-gated like the rest of this port) which simply clears
+the cache; `Training::dataSetNormalization()` calls it once, right
+after the rescale block, so the *next* `calculateForces()` call per
+structure -- the first one in real training -- re-uploads the
+corrected topology. (The cache itself moved from a function-local
+`static` to a small anonymous-namespace file-scope variable in
+`Mode.cpp`, purely so a class method can reach it to clear it; no
+behavior change for the already-validated once-per-structure caching
+itself.)
+
+**Verified, not just plausible:**
+
+| Config | CPU | GPU before fix | GPU after fix |
+|---|---|---|---|
+| 4 ranks, water's real `input.nn` (`selection_mode 2`), `FORCE` epoch 0 | 1.24088 | 5.95323 | **1.24088** |
+| 4 ranks, same, `ENERGY` epoch 1 | 5.89E-04 | 1.64E+41 (NaN by later epochs) | **5.89E-04** |
+| 1 rank, `selection_mode 0`, `FORCE` epoch 0 | 1.22489 | 10.3339 | **1.22489** |
+| 1 rank, same, `ENERGY`/`FORCE` epoch 1 | 6.97E-04 / 4.229E-02 | NaN / NaN | **6.97E-04 / 4.229E-02** |
+
+GPU now matches CPU to the same ordinary floating-point precision seen
+everywhere else in this project once the stale cache is gone -- across
+both the original reproducing configuration and the isolation
+configuration used throughout this investigation. Water's real GPU
+training divergence, open since the "benchmark three real-world
+systems" entry much earlier in this file, is resolved.
+
+**Provenance and scope**: unlike the `ts`/`MPI_SIZE_T` bug (pre-existing
+upstream n2p2, 2018), this bug was introduced by this project's own GPU
+force-kernel port (the topology-caching optimization documented in the
+"GpuForces.cu" follow-up above) -- it only exists because that
+optimization's "geometry never changes" premise has one real exception
+this codebase actually exercises. It affects any GPU-enabled `nnp-train`
+run using `normalize_data_set force` or `ref` (both call
+`calculateForces()` during calibration); `stats-only` is unaffected.
+Magnetite/feldspar's GPU training was never observed to diverge like
+water's, most likely because their geometry/cutoff-rescale interaction
+doesn't happen to flip any atom's neighbor set the way water's does --
+not because they're immune to the same stale-cache bug. Worth a
+follow-up check once resources allow: rerun magnetite/feldspar with the
+fix and confirm their (already-healthy-looking) results are unchanged,
+and don't rule out subtler, currently-invisible force errors of the
+"atom 0" kind (same bug, but topology happens not to change) lurking in
+runs that looked clean only because nothing forced a comparison at the
+per-atom level.
+
+**Left deliberately unfixed and flagged in code**: `Mode::calculateForces()`'s
+separate 4G-electrostatics topology cache (`gpuElecForcesTopologyUploaded`,
+same exact pattern) is not cleared by `resetForceTopologyCache()`. 4G/HDNNP_Q
+training is out of scope this pass and untested this session
+(`dataSetNormalization()` itself refuses to run for 4G/HDNNP_Q at
+stage 1); if 4G training work resumes and uses `force`-based
+normalization, this cache needs the identical fix and verification
+before its forces can be trusted.
