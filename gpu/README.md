@@ -5295,3 +5295,112 @@ less specific than a genuinely unique row identifier (structure index
 verified to list rows in identical order first). A non-unique-key join
 silently produces a cartesian product with no error or warning --
 exactly the trap this whole investigation fell into.
+
+### Follow-up: went digging in the Kalman-filter training loop instead of the (now-cleared) force kernel -- found and fixed a real, pre-existing n2p2 bug, but it's not the (or not the whole) cause of water's divergence
+
+With `GpuForces.cu` conclusively cleared, the next step was tracing the
+actual *training-loop* GPU code water's divergence runs through --
+`gpuNnEnergyDEdcSum`/`gpuNnForceDFdcSum` (the energy/force Jacobian-sum
+kernels, used only during weight updates) and `GpuKalmanFilter` (the
+Kalman gain/covariance update itself). Neither of these had been
+examined before; both are completely separate code paths from
+`GpuForces.cu`, which is only used for force *prediction* (evaluation),
+never for the Jacobians a weight update actually needs.
+
+**Traced the real weight-update sequence directly**, this time with a
+methodology built to avoid the earlier mistake: temporarily instrumented
+`Training.cpp` to dump `pu.error`/`pu.jacobian`/`weights` immediately
+before and after each of the first several weight updates, for both CPU
+and GPU builds, compared with a small hand-written Python script doing
+plain array indexing (no text-key joins at all). Because
+`force_energy_ratio=10`, force updates vastly outnumber energy updates,
+so "force update 0" is the genuinely first-ever weight update of the
+whole run -- confirmed directly: `weightsBefore` matches to `0.0` between
+CPU and GPU. For that exact update: the **Jacobian matches to ~13
+significant digits** (ordinary rounding), but the **error vector is
+wildly different** (CPU `[0.277, 35.19, 6.37, -19.74]` vs. GPU
+`[-41.18, 140.99, 69.54, -123.48]`, different in magnitude and even
+sign on the first component) -- despite identical starting weights.
+
+Cross-checking against `train-log.out` (which independently records
+each update's selected structure/atom/component per rank) showed why:
+of the 4 per-rank candidates in that first update, 3 matched CPU's
+candidates exactly, but **one rank picked a genuinely different
+structure/atom** than CPU did (structure 919/atom 223 vs. CPU's
+154/29). So part of what's going on is CPU and GPU builds selecting
+different training candidates from the very first update, not
+(only) computing the same candidate differently.
+
+**Separately, `train-log.out` also showed something stranger**: the
+"count" column (an update counter, `Training::countUpdates` -- a class
+*member*, not a stack-local) printed as `4437379212764330956` on the
+GPU build instead of a small integer like CPU's `1`. Reinterpreting
+that exact 64-bit pattern as an IEEE-754 double gives `4.7152e-12` -- an
+entirely unremarkable floating-point value, not "random" garbage. That
+strongly suggested a stray *double* being written into a `size_t`
+class member via an out-of-bounds write, not simple uninitialized
+memory. `compute-sanitizer` found nothing (0 errors across all ranks)
+-- but it only instruments CUDA/device memory, not plain host C++ heap
+or stack corruption, so that result doesn't clear a host-side bug the
+way it would a device-side one.
+
+**Rebuilt with AddressSanitizer instead** (the right tool for host-side
+corruption; confirmed it doesn't touch `libnnpgpu`'s separate nvcc
+build, only the plain `.cpp` files) and reran the identical
+reproduction. It caught a real, unambiguous bug on the first try: a
+**stack-buffer-overflow** in `Dataset::sendStructure()`
+(`src/libnnptrain/Dataset.cpp:256`), inside an `MPI_Pack` call packing
+the local variable `ts`. The bug: `ts` is declared `int` (4 bytes) but
+packed with the `MPI_SIZE_T` datatype (8 bytes) --
+
+```cpp
+int ts = 0;                              // Dataset.cpp:256
+ts = s.comment.length() + 1;
+MPI_Pack(&ts, 1, MPI_SIZE_T, buf, bs, &p, comm);   // reads 8 bytes from a 4-byte int
+```
+
+-- three times over in `sendStructure()` (comment length,
+`numAtomsPerElement` size, atom count) and mirrored identically in
+`recvStructure()` (`Dataset.cpp:468`), which unpacks the same fields
+with the same 4-byte-`int`-vs-8-byte-`MPI_SIZE_T` mismatch. This is
+genuine undefined behavior -- reading/writing 4 bytes past a 4-byte
+stack variable -- on *every* structure sent to or received by any
+non-rank-0 MPI process, in both directions, for a fixed field every
+single call.
+
+**`git blame` traces this to `9769786`, "v2.0.0 release candidate,"
+2018-10-29 -- upstream n2p2's original author, years before this
+project's GPU port started.** It is not a bug this project introduced.
+Its visible impact is undefined-behavior-dependent on incidental stack
+layout, which is exactly consistent with everything observed: harmless
+in the CPU build's particular compilation/stack layout, consequential
+in the GPU build's (different flags, different linked object code,
+different layout) -- and invisible to any single-rank run, since rank 0
+never calls `sendStructure`/`recvStructure` for its own structures.
+This is very plausibly a contributor to more of this investigation's
+"rank-count/build-dependent, hard to pin down" flakiness than just
+water's case specifically, though that's not separately confirmed.
+
+**Fixed** (`int ts` -> `size_t ts`, both functions, matching the
+`MPI_SIZE_T` datatype already used to pack/unpack it -- a strictly
+widening, uses-`.length()`/`.size()`-consistently change; syntax-
+checked clean). **Rebuilt with the fix still under AddressSanitizer and
+confirmed the overflow is gone: 0 ASan errors**, versus a caught
+overflow on every prior run. This is a real, validated bug fix, kept
+regardless of what else this investigation finds.
+
+**But it does not resolve water's divergence.** Rerunning the exact
+same reproduction with the fix applied: `ENERGY` still explodes to
+`1.64E+41` by epoch 1 -- same order of magnitude, same severity as
+before the fix. So this bug, while real, is not the (or not the whole)
+explanation for water's training-time blowup. The candidate-selection
+divergence found in the per-update trace above is still open and
+unexplained by this fix. **Status at the point of pausing to
+consolidate**: one real, confirmed, fixed bug (kept); the actual
+mechanism behind water's NaN divergence is still not identified.
+Next steps, not yet started: trace *why* CPU and GPU select different
+candidates from the very first update (a control-flow/RNG-consumption
+question, not obviously related to the `ts` bug just fixed), and
+check whether the fixed `ts` bug changes anything about magnetite/
+feldspar's (so far apparently healthy) GPU training given it affects
+every multi-rank run, not just water's.
