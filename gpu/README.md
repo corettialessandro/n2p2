@@ -5628,3 +5628,43 @@ correctness either way, same reasoning as the original 10-epoch table.
 Feldspar's matching 2-node DCGP run was still in progress at the time
 of writing; see the next entry (or `sacct -j 53821293`) for its result
 once complete.
+
+### Follow-up: feldspar's 2-node DCGP result, and water's first healthy GPU 10-epoch run since the topology-cache fix
+
+Feldspar's 2-node/224-rank DCGP run completed: **61.62 min/epoch**,
+vs. Booster GPU's 2-node/8-GPU **18.36 min/epoch** -- unlike magnetite,
+GPU still wins clearly here (~3.4x), even at matched node count.
+Feldspar and magnetite give genuinely different answers to "does DCGP
+catch GPU once node count is matched" -- not a contradiction, just a
+real difference between the two systems (dataset/structure size,
+presumably, though not separately isolated).
+
+Also reran water's full 10-epoch production benchmark on GPU
+(`train_booster_gpu.slurm`, 32 ranks/4 GPUs, the real dataset and
+`input.nn` -- not the reduced debug subset used throughout the topology-
+cache investigation) with the fix in place. **Clean, healthy
+convergence, matching CPU almost exactly** -- `FORCE` RMSE at epoch 10:
+`2.80304E-02` (GPU, this run) vs. `2.80532E-02` (CPU, the existing
+10-epoch baseline). No divergence, no NaN, first time water's GPU
+training has produced a trustworthy result since it was first flagged
+as broken.
+
+Full 10-epoch wall-clock recap, all three systems, every configuration run:
+
+| System | Booster CPU (32 cores, 1 node) | Booster GPU (32 ranks) | DCGP-112 (1 node) | DCGP-112 (2 nodes/224 ranks) |
+| --- | --- | --- | --- | --- |
+| water | 47.79 s/ep (477.9s total) | **7.28 s/ep (80.9s total, 4 GPUs/1 node, fixed)** | 27.32 s/ep (273.2s total) | -- |
+| magnetite | 54.07 min/ep | 20.02 min/ep (2 nodes/8 GPUs) | 26.04 min/ep | 19.68 min/ep -- ties GPU |
+| feldspar | 136.27 min/ep | **18.36 min/ep** (2 nodes/8 GPUs) | 77.98 min/ep | 61.62 min/ep -- GPU still ~3.4x faster |
+
+Water needed only 1 node/4 GPUs (no OOM issue, unlike magnetite/
+feldspar's larger structure counts) and is now GPU's clearest win of
+the three: 6.6x faster than CPU, 3.75x faster than DCGP-112. All three
+systems' GPU numbers are now trustworthy end to end -- water via this
+session's topology-cache fix, magnetite/feldspar via the earlier
+per-structure force-correctness re-verification (the "corrected
+understanding" follow-up much earlier in this file). Magnetite/
+feldspar have not yet been rerun with the topology-cache fix
+specifically (their GPU forces were never observed to diverge the way
+water's did, so this is a should-still-check, not a known problem --
+see the fix's own follow-up entry above).
