@@ -1813,23 +1813,33 @@ void Mode::calculateSymmetryFunctionGroups(Structure& structure,
                 // back onto the matching Atom::Neighbor::dGdr by
                 // position) -- same construction validated in
                 // gpu/e2e_symfnc_check/symfnc_e2e_check.cpp.
-                vector<int> neighOffset(numAtoms + 1, 0);
+                //
+                // Single-pass construction (gpu/README.md's matching
+                // follow-up): reserve to each atom's raw, pre-filter
+                // neighbor count as an upper bound (a size() call, not a
+                // traversal) instead of a separate counting pass over
+                // every neighbor first, then filter-and-fill in one pass,
+                // shrinking to the real size afterward. Membership itself
+                // (n.d < rc) still has to be re-evaluated fresh every
+                // call -- exactly like LAMMPS's own pair styles re-test
+                // their cutoff every step regardless of neighbor-list
+                // rebuild timing -- caching that across timesteps is NOT
+                // safe (see gpu/README.md).
+                int neighUpperBound = 0;
                 for (int t = 0; t < numAtoms; ++t)
                 {
-                    Atom const& at = structure.atoms.at(atomIdx.at(t));
-                    int cnt = 0;
-                    for (auto const& n : at.neighbors) if (n.d < rc) ++cnt;
-                    neighOffset.at(t + 1) = neighOffset.at(t) + cnt;
+                    neighUpperBound +=
+                        (int)structure.atoms.at(atomIdx.at(t)).neighbors.size();
                 }
-                int const totalNeigh = neighOffset.at(numAtoms);
-                vector<int> neighElem(totalNeigh);
-                vector<double> neighDist(totalNeigh), neighDx(totalNeigh),
-                               neighDy(totalNeigh), neighDz(totalNeigh);
-                vector<size_t> neighRealIdx(totalNeigh);
+                vector<int> neighOffset(numAtoms + 1, 0);
+                vector<int> neighElem(neighUpperBound);
+                vector<double> neighDist(neighUpperBound), neighDx(neighUpperBound),
+                               neighDy(neighUpperBound), neighDz(neighUpperBound);
+                vector<size_t> neighRealIdx(neighUpperBound);
+                int k = 0;
                 for (int t = 0; t < numAtoms; ++t)
                 {
                     Atom const& at = structure.atoms.at(atomIdx.at(t));
-                    int k = neighOffset.at(t);
                     for (size_t j = 0; j < at.neighbors.size(); ++j)
                     {
                         Atom::Neighbor const& n = at.neighbors.at(j);
@@ -1844,7 +1854,15 @@ void Mode::calculateSymmetryFunctionGroups(Structure& structure,
                             ++k;
                         }
                     }
+                    neighOffset.at(t + 1) = k;
                 }
+                int const totalNeigh = k;
+                neighElem.resize(totalNeigh);
+                neighDist.resize(totalNeigh);
+                neighDx.resize(totalNeigh);
+                neighDy.resize(totalNeigh);
+                neighDz.resize(totalNeigh);
+                neighRealIdx.resize(totalNeigh);
 
                 vector<double> G((size_t)numAtoms * numMembers, 0.0);
                 vector<double> dGdx(G.size(), 0.0), dGdy(G.size(), 0.0),

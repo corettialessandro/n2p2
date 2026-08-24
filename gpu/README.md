@@ -5775,3 +5775,63 @@ of the existing `report_gpu_sf_2k.slurm`, submitted in parallel with the
 window -- resource limits on `boost_qos_dbg` easily cover this job's 1
 node/4 GPUs, the only real constraint is its 30-minute wall-time cap,
 which this job fit inside).
+
+### Follow-up: attempted a cross-timestep GPU-SF topology cache, found it unsafe, implemented the safe version instead -- a real but modest win
+
+User asked to focus the remaining `GPU_SF=1` optimization work on
+H2O_RPBE-D3 specifically (H2O_2G is too small to be a representative
+benchmark, per the previous entry's atoms-per-rank finding), starting
+with a cross-timestep cache for the neighbor-CSR topology built in
+`Mode::calculateSymmetryFunctionGroups()`'s GPU dispatch.
+
+**That idea, as originally framed, is unsafe.** The CSR-build filters
+each atom's neighbors with `n.d < rc` (the SF-group's own cutoff),
+necessarily using current positions. LAMMPS's own neighbor list is
+skin-buffered specifically so pairwise distances can drift near the
+cutoff boundary between neighbor-list rebuilds without needing a
+rebuild -- meaning an atom can genuinely cross a given SF group's `rc`
+on any timestep, not just at rebuild boundaries. LAMMPS's own pair
+styles always re-test their cutoff every step for exactly this reason,
+and the current n2p2 code already does the same. Caching the *filtered*
+membership across steps and only refreshing distances would silently
+miss atoms crossing in and keep atoms crossing out -- the same
+"topology assumed constant, wasn't" failure mode as the training-loop
+force-cache bug fixed earlier in this file, just re-triggered on the MD
+side. Concluded that genuinely matching LAMMPS's own design means
+retest-every-step-but-avoid-waste, not cache-and-hope -- LAMMPS caches
+the raw *candidate* list (via `neigh_modify delay/every/check`), never
+cutoff membership, and n2p2 already inherits that candidate-list caching
+for free via `list->firstneigh`.
+
+**Implemented the safe version instead: single-pass CSR construction.**
+The original code did two full passes over each atom's neighbor list --
+one just to count qualifying neighbors (to build prefix-sum offsets),
+a second to filter and fill the flat arrays. Since `at.neighbors.size()`
+is already a known upper bound before filtering, reserve arrays sized to
+that upper bound (a `size()` call, not a traversal), fill in one pass
+while computing offsets on the fly, then shrink to the real size
+afterward. Same output, half the traversal, no cross-step state, no
+correctness risk -- membership is still re-evaluated fresh every call.
+
+**Validated on H2O_RPBE-D3** (`gpu/lammps_e2e/rpbe_singlepass_csr_check.slurm`,
+plus a `boost_qos_dbg` variant submitted in parallel as a queue-time
+hedge -- same pattern as the previous entry, and the one that finished
+first): fresh CPU and GPU_SF rebuilds, 40-step/1-rank correctness check
+first, then the same 2000-step/32-rank performance measurement as
+before.
+
+- Correctness: `Max |Temp_cpu - Temp_gpu| = 0`, `Max |E_pair_cpu -
+  E_pair_gpu| = 0`, `Max |force_cpu - force_gpu| = 0` -- bit-exact,
+  ALL PASS, exactly as expected from a mathematically-equivalent
+  reformulation.
+- Performance: Loop time 147.03s, down from the pre-optimization
+  baseline of 149.41s (job 53995440) -- a real but modest **1.6%
+  faster**. Consistent with the earlier phase breakdown: CSR-build was
+  only ~17% of SF-dispatch time at 32 ranks, and this change removes
+  just the redundant counting traversal within it, not the fill pass
+  (which dominates CSR cost -- 5 array writes per neighbor vs. the
+  counting pass's single comparison).
+
+Next: persistent scratch buffers (reusing allocated capacity for the
+CSR and output arrays across calls instead of constructing fresh
+`std::vector`s every call), as a separate step.
