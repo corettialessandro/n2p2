@@ -5668,3 +5668,110 @@ feldspar have not yet been rerun with the topology-cache fix
 specifically (their GPU forces were never observed to diverge the way
 water's did, so this is a should-still-check, not a known problem --
 see the fix's own follow-up entry above).
+
+### Follow-up: settled where `GPU_SF=1`'s time actually goes, and found it's a real, mechanistic win at H2O_RPBE-D3's scale -- just not at H2O_2G's
+
+Went back to the still-open `GPU_SF=1` question (Phase 5's final decision:
+shipped off-by-default because the one full 200000-step production-length
+H2O_2G run showed a 28.6% loss, cause never pinned down beyond "some
+time-correlated environment change"). This pass asked a narrower,
+answerable question instead: at a fixed, cheap 2000-step length, does
+symmetry-function GPU dispatch ever win against `GPU=1` (NN-forward-only,
+SF still on CPU) -- isolating the SF contribution specifically, since the
+small `GPU=1` NN-only win is already established -- and if it doesn't,
+exactly where does the time go.
+
+**Direct `GPU_SF=1` vs `GPU=1` comparison, 32 ranks/4 GPUs (real
+production rank count), 2000 steps, fresh builds:**
+
+| System | `GPU=1` (NN-only) Loop time | `GPU_SF=1` Loop time | Result |
+| --- | --- | --- | --- |
+| H2O_2G (630 atoms, ~20 atoms/rank) | 34.36s | 44.20s | **28.6% SLOWER** |
+| H2O_RPBE-D3 (8640 atoms, ~270 atoms/rank) | 232.45s | 149.41s | **35.7% FASTER (1.56x)** |
+
+So the answer to "does it win anywhere" is yes, decisively, for the
+larger system -- not a marginal or noise-level result.
+
+**Where the time goes -- re-added the round-3/round-4 probes'
+temporary `Stopwatch` instrumentation** (CSR-build / GPU-kernel-call /
+scatter-back phases inside `Mode::calculateSymmetryFunctionGroups()`'s
+GPU dispatch, printed as `SF-GPU-PROFILE` every 100 calls, reverted
+after this investigation -- same methodology as Phase 5's earlier
+profiling). Two regimes measured:
+
+*1 rank/1 GPU (no MPS contention -- isolates the kernel/CSR/scatter
+split from launch-sharing effects):*
+
+| System | SF-dispatch share of Pair time | CSR-build | GPU kernel | Scatter-back |
+| --- | --- | --- | --- | --- |
+| H2O_2G | 70% (144.2s/204.5s) | 20.4% | 45.4% | 34.3% |
+| H2O_RPBE-D3 | 66% (1269.9s/1925.4s) | 39.0% | 22.2% | 38.8% |
+
+*32 ranks/4 GPUs (real production contention, averaged over all 32
+ranks' final profile prints):*
+
+| System | CSR-build | GPU kernel | Scatter-back |
+| --- | --- | --- | --- |
+| H2O_2G | 1.2% | **96.4%** | 2.4% |
+| H2O_RPBE-D3 | 16.9% | 41.9% | 41.2% |
+
+**Mechanistic read, not just numbers.** Two genuinely separate costs are
+bundled inside "SF-dispatch time," and they respond to system size in
+opposite directions:
+
+- The GPU kernel call itself is cheap and gets *relatively* cheaper as
+  atoms/call grows (45%->22% of SF-dispatch time from H2O_2G to
+  H2O_RPBE-D3 at 1 rank) -- the warp-per-atom occupancy fix from Phase
+  5's earlier follow-up is doing its job. But under real 32-rank MPS
+  sharing, H2O_2G's ~20-atoms/rank calls are too small to amortize even
+  the kernel *launch* itself, and 8 ranks queuing launches through one
+  MPS daemon per GPU makes that worse, not better -- the GPU-call share
+  balloons to 96.4% of SF-dispatch time, explaining the 32-rank loss on
+  its own.
+- CSR-build and scatter-back are pure single-threaded host C++ -- a
+  full round-trip repack of data that already exists in
+  `Atom::neighbors`/`Atom::G`/`Atom::dGdr` into flat arrays for the GPU
+  kernel signature and back again, work the direct per-atom CPU path
+  (`Element::calculateSymmetryFunctionGroups()`) never has to do at all.
+  This cost is MPS-independent (no GPU sharing involved) and scales with
+  real per-rank atom/neighbor count, so it's negligible at H2O_2G's
+  ~20 atoms/rank (1.2%+2.4% of SF-dispatch time) but substantial at
+  H2O_RPBE-D3's ~270 atoms/rank (16.9%+41.2% = 58.1%, close to the
+  1-rank case's 77.8%).
+
+**Answer to "what's the difference between the two runs": atoms-per-rank
+at the real 32-rank production configuration is the deciding variable**,
+not atom count in isolation and not a mysterious environment effect.
+H2O_2G's ~20 atoms/rank is too little work to amortize either the GPU
+launch/MPS-queueing cost or the host-side CSR/scatter repack cost, so
+`GPU_SF=1` adds pure overhead on top of an already-cheap CPU SF
+evaluation at that scale. H2O_RPBE-D3's ~270 atoms/rank is enough real
+work per call that both costs are amortized well, and the CPU-side SF
+evaluation `GPU=1`-only would otherwise have to do at that atom count is
+expensive enough that offloading it is a clear net win despite the
+CSR/scatter tax. This reconciles cleanly with the earlier full
+200000-step production result too, once the comparison axis is kept
+straight: that run was H2O_2G-only (small atoms/rank), so a loss there
+is exactly what this atoms-per-rank story predicts -- it was never
+inconsistent with H2O_RPBE-D3 being a real win, since H2O_RPBE-D3 was
+never tested at that length.
+
+**Not yet done, the obvious next check**: a full-length (or at least a
+moderate, e.g. 20000-50000 step) H2O_RPBE-D3 production run, to confirm
+this 2000-step win survives at real production duration the way
+H2O_2G's 2000-step behavior did NOT survive to 200000 steps. Until that
+runs, `GPU_SF=1` stays the off-by-default opt-in it already was --
+this result upgrades the *reason* (a concrete, atoms-per-rank-shaped
+mechanism, not "cause unknown") but doesn't yet justify flipping the
+default, since the one length that matters most for this project's
+actual usage pattern hasn't been checked on the system where the win
+shows up.
+
+New slurm scripts: `gpu/lammps_e2e/profile_sf_2k_both.slurm` (1-rank
+phase-profile probe, both systems in one job) and
+`gpu/lammps_e2e/report_gpu_sf_2k_dbg.slurm` (a `boost_qos_dbg` variant
+of the existing `report_gpu_sf_2k.slurm`, submitted in parallel with the
+`normal`-QOS original to get a result faster during a congested queue
+window -- resource limits on `boost_qos_dbg` easily cover this job's 1
+node/4 GPUs, the only real constraint is its 30-minute wall-time cap,
+which this job fit inside).
