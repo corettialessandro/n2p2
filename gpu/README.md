@@ -5936,3 +5936,44 @@ is queued but hasn't completed -- this session's whole 2000-step
 optimization arc, including today's 10.2% win, is still unconfirmed at
 real production length. `GPU_SF=1` stays off-by-default until that
 lands.
+
+### Follow-up: pushed fusion further, across elements -- correct, but a real regression, not a further win
+
+Tried extending the within-element fusion above to also span multiple
+elements: bucket every `SymGrp` across the *whole* structure by
+`(type, cutoff)` (tolerance-based rc comparison) instead of per element,
+so groups sharing a cutoff fuse into one call regardless of which
+element they belong to. Required real kernel changes beyond the earlier
+per-element fusion, since elements can have different member *counts*
+(H2O_RPBE-D3: 11 angular members for H, 14 for O) -- generalized both
+kernels to a per-atom "row" into a shared, padded `[numRows][maxMembers]`
+parameter table (row = central element index, `numMembersPerRow[row]`
+bounds each atom's inner loop so padding columns are never read or
+written). The bucket-by-cutoff design doubles as the "what if groups
+don't share a cutoff" fallback (item 4 in the plan) for free: groups
+that don't share a cutoff with anything simply end up alone in a
+single-group bucket, identical to the original per-group dispatch --
+no separate precondition check needed, the bucketing never mis-fuses
+mismatched cutoffs by construction.
+
+Validated bit-exact against CPU, same as every step before it. But at
+32 ranks/2000 steps, this was a **regression**, not a further win:
+
+| Version | Loop time | Launches/timestep |
+| --- | --- | --- |
+| Fused within-element only (previous, committed) | **132.09s** | 4 |
+| Fused across elements too (this attempt) | 143.55s | 2 |
+
+So launch-count reduction is not monotonically beneficial -- 9->4 was a
+real 10.2% win, but 4->2 reversed it, costing back most of that gain.
+Leading hypothesis (not directly measured): under MPS's time-slicing
+across 8 ranks sharing a GPU, halving the launch count by roughly
+doubling each call's atom count may reduce how finely each rank's GPU
+usage gets interleaved with the other 7 -- each rank monopolizes its
+turn longer per call, which can hurt average wait time under contention
+even though total useful work is unchanged. Reverted; the within-element
+fusion (9->4 launches, +10.2%, commit `811493a`) remains the best
+validated state. Worth remembering before trying to push any further
+launch-count reduction in this codebase (including the still-open
+rank-batching idea) -- "fewer, bigger" has a sweet spot under MPS
+contention, not a monotonic direction.
