@@ -1792,6 +1792,29 @@ void Mode::calculateSymmetryFunctionGroups(Structure& structure,
             atomsByElement.at(structure.atoms.at(i).element).push_back(i);
         }
 
+        // Single shared host-side scratch arena (gpu/README.md's matching
+        // follow-up), reused sequentially across every (element, group)
+        // pair in this call -- not one persistent buffer per SymGrp
+        // (that design, tried and reverted, won at 1 rank by avoiding
+        // malloc/free but lost under real 32-rank contention, plausibly
+        // because ~9 separate long-lived regions -- one per group --
+        // each touched only once per timestep are individually more
+        // likely to have gone cold under concurrent multi-process
+        // memory/cache pressure). One small arena touched ~9x per
+        // timestep in immediate succession has much higher temporal
+        // locality than 9 buffers touched once each -- untested whether
+        // that actually changes the contention outcome, that's exactly
+        // what this variant is for.
+        struct SfHostScratch
+        {
+            vector<int> neighOffset, neighElem;
+            vector<double> neighDist, neighDx, neighDy, neighDz;
+            vector<size_t> neighRealIdx;
+            vector<double> G, dGdx, dGdy, dGdz;
+            vector<double> neighborDGdx, neighborDGdy, neighborDGdz;
+        };
+        static SfHostScratch arena;
+
         for (size_t ei = 0; ei < elements.size(); ++ei)
         {
             Element& elem = elements.at(ei);
@@ -1799,43 +1822,89 @@ void Mode::calculateSymmetryFunctionGroups(Structure& structure,
             if (atomIdx.empty()) continue;
             int const numAtoms = (int)atomIdx.size();
 
+            // Fuse each of this element's symmetry-function types into
+            // one GPU dispatch (gpu/README.md's matching follow-up):
+            // both gpuSfExpRadGroup() and gpuSfExpAngnGroup() take
+            // per-member e1[] (and e2[] for the angular case) arrays,
+            // and every member's contribution is independently
+            // accumulated with no cross-member interaction, so
+            // concatenating members from different SymGrps of the same
+            // type into one call is exactly equivalent to calling once
+            // per group -- *provided* they share the same cutoff, which
+            // every real group in this project's datasets does (checked
+            // directly for H2O_RPBE-D3: all 9 groups, both types, both
+            // elements, use rc=12.0). Cuts launches per element from
+            // however many separate groups it has down to 2 (one per
+            // type) -- H2O_RPBE-D3: H 4->2, O 5->2.
+            vector<SymGrp*> type2Groups, type3Groups;
             for (SymGrp* g : elem.getSymmetryFunctionGroups())
             {
-                size_t const type = g->getType();
-                SymGrpBaseCutoff* gc = dynamic_cast<SymGrpBaseCutoff*>(g);
-                double const rc = gc->getRc();
-                vector<size_t> const& memberIdx = g->getMemberIndices();
-                int const numMembers = (int)memberIdx.size();
+                if (g->getType() == 2) type2Groups.push_back(g);
+                else                   type3Groups.push_back(g);
+            }
+
+            vector<int>& neighOffset   = arena.neighOffset;
+            vector<int>& neighElem     = arena.neighElem;
+            vector<double>& neighDist  = arena.neighDist;
+            vector<double>& neighDx    = arena.neighDx;
+            vector<double>& neighDy    = arena.neighDy;
+            vector<double>& neighDz    = arena.neighDz;
+            vector<size_t>& neighRealIdx = arena.neighRealIdx;
+            vector<double>& G     = arena.G;
+            vector<double>& dGdx  = arena.dGdx;
+            vector<double>& dGdy  = arena.dGdy;
+            vector<double>& dGdz  = arena.dGdz;
+            vector<double>& neighborDGdx = arena.neighborDGdx;
+            vector<double>& neighborDGdy = arena.neighborDGdy;
+            vector<double>& neighborDGdz = arena.neighborDGdz;
+
+            // Fused type-2 (ExpRad) dispatch: one GPU call covering
+            // every radial group this element owns (rc precondition
+            // documented above where type2Groups is built).
+            if (!type2Groups.empty())
+            {
+                double const rc = dynamic_cast<SymGrpBaseCutoff*>(
+                    type2Groups.at(0))->getRc();
+                vector<size_t> fusedMemberIdx;
+                for (SymGrp* g : type2Groups)
+                {
+                    vector<size_t> const& mi = g->getMemberIndices();
+                    fusedMemberIdx.insert(
+                        fusedMemberIdx.end(), mi.begin(), mi.end());
+                }
+                int const numMembers = (int)fusedMemberIdx.size();
 
                 // Flat neighbor CSR for this element's atoms, filtered to
-                // this group's cutoff, preserving each atom's own
-                // neighbor order (so neighbor-slot results below scatter
-                // back onto the matching Atom::Neighbor::dGdr by
-                // position) -- same construction validated in
+                // the shared cutoff, preserving each atom's own neighbor
+                // order (so neighbor-slot results below scatter back onto
+                // the matching Atom::Neighbor::dGdr by position) -- same
+                // construction validated in
                 // gpu/e2e_symfnc_check/symfnc_e2e_check.cpp.
                 //
                 // Single-pass construction (gpu/README.md's matching
                 // follow-up): reserve to each atom's raw, pre-filter
                 // neighbor count as an upper bound (a size() call, not a
                 // traversal) instead of a separate counting pass over
-                // every neighbor first, then filter-and-fill in one pass,
-                // shrinking to the real size afterward. Membership itself
-                // (n.d < rc) still has to be re-evaluated fresh every
-                // call -- exactly like LAMMPS's own pair styles re-test
-                // their cutoff every step regardless of neighbor-list
-                // rebuild timing -- caching that across timesteps is NOT
-                // safe (see gpu/README.md).
+                // every neighbor first, then filter-and-fill in one pass.
+                // Membership itself (n.d < rc) still has to be
+                // re-evaluated fresh every call -- exactly like LAMMPS's
+                // own pair styles re-test their cutoff every step
+                // regardless of neighbor-list rebuild timing -- caching
+                // that across timesteps is NOT safe (see gpu/README.md).
                 int neighUpperBound = 0;
                 for (int t = 0; t < numAtoms; ++t)
                 {
                     neighUpperBound +=
                         (int)structure.atoms.at(atomIdx.at(t)).neighbors.size();
                 }
-                vector<int> neighOffset(numAtoms + 1, 0);
-                vector<int> neighElem(neighUpperBound);
-                vector<double> neighDist(neighUpperBound), neighDx(neighUpperBound),
-                               neighDy(neighUpperBound), neighDz(neighUpperBound);
-                vector<size_t> neighRealIdx(neighUpperBound);
+                neighOffset.resize(numAtoms + 1);
+                neighOffset[0] = 0;
+                neighElem.resize(neighUpperBound);
+                neighDist.resize(neighUpperBound);
+                neighDx.resize(neighUpperBound);
+                neighDy.resize(neighUpperBound);
+                neighDz.resize(neighUpperBound);
+                neighRealIdx.resize(neighUpperBound);
                 int k = 0;
                 for (int t = 0; t < numAtoms; ++t)
                 {
@@ -1857,64 +1926,42 @@ void Mode::calculateSymmetryFunctionGroups(Structure& structure,
                     neighOffset.at(t + 1) = k;
                 }
                 int const totalNeigh = k;
-                neighElem.resize(totalNeigh);
-                neighDist.resize(totalNeigh);
-                neighDx.resize(totalNeigh);
-                neighDy.resize(totalNeigh);
-                neighDz.resize(totalNeigh);
-                neighRealIdx.resize(totalNeigh);
 
-                vector<double> G((size_t)numAtoms * numMembers, 0.0);
-                vector<double> dGdx(G.size(), 0.0), dGdy(G.size(), 0.0),
-                               dGdz(G.size(), 0.0);
-                vector<double> neighborDGdx((size_t)totalNeigh * numMembers, 0.0);
-                vector<double> neighborDGdy(neighborDGdx.size(), 0.0);
-                vector<double> neighborDGdz(neighborDGdx.size(), 0.0);
+                size_t const gSize = (size_t)numAtoms * numMembers;
+                G.resize(gSize);
+                dGdx.resize(gSize);
+                dGdy.resize(gSize);
+                dGdz.resize(gSize);
+                size_t const neighGSize = (size_t)totalNeigh * numMembers;
+                // No need to zero-init here: both gpuSfExpRadGroup() and
+                // gpuSfExpAngnGroup() unconditionally cudaMemsetAsync
+                // their device-side neighborDGdx/y/z buffers before the
+                // kernel runs, then memcpy the whole result back over
+                // these host arrays regardless of prior content -- so
+                // whatever was here before every call gets fully
+                // overwritten either way (confirmed by reading
+                // GpuSymmetryFunction.cu directly).
+                neighborDGdx.resize(neighGSize);
+                neighborDGdy.resize(neighGSize);
+                neighborDGdz.resize(neighGSize);
 
-                if (type == 2)
+                vector<int> e1(numMembers);
+                vector<double> eta(numMembers), rs(numMembers);
+                for (int m = 0; m < numMembers; ++m)
                 {
-                    SymFncExpRad const& first = dynamic_cast<SymFncExpRad const&>(
-                        elem.getSymmetryFunction(memberIdx.at(0)));
-                    int const e1 = (int)first.getE1();
-                    vector<double> eta(numMembers), rs(numMembers);
-                    for (int m = 0; m < numMembers; ++m)
-                    {
-                        SymFncExpRad const& sf = dynamic_cast<SymFncExpRad const&>(
-                            elem.getSymmetryFunction(memberIdx.at(m)));
-                        eta.at(m) = sf.getEta();
-                        rs.at(m)  = sf.getRs();
-                    }
-                    gpuSfExpRadGroup(numAtoms, neighOffset.data(), neighElem.data(),
-                                     neighDist.data(), neighDx.data(), neighDy.data(),
-                                     neighDz.data(), e1, rc, numMembers,
-                                     eta.data(), rs.data(),
-                                     G.data(), dGdx.data(), dGdy.data(), dGdz.data(),
-                                     neighborDGdx.data(), neighborDGdy.data(),
-                                     neighborDGdz.data());
+                    SymFncExpRad const& sf = dynamic_cast<SymFncExpRad const&>(
+                        elem.getSymmetryFunction(fusedMemberIdx.at(m)));
+                    e1.at(m) = (int)sf.getE1();
+                    eta.at(m) = sf.getEta();
+                    rs.at(m)  = sf.getRs();
                 }
-                else // type == 3
-                {
-                    vector<int> e1(numMembers), e2(numMembers);
-                    vector<double> eta(numMembers), lambda(numMembers), zeta(numMembers);
-                    for (int m = 0; m < numMembers; ++m)
-                    {
-                        SymFncBaseExpAng const& sf = dynamic_cast<SymFncBaseExpAng const&>(
-                            elem.getSymmetryFunction(memberIdx.at(m)));
-                        e1.at(m) = (int)sf.getE1();
-                        e2.at(m) = (int)sf.getE2();
-                        eta.at(m) = sf.getEta();
-                        lambda.at(m) = sf.getLambda();
-                        zeta.at(m) = sf.getZeta();
-                    }
-                    gpuSfExpAngnGroup(numAtoms, neighOffset.data(), neighElem.data(),
-                                      neighDist.data(), neighDx.data(), neighDy.data(),
-                                      neighDz.data(), rc, numMembers,
-                                      e1.data(), e2.data(), eta.data(), lambda.data(),
-                                      zeta.data(),
-                                      G.data(), dGdx.data(), dGdy.data(), dGdz.data(),
-                                      neighborDGdx.data(), neighborDGdy.data(),
-                                      neighborDGdz.data());
-                }
+                gpuSfExpRadGroup(numAtoms, neighOffset.data(), neighElem.data(),
+                                 neighDist.data(), neighDx.data(), neighDy.data(),
+                                 neighDz.data(), e1.data(), rc, numMembers,
+                                 eta.data(), rs.data(),
+                                 G.data(), dGdx.data(), dGdy.data(), dGdz.data(),
+                                 neighborDGdx.data(), neighborDGdy.data(),
+                                 neighborDGdz.data());
 
                 // Scatter results: apply the real production
                 // scale()/getScalingFactor() (not reimplemented on GPU --
@@ -1927,9 +1974,9 @@ void Mode::calculateSymmetryFunctionGroups(Structure& structure,
                     Atom& at = structure.atoms.at(atomIdx.at(t));
                     for (int m = 0; m < numMembers; ++m)
                     {
-                        SymFnc const& sf = elem.getSymmetryFunction(memberIdx.at(m));
+                        SymFnc const& sf = elem.getSymmetryFunction(fusedMemberIdx.at(m));
                         size_t const gIdx = (size_t)t * numMembers + m;
-                        size_t const globalIdx = memberIdx.at(m);
+                        size_t const globalIdx = fusedMemberIdx.at(m);
                         at.G.at(globalIdx) = sf.scale(G.at(gIdx));
                         if (derivatives)
                         {
@@ -1950,10 +1997,148 @@ void Mode::calculateSymmetryFunctionGroups(Structure& structure,
                             Atom::Neighbor& n = at.neighbors.at(realJ);
                             for (int m = 0; m < numMembers; ++m)
                             {
-                                SymFnc const& sf = elem.getSymmetryFunction(memberIdx.at(m));
+                                SymFnc const& sf = elem.getSymmetryFunction(fusedMemberIdx.at(m));
                                 double const sfac = sf.getScalingFactor();
                                 size_t const idx = (size_t)(off + jLocal) * numMembers + m;
-                                size_t const globalIdx = memberIdx.at(m);
+                                size_t const globalIdx = fusedMemberIdx.at(m);
+                                n.dGdr.at(globalIdx)[0] = sfac * neighborDGdx.at(idx);
+                                n.dGdr.at(globalIdx)[1] = sfac * neighborDGdy.at(idx);
+                                n.dGdr.at(globalIdx)[2] = sfac * neighborDGdz.at(idx);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Fused type-3 (ExpAngn) dispatch: one GPU call covering
+            // every angular group this element owns (see the doc
+            // comment where type3Groups is built, above). rc is taken
+            // from the first group -- valid exactly when every fused
+            // group shares the same cutoff, true for every real dataset
+            // checked so far (see gpu/README.md); a dataset that ever
+            // violated this would silently mis-filter neighbors for
+            // whichever group's rc didn't match, so this is the one
+            // real precondition this fusion relies on.
+            if (!type3Groups.empty())
+            {
+                double const rc = dynamic_cast<SymGrpBaseCutoff*>(
+                    type3Groups.at(0))->getRc();
+                vector<size_t> fusedMemberIdx;
+                for (SymGrp* g : type3Groups)
+                {
+                    vector<size_t> const& mi = g->getMemberIndices();
+                    fusedMemberIdx.insert(
+                        fusedMemberIdx.end(), mi.begin(), mi.end());
+                }
+                int const numMembers = (int)fusedMemberIdx.size();
+
+                int neighUpperBound = 0;
+                for (int t = 0; t < numAtoms; ++t)
+                {
+                    neighUpperBound +=
+                        (int)structure.atoms.at(atomIdx.at(t)).neighbors.size();
+                }
+                neighOffset.resize(numAtoms + 1);
+                neighOffset[0] = 0;
+                neighElem.resize(neighUpperBound);
+                neighDist.resize(neighUpperBound);
+                neighDx.resize(neighUpperBound);
+                neighDy.resize(neighUpperBound);
+                neighDz.resize(neighUpperBound);
+                neighRealIdx.resize(neighUpperBound);
+                int k = 0;
+                for (int t = 0; t < numAtoms; ++t)
+                {
+                    Atom const& at = structure.atoms.at(atomIdx.at(t));
+                    for (size_t j = 0; j < at.neighbors.size(); ++j)
+                    {
+                        Atom::Neighbor const& n = at.neighbors.at(j);
+                        if (n.d < rc)
+                        {
+                            neighElem.at(k)     = (int)n.element;
+                            neighDist.at(k)     = n.d;
+                            neighDx.at(k)       = n.dr[0];
+                            neighDy.at(k)       = n.dr[1];
+                            neighDz.at(k)       = n.dr[2];
+                            neighRealIdx.at(k)  = j;
+                            ++k;
+                        }
+                    }
+                    neighOffset.at(t + 1) = k;
+                }
+                int const totalNeigh = k;
+
+                size_t const gSize = (size_t)numAtoms * numMembers;
+                G.resize(gSize);
+                dGdx.resize(gSize);
+                dGdy.resize(gSize);
+                dGdz.resize(gSize);
+                size_t const neighGSize = (size_t)totalNeigh * numMembers;
+                // No need to zero-init here: both gpuSfExpRadGroup() and
+                // gpuSfExpAngnGroup() unconditionally cudaMemsetAsync
+                // their device-side neighborDGdx/y/z buffers before the
+                // kernel runs, then memcpy the whole result back over
+                // these host arrays regardless of prior content -- so
+                // whatever was here before every call gets fully
+                // overwritten either way (confirmed by reading
+                // GpuSymmetryFunction.cu directly).
+                neighborDGdx.resize(neighGSize);
+                neighborDGdy.resize(neighGSize);
+                neighborDGdz.resize(neighGSize);
+
+                vector<int> e1(numMembers), e2(numMembers);
+                vector<double> eta(numMembers), lambda(numMembers), zeta(numMembers);
+                for (int m = 0; m < numMembers; ++m)
+                {
+                    SymFncBaseExpAng const& sf = dynamic_cast<SymFncBaseExpAng const&>(
+                        elem.getSymmetryFunction(fusedMemberIdx.at(m)));
+                    e1.at(m) = (int)sf.getE1();
+                    e2.at(m) = (int)sf.getE2();
+                    eta.at(m) = sf.getEta();
+                    lambda.at(m) = sf.getLambda();
+                    zeta.at(m) = sf.getZeta();
+                }
+                gpuSfExpAngnGroup(numAtoms, neighOffset.data(), neighElem.data(),
+                                  neighDist.data(), neighDx.data(), neighDy.data(),
+                                  neighDz.data(), rc, numMembers,
+                                  e1.data(), e2.data(), eta.data(), lambda.data(),
+                                  zeta.data(),
+                                  G.data(), dGdx.data(), dGdy.data(), dGdz.data(),
+                                  neighborDGdx.data(), neighborDGdy.data(),
+                                  neighborDGdz.data());
+
+                for (int t = 0; t < numAtoms; ++t)
+                {
+                    Atom& at = structure.atoms.at(atomIdx.at(t));
+                    for (int m = 0; m < numMembers; ++m)
+                    {
+                        SymFnc const& sf = elem.getSymmetryFunction(fusedMemberIdx.at(m));
+                        size_t const gIdx = (size_t)t * numMembers + m;
+                        size_t const globalIdx = fusedMemberIdx.at(m);
+                        at.G.at(globalIdx) = sf.scale(G.at(gIdx));
+                        if (derivatives)
+                        {
+                            double const sfac = sf.getScalingFactor();
+                            at.dGdr.at(globalIdx)[0] = sfac * dGdx.at(gIdx);
+                            at.dGdr.at(globalIdx)[1] = sfac * dGdy.at(gIdx);
+                            at.dGdr.at(globalIdx)[2] = sfac * dGdz.at(gIdx);
+                        }
+                    }
+
+                    if (derivatives)
+                    {
+                        int const off = neighOffset.at(t);
+                        int const nCount = neighOffset.at(t + 1) - off;
+                        for (int jLocal = 0; jLocal < nCount; ++jLocal)
+                        {
+                            size_t const realJ = neighRealIdx.at(off + jLocal);
+                            Atom::Neighbor& n = at.neighbors.at(realJ);
+                            for (int m = 0; m < numMembers; ++m)
+                            {
+                                SymFnc const& sf = elem.getSymmetryFunction(fusedMemberIdx.at(m));
+                                double const sfac = sf.getScalingFactor();
+                                size_t const idx = (size_t)(off + jLocal) * numMembers + m;
+                                size_t const globalIdx = fusedMemberIdx.at(m);
                                 n.dGdr.at(globalIdx)[0] = sfac * neighborDGdx.at(idx);
                                 n.dGdr.at(globalIdx)[1] = sfac * neighborDGdy.at(idx);
                                 n.dGdr.at(globalIdx)[2] = sfac * neighborDGdz.at(idx);

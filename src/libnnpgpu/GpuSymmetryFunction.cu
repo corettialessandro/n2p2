@@ -106,7 +106,7 @@ __device__ inline double warpReduceSum(double val)
 // existing correctness harness checks against.
 
 __global__ void sfExpRadGroupKernel(
-    int numAtoms, int e1, double rc, int numMembers,
+    int numAtoms, const int* e1, double rc, int numMembers,
     const double* eta, const double* rs,
     const int* neighOffset, const int* neighElem, const double* neighDist,
     const double* neighDx, const double* neighDy, const double* neighDz,
@@ -126,13 +126,20 @@ __global__ void sfExpRadGroupKernel(
     for (int j = lane; j < n; j += 32)
     {
         int idxN = off + j;
-        if (neighElem[idxN] != e1) continue;
         double rij = neighDist[idxN];
         if (rij >= rc) continue;
         double pfc, pdfc;
         cutoffTANHU(rij, rcinv, pfc, pdfc);
+        // e1 is per-member (not a single shared value) so that multiple
+        // groups with different neighbor-element filters can be fused
+        // into one call -- see gpu/README.md's matching follow-up. A
+        // single-group (unfused) call, where every e1[k] is identical,
+        // reduces to exactly the old shared-e1 behavior: every k either
+        // all match or all skip together, so this is a strict
+        // generalization, not a behavior change for existing callers.
         for (int k = 0; k < numMembers; ++k)
         {
+            if (neighElem[idxN] != e1[k]) continue;
             double diff = rij - rs[k];
             double pexp = exp(-eta[k] * diff * diff);
             result[k] += pexp * pfc;
@@ -421,12 +428,17 @@ struct SfBuffers
     void ensureMembersRad(int numMembers)
     {
         if ((size_t)numMembers <= capMembers) return;
-        if (d_eta) { cudaFree(d_eta); cudaFree(d_rs); cudaFreeHost(h_eta); cudaFreeHost(h_rs); }
+        if (d_eta) {
+            cudaFree(d_eta); cudaFree(d_rs); cudaFree(d_e1);
+            cudaFreeHost(h_eta); cudaFreeHost(h_rs); cudaFreeHost(h_e1);
+        }
         capMembers = numMembers;
         CUDA_CHECK(cudaMalloc(&d_eta, capMembers * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&d_rs, capMembers * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&d_e1, capMembers * sizeof(int)));
         CUDA_CHECK(cudaMallocHost(&h_eta, capMembers * sizeof(double)));
         CUDA_CHECK(cudaMallocHost(&h_rs, capMembers * sizeof(double)));
+        CUDA_CHECK(cudaMallocHost(&h_e1, capMembers * sizeof(int)));
     }
 
     void ensureMembersAngn(int numMembers)
@@ -473,7 +485,7 @@ void gpuSfExpRadGroup(int numAtoms, int const* neighOffset,
                       int const* neighElement, double const* neighDist,
                       double const* neighDx, double const* neighDy,
                       double const* neighDz,
-                      int e1, double rc, int numMembers,
+                      int const* e1, double rc, int numMembers,
                       double const* eta, double const* rs,
                       double* G, double* dGdx, double* dGdy, double* dGdz,
                       double* neighborDGdx, double* neighborDGdy,
@@ -505,6 +517,7 @@ void gpuSfExpRadGroup(int numAtoms, int const* neighOffset,
     memcpy(b.h_neighDz, neighDz, totalNeigh * sizeof(double));
     memcpy(b.h_eta, eta, numMembers * sizeof(double));
     memcpy(b.h_rs, rs, numMembers * sizeof(double));
+    memcpy(b.h_e1, e1, numMembers * sizeof(int));
 
     cudaStream_t s = b.stream;
     CUDA_CHECK(cudaMemcpyAsync(b.d_neighOffset, b.h_neighOffset, (numAtoms + 1) * sizeof(int), cudaMemcpyHostToDevice, s));
@@ -515,6 +528,7 @@ void gpuSfExpRadGroup(int numAtoms, int const* neighOffset,
     CUDA_CHECK(cudaMemcpyAsync(b.d_neighDz, b.h_neighDz, totalNeigh * sizeof(double), cudaMemcpyHostToDevice, s));
     CUDA_CHECK(cudaMemcpyAsync(b.d_eta, b.h_eta, numMembers * sizeof(double), cudaMemcpyHostToDevice, s));
     CUDA_CHECK(cudaMemcpyAsync(b.d_rs, b.h_rs, numMembers * sizeof(double), cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(b.d_e1, b.h_e1, numMembers * sizeof(int), cudaMemcpyHostToDevice, s));
     CUDA_CHECK(cudaMemsetAsync(b.d_neighborDGdx, 0, neighGSize * sizeof(double), s));
     CUDA_CHECK(cudaMemsetAsync(b.d_neighborDGdy, 0, neighGSize * sizeof(double), s));
     CUDA_CHECK(cudaMemsetAsync(b.d_neighborDGdz, 0, neighGSize * sizeof(double), s));
@@ -524,7 +538,7 @@ void gpuSfExpRadGroup(int numAtoms, int const* neighOffset,
     int const warpsPerBlock = blockSize / 32;
     int const gridSize = (numAtoms + warpsPerBlock - 1) / warpsPerBlock;
     sfExpRadGroupKernel<<<gridSize, blockSize, 0, s>>>(
-        numAtoms, e1, rc, numMembers, b.d_eta, b.d_rs,
+        numAtoms, b.d_e1, rc, numMembers, b.d_eta, b.d_rs,
         b.d_neighOffset, b.d_neighElem, b.d_neighDist,
         b.d_neighDx, b.d_neighDy, b.d_neighDz,
         b.d_G, b.d_dGdx, b.d_dGdy, b.d_dGdz,

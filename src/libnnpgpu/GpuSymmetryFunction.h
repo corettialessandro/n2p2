@@ -75,11 +75,20 @@ namespace nnp
  *             same length.
  * @param[in]  neighDx/neighDy/neighDz Flat neighbor displacement vector
  *             arrays (Atom::Neighbor::dr), same length.
- * @param[in]  e1 Neighbor-element filter (this group's common feature,
- *             SymGrpExpRad::getEc()'s neighbor-side counterpart).
- * @param[in]  rc Cutoff radius (SymGrpBaseCutoff::getRc()).
- * @param[in]  numMembers Number of (eta,rs) pairs sharing this group's
- *             element filter and cutoff.
+ * @param[in]  e1 Per-member neighbor-element filter, length numMembers
+ *             (SymGrpExpRad::getEc()'s neighbor-side counterpart).
+ *             Generalized from a single shared value to one per member
+ *             (gpu/README.md's matching follow-up) so that multiple
+ *             SymGrpExpRad instances with different neighbor-element
+ *             filters (but the same cutoff) can be fused into one call
+ *             -- a single-group caller just passes the same value
+ *             numMembers times, identical to the old shared-e1 behavior.
+ * @param[in]  rc Cutoff radius (SymGrpBaseCutoff::getRc()), shared by
+ *             every fused member -- callers fusing multiple groups must
+ *             only do so when those groups' cutoffs actually match.
+ * @param[in]  numMembers Number of (e1,eta,rs) instances sharing this
+ *             cutoff (one group's members, or several groups' members
+ *             concatenated).
  * @param[in]  eta/rs Per-member Gaussian parameters, length numMembers
  *             (SymFncExpRad::getEta()/getRs() for each member).
  * @param[out] G Flat, unscaled symmetry-function output, length
@@ -89,45 +98,60 @@ namespace nnp
  *             matching neighbors), same shape/length as G.
  * @param[out] neighborDGdx/neighborDGdy/neighborDGdz Per-neighbor-slot
  *             derivative, length neighOffset[numAtoms]*numMembers,
- *             row-major [neighborSlot*numMembers+member]. Caller MUST
- *             zero this buffer before the call -- non-matching neighbor
- *             slots (element != e1, or d >= rc) are left untouched by
- *             design, since zero is exactly the correct derivative for a
- *             neighbor this symmetry function doesn't depend on.
+ *             row-major [neighborSlot*numMembers+member]. Non-matching
+ *             neighbor slots (element != e1[m], or d >= rc) are left
+ *             untouched by the kernel, since zero is exactly the correct
+ *             derivative for a neighbor this symmetry function doesn't
+ *             depend on -- but the caller does NOT need to pre-zero this
+ *             buffer: the implementation unconditionally
+ *             cudaMemsetAsync()s the device-side buffer before the
+ *             kernel runs and overwrites this entire host array via
+ *             memcpy() on return, regardless of what it held before the
+ *             call (confirmed directly in GpuSymmetryFunction.cu; the
+ *             "caller must zero" note this doc used to carry was stale).
  */
 void gpuSfExpRadGroup(int numAtoms, int const* neighOffset,
                       int const* neighElement, double const* neighDist,
                       double const* neighDx, double const* neighDy,
                       double const* neighDz,
-                      int e1, double rc, int numMembers,
+                      int const* e1, double rc, int numMembers,
                       double const* eta, double const* rs,
                       double* G, double* dGdx, double* dGdy, double* dGdz,
                       double* neighborDGdx, double* neighborDGdy,
                       double* neighborDGdz);
 
-/** Same shape and scope as gpuSfExpRadGroup() but for one
- *  SymGrpExpAngn-equivalent narrow angular symmetry function group
+/** Same shape and scope as gpuSfExpRadGroup() but for
+ *  SymGrpExpAngn-equivalent narrow angular symmetry function groups
  *  (type 3): per-member (e1,e2) element-pair filters -- real H2O_2G
  *  instances mix multiple element pairs within one element's group, so
- *  this is generalized beyond ExpRad's single shared filter, matching
- *  gpu/soa/symfnc_expangn_group_test.cu's real-`input.nn`-driven
- *  generalization rather than SymGrpExpAngn's own single-filter grouping
- *  assumption. `rs` is always 0 for this type's 4-parameter
+ *  this is generalized beyond ExpRad's (now also per-member, see above)
+ *  filter, matching gpu/soa/symfnc_expangn_group_test.cu's real-
+ *  `input.nn`-driven generalization rather than SymGrpExpAngn's own
+ *  single-filter grouping assumption -- and further generalized
+ *  (gpu/README.md's matching follow-up) to also cover concatenating
+ *  members from *multiple* SymGrpExpAngn instances sharing one cutoff
+ *  into a single call, same fusion rationale as gpuSfExpRadGroup(). `rs`
+ *  is always 0 for this type's 4-parameter
  *  `symfunction_short <ec> 3 <e1> <e2> <eta> <lambda> <zeta> <rc>`
  *  input.nn form, so it isn't a parameter here.
  *
  * Neighbor-slot derivatives ACCUMULATE (+=) rather than being written
  * once, unlike the radial case -- a given neighbor slot can appear as
  * "j" in one (j,k) pair and "k" in another within the same atom's
- * angular sum (SymFncExpAngn.cpp:79-225's structure). Caller must still
- * zero the buffer first; accumulation happens only across this one
- * call's internal (j,k) loop, not across separate calls.
+ * angular sum (SymFncExpAngn.cpp:79-225's structure). That accumulation
+ * happens only across this one call's internal (j,k) loop, not across
+ * separate calls -- like gpuSfExpRadGroup(), the caller does NOT need to
+ * pre-zero neighborDGdx/y/z; see that function's doc for why.
  *
  * @param[in]  numAtoms,neighOffset,neighElement,neighDist,
- *             neighDx,neighDy,neighDz,rc As gpuSfExpRadGroup().
+ *             neighDx,neighDy,neighDz,rc As gpuSfExpRadGroup(). rc is
+ *             shared by every fused member -- callers fusing multiple
+ *             groups must only do so when those groups' cutoffs match.
  * @param[in]  numMembers Number of (e1,e2,eta,lambda,zeta) instances
- *             sharing this cutoff (all of one element's real ExpAngn
- *             instances at once -- e.g. 19 for H, 26 for O in H2O_2G).
+ *             sharing this cutoff (one element's full set of ExpAngn
+ *             instances at once -- e.g. 19 for H, 26 for O in H2O_2G --
+ *             or several such sets concatenated, if fusing across
+ *             what were originally separate SymGrp instances).
  * @param[in]  e1/e2 Per-member element-pair filter (order-independent --
  *             a neighbor pair (j,k) matches member m if
  *             {elem(j),elem(k)} == {e1[m],e2[m]}), length numMembers.
@@ -136,7 +160,8 @@ void gpuSfExpRadGroup(int numAtoms, int const* neighOffset,
  *             numMembers.
  * @param[out] G,dGdx,dGdy,dGdz As gpuSfExpRadGroup(), unscaled.
  * @param[out] neighborDGdx/neighborDGdy/neighborDGdz As
- *             gpuSfExpRadGroup(), caller-zeroed, accumulated in place.
+ *             gpuSfExpRadGroup(), accumulated in place, no caller
+ *             zero-init needed.
  */
 void gpuSfExpAngnGroup(int numAtoms, int const* neighOffset,
                        int const* neighElement, double const* neighDist,

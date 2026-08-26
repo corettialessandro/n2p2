@@ -192,20 +192,25 @@ int main(int argc, char** argv)
 
             if (type == 2)
             {
-                SymFncExpRad const& first = dynamic_cast<SymFncExpRad const&>(
-                    elem.getSymmetryFunction(memberIdx.at(0)));
-                int const e1 = (int)first.getE1();
+                // e1 is now per-member (gpu/README.md's matching
+                // follow-up: gpuSfExpRadGroup() generalized from a single
+                // shared e1 to enable fusing multiple SymGrpExpRad
+                // instances into one call). This harness still tests one
+                // group per call, so every member's own e1 is identical
+                // by construction -- same numerics as before.
+                vector<int> e1(numMembers);
                 vector<double> eta(numMembers), rs(numMembers);
                 for (int m = 0; m < numMembers; ++m)
                 {
                     SymFncExpRad const& sf = dynamic_cast<SymFncExpRad const&>(
                         elem.getSymmetryFunction(memberIdx.at(m)));
+                    e1.at(m) = (int)sf.getE1();
                     eta.at(m) = sf.getEta();
                     rs.at(m)  = sf.getRs();
                 }
                 gpuSfExpRadGroup(numAtoms, neighOffset.data(), neighElem.data(),
                                  neighDist.data(), neighDx.data(), neighDy.data(),
-                                 neighDz.data(), e1, rc, numMembers,
+                                 neighDz.data(), e1.data(), rc, numMembers,
                                  eta.data(), rs.data(),
                                  G.data(), dGdx.data(), dGdy.data(), dGdz.data(),
                                  neighborDGdx.data(), neighborDGdy.data(),

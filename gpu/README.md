@@ -5835,3 +5835,104 @@ before.
 Next: persistent scratch buffers (reusing allocated capacity for the
 CSR and output arrays across calls instead of constructing fresh
 `std::vector`s every call), as a separate step.
+
+### Follow-up: persistent buffers replaced with a shared arena, then fused GPU dispatch cut launches 9->4/timestep -- the biggest H2O_RPBE-D3 win yet (+10.2%)
+
+Per-group persistent buffers (previous entry) turned out to be a real
+win at 1 rank but a net loss at 32 ranks under real MPS contention.
+Replaced them with a single shared host-side scratch arena reused
+sequentially across every (element, group) pair in a call, instead of
+one persistent buffer per `SymGrp` -- the hypothesis: ~9 separate
+long-lived regions, each touched only once per timestep, are
+individually more likely to have gone cold under concurrent
+multi-process memory pressure than one small region touched repeatedly
+in immediate succession. Validated bit-exact; 146.59s at 32 ranks/2000
+steps, matching (marginally beating) the 147.03s single-pass-CSR
+baseline with none of the per-group design's regression.
+
+**Deeper `perf` profiling** (`perf record --call-graph dwarf` + `perf
+report`, 1 rank, real hardware counters rather than Stopwatch wall-clock
+inference) confirmed allocation/memmove machinery is genuinely ~25-30%
+of total cycles -- validating the original hypothesis -- but also found
+two large, backend-agnostic hotspots outside `calculateSymmetryFunctionGroups()`
+entirely (`Atom::allocate()` ~10%, `InterfaceLammps::setLocalAtoms()`
+~7%, both paid by CPU-only runs too, so orthogonal to the GPU_SF-vs-GPU=1
+question). A follow-up attempt at hoisting redundant per-member
+`SymFnc`/scaling-factor lookups out of the scatter loop (based on that
+profiling) measured no net effect at 32 ranks (147.30s, statistically
+identical to baseline) -- reverted.
+
+**The real lever turned out to be launch count, not host-side
+bookkeeping.** `Mode::calculateSymmetryFunctionGroups()` dispatched one
+GPU call per (element, SymGrp) pair -- 9 separate kernel launches per
+timestep for H2O_RPBE-D3 (H: 2 radial + 2 angular groups; O: 2 radial +
+3 angular). Checked directly: every one of those 9 groups, across both
+elements and both types, shares the same cutoff (`rc=12.0`, confirmed by
+grepping `hdnnp-data/input.nn`). Since `gpuSfExpAngnGroup()` already took
+per-member `e1[]`/`e2[]` arrays (not a shared scalar) and every member's
+contribution is independently accumulated with no cross-member
+interaction, concatenating members from an element's separate angular
+`SymGrp`s into one call is provably equivalent to calling once per
+group, *given* the shared-cutoff precondition -- zero CUDA changes
+needed. Implemented and validated bit-exact: 142.59s (+3.0% vs.
+baseline), cutting angular launches per element to 1 (H2O_RPBE-D3: H
+2->1, O 3->1).
+
+Extending the same fusion to radial (`ExpRad`, type 2) groups needed a
+real kernel change: `gpuSfExpRadGroup()` still took a single shared `e1`
+for the whole call. Generalized `sfExpRadGroupKernel`/`gpuSfExpRadGroup()`
+to a per-member `e1[]` array, moving the element-match filter inside the
+per-member loop (a single-group call where every `e1[m]` is identical
+reduces to exactly the old behavior -- a strict generalization, not a
+behavior change for existing callers). **First attempt failed to
+compile**: the `__global__` kernel signature was updated but the ordinary
+host C++ wrapper function (same name, separate definition in the `.cu`
+file) wasn't, and unlike the kernel, changing a plain scalar parameter to
+an array meant real device/pinned-buffer plumbing was needed too (`d_e1`/
+`h_e1` didn't exist yet for the radial `SfBuffers` instance, only for the
+angular one) -- fixed by mirroring exactly how `eta`/`rs` (and the
+angular kernel's own `e1`/`e2`) already handle this. Combined
+radial+angular fusion (9 launches/timestep -> 4: 2 per element)
+validated bit-exact, and this time the win was decisive:
+
+| Version | Loop time (32 ranks, 2000 steps) | vs. baseline |
+| --- | --- | --- |
+| Single-pass CSR alone (previous baseline) | 147.03s | -- |
+| + shared arena | 146.59s | +0.3% |
+| + fused angular dispatch only | 142.59s | +3.0% |
+| **+ fused radial AND angular dispatch** | **132.09s** | **+10.2%** |
+
+Going from 9 launches/timestep to 4 (2.25x fewer) cut a large, real
+chunk of the MPS-queueing overhead that was inflating the GPU-dispatch
+phase under 32-rank contention -- far outside the ~1-3% noise floor this
+investigation has otherwise been fighting all session, and the biggest
+single win found for H2O_RPBE-D3's `GPU_SF=1` path.
+
+**One more thing found and fixed along the way, unrelated to the
+fusion itself**: `GpuSymmetryFunction.h`'s doc comments claimed the
+caller "MUST zero" `neighborDGdx/y/z` before each call. Reading
+`GpuSymmetryFunction.cu` directly (while investigating the wrapper-vs-
+kernel signature mismatch above) showed this was stale -- both wrappers
+unconditionally `cudaMemsetAsync` their device-side buffers before the
+kernel runs and unconditionally `memcpy` the whole result back over the
+host arrays on return, regardless of prior content. That stale doc is
+exactly what led this investigation to add unnecessary `.assign(...,
+0.0)` calls in the arena/fusion host code instead of plain `.resize()`
+(already fixed, removed the redundant zero-fill, and corrected the
+doc comment so it doesn't mislead the next person the same way).
+
+**Generality, not yet fully hardened**: the fusion's one real
+precondition -- all fused groups sharing a cutoff -- is checked by hand
+for H2O_RPBE-D3 (`grep`) but not asserted at runtime. A dataset that
+violated it would silently mis-filter neighbors for whichever group's
+cutoff didn't match the one used to build the CSR, with no error. Adding
+a runtime check (verify, fall back to per-group dispatch if it fails)
+is a real, still-open follow-up before trusting this beyond the one
+dataset it's been validated on.
+
+**Still open**: the 200000-step H2O_RPBE-D3 validation (both `GPU=1`
+NN-only and `GPU=1 GPU_SF=1`, the latter now pinned to this fused state)
+is queued but hasn't completed -- this session's whole 2000-step
+optimization arc, including today's 10.2% win, is still unconfirmed at
+real production length. `GPU_SF=1` stays off-by-default until that
+lands.
