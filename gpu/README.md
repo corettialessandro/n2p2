@@ -5977,3 +5977,35 @@ validated state. Worth remembering before trying to push any further
 launch-count reduction in this codebase (including the still-open
 rank-batching idea) -- "fewer, bigger" has a sweet spot under MPS
 contention, not a monotonic direction.
+
+### Follow-up: retested H2O_2G with the fused (within-element) dispatch -- a real improvement, not a reversal
+
+Checked whether the launch-count fusion that won big on H2O_RPBE-D3
+also helps H2O_2G, whose loss was specifically diagnosed as launch-
+overhead-dominated (~20 atoms/rank, GPU-call phase ballooning to 96.4%
+of SF-dispatch time under 32-rank contention). Same 32-rank/2000-step
+comparison, current best code (single-pass CSR + arena + within-element
+fusion):
+
+| System | `GPU=1` baseline | `GPU_SF=1` (original) | `GPU_SF=1` (fused) |
+| --- | --- | --- | --- |
+| H2O_2G | 34.36s | 44.20s (28.6% slower) | 42.31s (23.1% slower) |
+| H2O_RPBE-D3 | 232.45s | 149.41s (1.56x faster) | 132.17s (1.76x faster, reproduces the earlier fusion result) |
+
+Fusion helps H2O_2G too -- 44.20s -> 42.31s, narrowing the gap by
+~5.5 points -- but doesn't flip it: ~20 atoms/rank is still too little
+work to amortize even 4 launches/timestep under 32-way MPS contention.
+Consistent with the standing diagnosis: launch-count reduction helps
+universally, but H2O_2G's problem was never *only* launch count -- there's
+a floor set by how little work each rank has to offer per call, and
+fusion alone doesn't raise that floor. `GPU_SF=1` stays off-by-default;
+H2O_RPBE-D3-scale systems are where it's a clear win.
+
+Pausing the fusion/launch-count investigation here. Candidate next
+step, not yet attempted: batching multiple MPI ranks into one shared
+per-node GPU dispatch -- attacks the same contention mechanism from a
+different angle (fewer *processes* competing, not just fewer *calls*
+per process) and would plausibly help H2O_2G specifically, unlike
+within-rank fusion which hit a floor there. A real architecture change
+(a GPU-owning worker process per node), not a quick follow-up -- noted
+for whenever this is picked back up.
