@@ -26,6 +26,14 @@ PROJECT_ARFLAGS=-rcsv
 PROJECT_CFLAGS_BLAS=
 PROJECT_LDFLAGS_BLAS=-lopenblas -lgsl -lgslcblas
 
+# GPU acceleration (src/libnnpgpu), only used by "make GPU=1". Set the CUDA
+# architecture of your GPU (sm_80: NVIDIA A100). PROJECT_CUDA_HOME defaults to
+# $(CUDA_HOME), which "module load cuda" sets on most clusters.
+PROJECT_NVCC=nvcc
+PROJECT_NVCCFLAGS=-O3 -std=c++14 -arch=sm_80
+PROJECT_CUDA_HOME=${CUDA_HOME}
+PROJECT_LDFLAGS_GPU=-L$(PROJECT_CUDA_HOME)/lib64 -lcudart -lcublas -lcusolver
+
 ###############################################################################
 # COMPILE-TIME OPTIONS
 ###############################################################################
@@ -62,3 +70,10 @@ PROJECT_LDFLAGS_BLAS=-lopenblas -lgsl -lgslcblas
 
 # Disable Eigen multi threading.
 PROJECT_OPTIONS+= -DEIGEN_DONT_PARALLELIZE
+
+# GPU acceleration: "make GPU=1" builds src/libnnpgpu and compiles all code
+# with N2P2_GPU. Libraries, applications, tests and interfaces must all be
+# built with the same setting.
+ifeq ($(GPU), 1)
+PROJECT_OPTIONS+= -DN2P2_GPU
+endif
