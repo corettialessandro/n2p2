@@ -133,14 +133,14 @@ struct FixtureH2OTrainingGD : public FixtureRepairDir
     Training training;
 };
 
-// Runs the given number of epochs of energy and force training (stage 2 for
-// 4G) on an nnp-train example and returns the learning-curve values {energy
-// RMSE train, test, force RMSE train, test} of epochs 0 to epochs. Same setup
-// sequence as src/application/nnp-train.cpp. epochsLine is the epochs line
-// of the example's input.nn. A non-empty forceFraction replaces the
-// example's short_force_fraction 0.025. With memorize,
-// memorize_symfunc_results is switched on. Without gpuNetworks (GPU builds),
-// the neural networks are evaluated on the CPU.
+// Runs the given number of epochs of training on an nnp-train example and
+// returns the learning-curve values of epochs 0 to epochs: {energy RMSE
+// train, test, force RMSE train, test} each, or {charge RMSE train, test}
+// for 4G stage 1. Same setup sequence as src/application/nnp-train.cpp.
+// epochsLine is the epochs line of the example's input.nn. A non-empty
+// forceFraction replaces the example's short_force_fraction 0.025. With
+// memorize, memorize_symfunc_results is switched on. Without gpuNetworks
+// (GPU builds), the neural networks are evaluated on the CPU.
 vector<double> trainEpochs(string const& example,
                            size_t        stage,
                            string const& epochsLine,
@@ -179,7 +179,9 @@ vector<double> trainEpochs(string const& example,
         training.loadSettingsFile();
         training.setStage(stage);
         training.setupGeneric(
-            "", training.settingsKeywordExists("normalize_data_set"), false);
+            "",
+            training.settingsKeywordExists("normalize_data_set"),
+            stage == 1);
         training.setupSymmetryFunctionScaling();
         training.setupSymmetryFunctionStatistics(false, false, false, false);
         training.setupRandomNumberGenerator();
@@ -204,9 +206,10 @@ vector<double> trainEpochs(string const& example,
         training.loop();
     }
 
-    vector<double> rows(4 * (epochs + 1), 0.0);
-    ifstream file(stage == 0 ? "learning-curve.out"
-                             : "learning-curve.out.stage-2");
+    size_t const numColumns = (stage == 1) ? 2 : 4;
+    vector<double> rows((epochs + 1) * numColumns, 0.0);
+    ifstream file(stage == 0 ? string("learning-curve.out")
+                             : strpr("learning-curve.out.stage-%zu", stage));
     BOOST_REQUIRE(file.is_open());
     string line;
     while (getline(file, line))
@@ -215,10 +218,11 @@ vector<double> trainEpochs(string const& example,
         if (c.empty() || c.at(0).at(0) == '#') continue;
         size_t const e = stoul(c.at(0));
         BOOST_REQUIRE(e <= epochs);
-        rows.at(4 * e + 0) = stod(c.at(1));
-        rows.at(4 * e + 1) = stod(c.at(2));
-        rows.at(4 * e + 2) = stod(c.at(9));
-        rows.at(4 * e + 3) = stod(c.at(10));
+        rows.at(numColumns * e + 0) = stod(c.at(1));
+        rows.at(numColumns * e + 1) = stod(c.at(2));
+        if (numColumns == 2) continue;
+        rows.at(numColumns * e + 2) = stod(c.at(9));
+        rows.at(numColumns * e + 3) = stod(c.at(10));
     }
     file.close();
     bfs::current_path("..");
@@ -238,6 +242,18 @@ vector<double> trainStage2Epochs4G(bool          memorize,
                        epochs,
                        forceFraction,
                        memorize,
+                       gpuNetworks);
+}
+
+// One epoch of 4G stage-1 training on the H2O_RPBE-D3_4G example.
+vector<double> trainStage1OneEpoch4G(bool gpuNetworks)
+{
+    return trainEpochs("H2O_RPBE-D3_4G",
+                       1,
+                       "epochs                          10",
+                       1,
+                       "",
+                       false,
                        gpuNetworks);
 }
 
@@ -808,6 +824,14 @@ BOOST_FIXTURE_TEST_CASE(Train2G_GpuNetworks_MatchesCpu, FixtureRepairDir)
 {
     vector<double> const gpu = trainOneEpoch2G(true);
     vector<double> const cpu = trainOneEpoch2G(false);
+    requireSameLearningCurve(cpu, gpu);
+}
+
+BOOST_FIXTURE_TEST_CASE(TrainStage1_4G_GpuNetworks_MatchesCpu,
+                        FixtureRepairDir)
+{
+    vector<double> const gpu = trainStage1OneEpoch4G(true);
+    vector<double> const cpu = trainStage1OneEpoch4G(false);
     requireSameLearningCurve(cpu, gpu);
 }
 

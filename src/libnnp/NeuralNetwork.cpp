@@ -176,7 +176,9 @@ void NeuralNetwork::propagateBatchGpu(size_t        numInputs,
 void NeuralNetwork::calculateDEdcBatchGpu(size_t        numInputs,
                                           double const* input,
                                           double*       output,
-                                          double*       dEdcSum)
+                                          double*       dEdcSum,
+                                          double const* weights,
+                                          bool          updateStatistics)
 {
     requireGpu();
     if (numInputs == 0)
@@ -186,11 +188,18 @@ void NeuralNetwork::calculateDEdcBatchGpu(size_t        numInputs,
     }
 #ifdef N2P2_GPU
     vector<double> statistics(4 * getNumNeurons());
-    gpu->propagateDEdc(numInputs, input, output, dEdcSum, statistics.data());
-    addNeuronStatistics(numInputs, statistics);
+    gpu->propagateDEdc(numInputs,
+                       input,
+                       weights,
+                       output,
+                       dEdcSum,
+                       updateStatistics ? statistics.data() : nullptr);
+    if (updateStatistics) addNeuronStatistics(numInputs, statistics);
 #else
     (void)input;
     (void)output;
+    (void)weights;
+    (void)updateStatistics;
 #endif
 
     return;

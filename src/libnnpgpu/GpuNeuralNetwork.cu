@@ -217,6 +217,17 @@ __global__ void multiplyScaled(size_t        numEntries,
     if (i < numEntries) a[i] = b[i] * c[i] / scale;
 }
 
+// Multiply column j of a numRows x numColumns matrix by factor[j].
+__global__ void scaleColumns(size_t        numRows,
+                             size_t        numColumns,
+                             double const* factor,
+                             double*       a)
+{
+    size_t const i = blockIdx.x * static_cast<size_t>(blockDim.x)
+                   + threadIdx.x;
+    if (i < numRows * numColumns) a[i] *= factor[i / numRows];
+}
+
 __global__ void fill(size_t numEntries, double value, double* a)
 {
     size_t const i = blockIdx.x * static_cast<size_t>(blockDim.x)
@@ -317,6 +328,8 @@ struct GpuNeuralNetwork::Data
     double*         dOutputdInput;
     /// Vector of ones (capacity), sums over the batch.
     double*         ones;
+    /// Factors of the inputs in a weighted sum (capacity).
+    double*         weights;
     /// Summed derivatives with respect to the connections.
     double*         dConnections;
     double*         statistics;
@@ -338,6 +351,7 @@ GpuNeuralNetwork::GpuNeuralNetwork(
     d.connections = nullptr;
     d.dOutputdInput = nullptr;
     d.ones = nullptr;
+    d.weights = nullptr;
     d.dConnections = nullptr;
     d.statistics = nullptr;
     d.handle = nullptr;
@@ -417,6 +431,7 @@ void GpuNeuralNetwork::release()
     cudaFree(d.statistics);
     cudaFree(d.dOutputdInput);
     cudaFree(d.ones);
+    cudaFree(d.weights);
     for (vector<double*>* b : {&d.x, &d.value, &d.dfdx, &d.d2fdx2, &d.g,
                                &d.xdot, &d.ydot, &d.gdot, &d.h})
     {
@@ -435,12 +450,15 @@ void GpuNeuralNetwork::reserve(size_t numInputs)
     d.capacity = 0;
     NNP_CUDA_CHECK(cudaFree(d.dOutputdInput));
     NNP_CUDA_CHECK(cudaFree(d.ones));
+    NNP_CUDA_CHECK(cudaFree(d.weights));
     d.dOutputdInput = nullptr;
     d.ones = nullptr;
+    d.weights = nullptr;
     NNP_CUDA_CHECK(cudaMalloc(&d.dOutputdInput,
                               d.numNeurons.at(0) * capacity
                               * sizeof(double)));
     NNP_CUDA_CHECK(cudaMalloc(&d.ones, capacity * sizeof(double)));
+    NNP_CUDA_CHECK(cudaMalloc(&d.weights, capacity * sizeof(double)));
     fill<<<numBlocks(capacity), threadsPerBlock>>>(capacity, 1.0, d.ones);
     NNP_CUDA_CHECK(cudaGetLastError());
     for (size_t l = 0; l < d.numLayers; ++l)
@@ -486,6 +504,7 @@ void GpuNeuralNetwork::propagate(size_t        numInputs,
 
 void GpuNeuralNetwork::propagateDEdc(size_t        numInputs,
                                      double const* input,
+                                     double const* weights,
                                      double*       output,
                                      double*       dOutputdConnectionsSum,
                                      double*       statistics)
@@ -493,6 +512,22 @@ void GpuNeuralNetwork::propagateDEdc(size_t        numInputs,
     if (numInputs == 0) return;
     forward(numInputs, input);
     backward(numInputs);
+    if (weights != nullptr)
+    {
+        // Weighted sum: scale the bias derivatives of each input.
+        Data& d = *data;
+        NNP_CUDA_CHECK(cudaMemcpy(d.weights,
+                                  weights,
+                                  numInputs * sizeof(double),
+                                  cudaMemcpyHostToDevice));
+        for (size_t l = 1; l < d.numLayers; ++l)
+        {
+            size_t const n = d.numNeurons.at(l);
+            scaleColumns<<<numBlocks(n * numInputs), threadsPerBlock>>>(
+                n, numInputs, d.weights, d.g.at(l));
+            NNP_CUDA_CHECK(cudaGetLastError());
+        }
+    }
     // As NeuralNetwork::calculateDEdc(): weights delta . y^T, biases delta.
     connectionDerivatives(numInputs,
                           data->g,
@@ -773,14 +808,20 @@ void GpuNeuralNetwork::results(size_t  numInputs,
                                double* statistics)
 {
     Data& d = *data;
-    NNP_CUDA_CHECK(cudaMemcpy(output,
-                              d.value.at(d.numLayers - 1),
-                              numInputs * sizeof(double),
-                              cudaMemcpyDeviceToHost));
-    NNP_CUDA_CHECK(cudaMemcpy(statistics,
-                              d.statistics,
-                              4 * d.numNeuronsTotal * sizeof(double),
-                              cudaMemcpyDeviceToHost));
+    if (output != nullptr)
+    {
+        NNP_CUDA_CHECK(cudaMemcpy(output,
+                                  d.value.at(d.numLayers - 1),
+                                  numInputs * sizeof(double),
+                                  cudaMemcpyDeviceToHost));
+    }
+    if (statistics != nullptr)
+    {
+        NNP_CUDA_CHECK(cudaMemcpy(statistics,
+                                  d.statistics,
+                                  4 * d.numNeuronsTotal * sizeof(double),
+                                  cudaMemcpyDeviceToHost));
+    }
 }
 
 int GpuNeuralNetwork::getDevice() const

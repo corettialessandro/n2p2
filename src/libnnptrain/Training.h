@@ -728,6 +728,33 @@ private:
                         std::vector<std::size_t> const&         offset,
                         std::vector<std::vector<double>>&       dXdc,
                         std::vector<std::vector<double>>&       jacobian);
+    /** Calculate the electronegativities of all atoms on the GPU, as the CPU
+     * code in the charge branch of update() (4G stage 1).
+     *
+     * @param[in] structure The structure.
+     */
+    void propagateChargeNetworksGpu(Structure& structure);
+    /** Add the charge contributions of one structure to the Jacobian (4G
+     * stage 1), calculated on the GPU (same results as the CPU loop in
+     * update()).
+     *
+     * @param[in] structure The structure, with electronegativities from
+     *                      propagateChargeNetworksGpu().
+     * @param[in] dQdChi Derivatives of the charges with respect to the
+     *                   electronegativities.
+     * @param[in] QError Charge errors.
+     * @param[in] QErrorNorm Norm of the charge errors.
+     * @param[in] offset Offset of each element in the Jacobian.
+     * @param[in,out] dXdc Per-element scratch for the derivatives.
+     * @param[in,out] jacobian Jacobian of the (single) updater.
+     */
+    void addChargeJacobianGpu(Structure&                          structure,
+                              std::vector<Eigen::VectorXd> const& dQdChi,
+                              Eigen::VectorXd const&              QError,
+                              double                              QErrorNorm,
+                              std::vector<std::size_t> const&     offset,
+                              std::vector<std::vector<double>>&   dXdc,
+                              std::vector<double>&                jacobian);
 #endif
     /** Randomly initialize specificy neural network weights.
      *
