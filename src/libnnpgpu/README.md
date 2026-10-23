@@ -1,0 +1,89 @@
+# libnnpgpu: GPU backend of n2p2
+
+CUDA implementations of the most expensive parts of n2p2, built only with
+`make GPU=1` (see `src/makefile.gnu` for the CUDA settings). This file states
+the rules the GPU backend follows. Every change to the GPU code must keep
+them, and every newly ported feature goes through the checklist at the end.
+
+## Rules
+
+### 1. The build decides where n2p2 runs
+
+- A `GPU=1` build uses the GPU for everything that has a GPU implementation.
+  A plain build never uses it.
+- There is no keyword in `input.nn` (or any other input file) to choose the
+  hardware. Input files describe the model and the training; the same files
+  must give the same results with any build.
+- `GPU=1` compiles all code (libraries, applications, tests, interfaces) with
+  `-DN2P2_GPU`. Mixing objects compiled with and without it is not supported.
+
+### 2. Building never checks for a GPU
+
+Building with `GPU=1` on a machine without a GPU is allowed: on clusters the
+code is usually compiled on login nodes without GPUs, and continuous
+integration compiles the GPU code on machines without GPUs. `nvcc` does not
+need a device, the target architecture is set by `PROJECT_NVCCFLAGS`.
+Building without `GPU=1` on a machine with a GPU is of course allowed too.
+
+### 3. Running a GPU build without a usable GPU is an error
+
+A `GPU=1` build never falls back to the CPU silently. When a component that
+runs on the GPU is set up, it checks the device and throws an error with a
+clear message if
+
+- no CUDA device is visible, or
+- the device cannot run the compiled code (architecture mismatch).
+
+The check happens at setup, before any expensive work, not at the first use
+deep inside a calculation. Programs that never reach GPU code (for example
+`nnp-convert` or `nnp-select`) run without a GPU, also in a `GPU=1` build.
+
+Each process uses the device given by its local rank modulo the number of
+devices on its node (`gpuSelectDevice()` in `GpuDevice.h`).
+
+### 4. Model features without a GPU implementation run on the CPU, loudly
+
+If the device is fine but a feature of the model has no GPU implementation
+(a network architecture, a symmetry function type, a Kalman filter variant,
+...), that part runs on the CPU and a prominent warning in the log names it.
+The rest still runs on the GPU. The log always states which parts run on the
+GPU and which on the CPU.
+
+### 5. Errors are exceptions
+
+GPU errors throw `std::runtime_error` (checks in `GpuError.h`), like all other
+errors in n2p2. Library code never calls `exit()`.
+
+### 6. GPU state is owned and freed
+
+Device memory and caches belong to an object (for example the structure or
+the Kalman filter they serve), are invalidated when what they cache changes,
+and are freed in its destructor. No process-global caches keyed by indices.
+
+### 7. CPU and GPU results agree within tolerance
+
+The CPU code path stays unchanged by the GPU port: a build without `GPU=1`
+gives bit-identical results to upstream. Tests compare the GPU path against
+the CPU path in the same test binary (through an internal switch that is not
+visible to users) and against the stored CPU references, with the GPU
+tolerance profile of `test/cpp/tolerance.h`.
+
+## Checklist for porting a feature to the GPU
+
+1. The CPU code path is unchanged; the GPU path is a dispatch around it, not
+   a copy of it.
+2. **Device check:** decide where this feature is set up and make sure the
+   device check (rule 3) runs there, before expensive work. Check which
+   applications and interfaces now reach GPU code and therefore need a GPU;
+   update the list below. Re-check earlier features: the right place for the
+   check can move when a new feature is ported.
+3. Unsupported variants of the feature fall back to the CPU with a warning in
+   the log (rule 4).
+4. GPU state has an owner, is invalidated on change and freed (rule 6).
+5. Errors use the checks of `GpuError.h` (rule 5).
+6. Tests compare GPU against CPU in the same binary, plus the full suite with
+   `GPU=1` (rule 7).
+
+## Programs that require a GPU in a GPU build
+
+None yet: no feature has been ported so far.
