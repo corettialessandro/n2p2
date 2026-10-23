@@ -15,6 +15,17 @@ using namespace nnp;
 
 BoostDataContainer<Example_nnp_train> container;
 
+// GPU builds only: allowed relative deviation per epoch class. The untrained
+// network (epoch 0) is a pure evaluation, so it must agree with the CPU to
+// the printed digits. After one epoch the trajectories still agree closely.
+// By the last epoch, summation-order differences have been amplified by the
+// selection of update candidates (see Example_nnp_train.h; for Cu2S_PBE by
+// about a factor of ten per epoch), so only a sanity bound is checked there:
+// an RMSE within a factor of ten of the CPU result.
+double const gpuRelativeEpoch0 = gpuRelativePrinted;
+double const gpuRelativeEpoch1 = 1.0E-6;
+double const gpuRelativeLastEpoch = 9.0;
+
 // Compares one learning-curve.out row against reference RMSEs.
 void checkRow(vector<string> const&   columns,
               bool                    charges,
@@ -66,6 +77,11 @@ void nnpToolTestBody(Example_nnp_train const example)
     last.rmseForcesTrain = charges ? 0.0 : example.rmseForcesTrain;
     last.rmseForcesTest = charges ? 0.0 : example.rmseForcesTest;
 
+    Tolerance const toleranceLast =
+        buildTolerance(Tolerance(example.accuracy,
+                                 example.accuracyLastEpochRelative),
+                       gpuRelativeLastEpoch);
+
     size_t earlyFound = 0;
     file.open(filename);
     BOOST_REQUIRE(file.is_open());
@@ -75,17 +91,20 @@ void nnpToolTestBody(Example_nnp_train const example)
         if (columns.at(0) == to_string(example.lastEpoch))
         {
             epochFound = true;
-            checkRow(columns,
-                     charges,
-                     last,
-                     Tolerance(example.accuracy,
-                               example.accuracyLastEpochRelative));
+            checkRow(columns, charges, last, toleranceLast);
         }
         for (auto const& early : example.earlyEpochs)
         {
             if (columns.at(0) != to_string(early.epoch)) continue;
             earlyFound++;
-            checkRow(columns, charges, early, Tolerance(example.accuracy));
+            double const relativeGpu = early.epoch == 0 ? gpuRelativeEpoch0
+                                                        : gpuRelativeEpoch1;
+            checkRow(columns,
+                     charges,
+                     early,
+                     buildTolerance(Tolerance(example.accuracy),
+                                    relativeGpu,
+                                    0.0));
         }
     }
     file.close();

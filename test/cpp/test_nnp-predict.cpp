@@ -23,10 +23,10 @@ BoostDataContainer<ExamplePrediction> referenceForces;
 
 // output.data prints forces and charges with 17 significant digits.
 Tolerance const toleranceForces =
-    Tolerance(1000.0 * numeric_limits<double>::epsilon());
+    buildTolerance(Tolerance(1000.0 * numeric_limits<double>::epsilon()));
 // The 4G checks were recorded with a later build than the energies above
 // (which differ from it by 1E-11 relative): allow a little more.
-Tolerance const toleranceCheckAtoms = Tolerance(1.0E-10);
+Tolerance const toleranceCheckAtoms = buildTolerance(Tolerance(1.0E-10));
 
 NNP_TOOL_TEST_CASE()
 
