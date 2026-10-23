@@ -165,15 +165,23 @@ public:
      *
      * @param[in] numInputs Number of input vectors.
      * @param[in] input Input vectors, one after the other.
-     * @param[out] output Output neuron value for each input vector.
+     * @param[out] output Output neuron value for each input vector, not
+     *                    copied if nullptr.
      * @param[out] dEdcSum Sum over all input vectors of #calculateDEdc().
+     * @param[in] weights Factor of each input vector in the sum, all 1 if
+     *                    nullptr.
+     * @param[in] updateStatistics Update the neuron statistics (false if
+     *                             the inputs were already propagated).
      *
      * See #propagateBatchGpu().
      */
-    void                     calculateDEdcBatchGpu(std::size_t   numInputs,
-                                                   double const* input,
-                                                   double*       output,
-                                                   double*       dEdcSum);
+    void                     calculateDEdcBatchGpu(
+                                       std::size_t   numInputs,
+                                       double const* input,
+                                       double*       output,
+                                       double*       dEdcSum,
+                                       double const* weights = nullptr,
+                                       bool          updateStatistics = true);
     /** Propagate a batch of inputs on the GPU and calculate the derivatives
      * of the force contributions with respect to the connections, summed
      * over the batch.

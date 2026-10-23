@@ -89,16 +89,20 @@ public:
      *
      * @param[in] numInputs Number of input vectors.
      * @param[in] input Input vectors (numNeuronsPerLayer[0] x numInputs).
-     * @param[out] output Output neuron values (numInputs).
-     * @param[out] dOutputdConnectionsSum Sum over the batch of the
-     *             derivatives with respect to the connections, in the order
-     *             of NeuralNetwork::getConnections() (as
+     * @param[in] weights Factor of each input vector in the sum (numInputs),
+     *                    all 1 if nullptr.
+     * @param[out] output Output neuron values (numInputs), not copied if
+     *                    nullptr.
+     * @param[out] dOutputdConnectionsSum (Weighted) sum over the batch of
+     *             the derivatives with respect to the connections, in the
+     *             order of NeuralNetwork::getConnections() (as
      *             NeuralNetwork::calculateDEdc()).
      * @param[out] statistics Neuron statistics of this batch, see
-     *                        propagate().
+     *                        propagate(), not copied if nullptr.
      */
     void        propagateDEdc(std::size_t   numInputs,
                               double const* input,
+                              double const* weights,
                               double*       output,
                               double*       dOutputdConnectionsSum,
                               double*       statistics);

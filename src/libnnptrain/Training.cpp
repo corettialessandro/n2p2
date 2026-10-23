@@ -1231,17 +1231,12 @@ void Training::setupTraining()
 #ifdef N2P2_GPU
     if (elements.front().neuralNetworks.at(nnId).isGpuEnabled())
     {
-        log << "Jacobians of energy and force updates calculated on the "
-               "GPU.\n";
+        log << "Jacobians of energy, force and charge updates calculated "
+               "on the GPU.\n";
 #ifdef N2P2_FULL_SFD_MEMORY
         log << "WARNING: Jacobians of force updates calculated on the CPU "
                "(no GPU implementation with N2P2_FULL_SFD_MEMORY).\n";
 #endif
-        if (nnpType == NNPType::HDNNP_4G && stage == 1)
-        {
-            log << "WARNING: Jacobians of charge updates calculated on the "
-                   "CPU (no GPU implementation yet).\n";
-        }
     }
 #endif
     log << strpr("TIMING Finished setup: %.2f seconds.\n",
@@ -2780,10 +2775,19 @@ void Training::update(string const& property)
             if (nnpType == NNPType::HDNNP_4G)
             {
 
+                // On the GPU only the electronegativities are calculated
+                // here, their derivatives are summed in
+                // addChargeJacobianGpu() below.
+                bool chargeJacobianGpu = false;
+#ifdef N2P2_GPU
+                chargeJacobianGpu =
+                    elements.front().neuralNetworks.at(nnId).isGpuEnabled();
+                if (chargeJacobianGpu) propagateChargeNetworksGpu(s);
+#endif
                 // Vector for storing all atoms dChi/dc
                 vector<vector<double>> dChidc;
                 dChidc.resize(s.numAtoms);
-                for (size_t k = 0; k < s.numAtoms; ++k)
+                for (size_t k = 0; k < s.numAtoms && !chargeJacobianGpu; ++k)
                 {
                     Atom& ak = s.atoms.at(k);
                     size_t n = elements.at(ak.element).neuralNetworks.at(nnId)
@@ -2829,7 +2833,16 @@ void Training::update(string const& property)
                     // (O(N^2 + N * numWeights) instead of
                     // O(N^2 * numWeights)).
                     // weights
-                    for (size_t k = 0; k < s.numAtoms; ++k)
+#ifdef N2P2_GPU
+                    if (chargeJacobianGpu)
+                    {
+                        addChargeJacobianGpu(s, dQdChi, QError, QErrorNorm,
+                                             offset, dXdc,
+                                             pu.jacobian.at(0));
+                    }
+#endif
+                    for (size_t k = 0; k < s.numAtoms && !chargeJacobianGpu;
+                         ++k)
                     {
                         size_t l = s.atoms.at(k).element;
                         // 1 / QErrorNorm * (Q-Qref) * dQ/dChi
@@ -3884,6 +3897,80 @@ bool Training::addJacobianGpu(Structure&              structure,
     }
 
     return true;
+}
+#endif
+
+#ifdef N2P2_GPU
+void Training::propagateChargeNetworksGpu(Structure& structure)
+{
+    // As the CPU loop in update() (charge branch): electronegativities of
+    // all atoms, normalized together with their derivatives dChidG.
+    propagateAtomsGpu(structure, nnId, false, &Atom::chi, nullptr);
+    if (normalize)
+    {
+        for (auto& a : structure.atoms)
+        {
+            a.chi = normalized("negativity", a.chi);
+            for (auto& dChidGi : a.dChidG)
+                dChidGi = normalized("negativity", dChidGi);
+        }
+    }
+
+    return;
+}
+
+void Training::addChargeJacobianGpu(Structure&                     structure,
+                                    vector<Eigen::VectorXd> const& dQdChi,
+                                    Eigen::VectorXd const&         QError,
+                                    double                         QErrorNorm,
+                                    vector<size_t> const&          offset,
+                                    vector<vector<double>>&        dXdc,
+                                    vector<double>&                jacobian)
+{
+    // Jacobian += sum over atoms k of dError/dChi_k * dChi_k/dc, with
+    // dError/dChi_k = (Q-Qref) . dQ/dChi_k / |Q-Qref| (as the CPU loop in
+    // update()): one weighted sum per element. Normalization of dChi/dc is
+    // a constant factor.
+    double const factor = normalize ? normalized("negativity", 1.0) : 1.0;
+    vector<vector<size_t>> atomsOfElement(numElements);
+    for (auto const& a : structure.atoms)
+    {
+        atomsOfElement.at(a.element).push_back(a.index);
+    }
+
+    vector<double> input;
+    vector<double> weights;
+    for (size_t e = 0; e < numElements; ++e)
+    {
+        vector<size_t> const& indices = atomsOfElement.at(e);
+        size_t const numAtoms = indices.size();
+        if (numAtoms == 0) continue;
+        size_t const numInputs = structure.atoms.at(indices.front()).G.size();
+        input.resize(numInputs * numAtoms);
+        weights.resize(numAtoms);
+        for (size_t t = 0; t < numAtoms; ++t)
+        {
+            size_t const k = indices.at(t);
+            Atom const& a = structure.atoms.at(k);
+            copy(a.G.begin(), a.G.end(), input.begin() + t * numInputs);
+            weights.at(t) = factor * QError.dot(dQdChi.at(k)) / QErrorNorm;
+        }
+        // The networks were already propagated (with neuron statistics) in
+        // propagateChargeNetworksGpu().
+        elements.at(e).neuralNetworks.at(nnId).calculateDEdcBatchGpu(
+            numAtoms,
+            input.data(),
+            nullptr,
+            dXdc.at(e).data(),
+            weights.data(),
+            false);
+        for (size_t j = 0; j < dXdc.at(e).size(); ++j)
+        {
+            jacobian.at(offset.at(e) + j) += dXdc.at(e).at(j);
+        }
+    }
+
+    return;
 }
 #endif
 

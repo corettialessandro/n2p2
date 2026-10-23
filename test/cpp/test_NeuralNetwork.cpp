@@ -1003,6 +1003,43 @@ BOOST_DATA_TEST_CASE(CalculateDFdcBatch_Architectures_MatchesCpuSum,
     requireCloseScaled(dFdcSum, dFdcSumGpu, "dFdc without dEdG");
 }
 
+BOOST_AUTO_TEST_CASE(CalculateDEdcBatch_Weighted_MatchesCpuWeightedSum)
+{
+    // Weighted sums (charge Jacobian) without updating the statistics.
+    Architecture const a = gpuArchitectures().back();
+    unique_ptr<NeuralNetwork> cpu = makeNetwork(a);
+    unique_ptr<NeuralNetwork> gpu = makeNetwork(a);
+    gpu->setGpuEnabled(true);
+    size_t const numIn = a.numNeurons.front();
+    size_t const numConnections = cpu->getNumConnections();
+    size_t const numInputs = 31;
+    vector<double> const in = makeInputs(numIn, numInputs, 9);
+    vector<double> weights(numInputs);
+    for (size_t t = 0; t < numInputs; ++t) weights.at(t) = sin(2.1 * t + 0.2);
+
+    vector<double> sum(numConnections, 0.0);
+    vector<double> dEdc(numConnections);
+    for (size_t t = 0; t < numInputs; ++t)
+    {
+        cpu->setInput(&(in.at(t * numIn)));
+        cpu->propagate();
+        cpu->calculateDEdc(dEdc.data());
+        for (size_t j = 0; j < numConnections; ++j)
+        {
+            sum.at(j) += weights.at(t) * dEdc.at(j);
+        }
+    }
+    // Statistics of the CPU network as after one propagation of the batch.
+    vector<double> out(numInputs);
+    gpu->propagateBatchGpu(numInputs, in.data(), out.data(), nullptr);
+
+    vector<double> sumGpu(numConnections);
+    gpu->calculateDEdcBatchGpu(numInputs, in.data(), nullptr, sumGpu.data(),
+                               weights.data(), false);
+    requireCloseScaled(sum, sumGpu, "weighted dEdc");
+    requireSameStatistics(*cpu, *gpu);
+}
+
 BOOST_AUTO_TEST_CASE(CalculateJacobianBatch_NoInputs_Zero)
 {
     unique_ptr<NeuralNetwork> gpu = makeNetwork(gpuArchitectures().front());
