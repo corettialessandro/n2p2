@@ -49,6 +49,19 @@ int         gpuLocalRank();
  * Throws std::runtime_error if no device is available.
  */
 int         gpuSelectDevice();
+/** Make sure this process can run GPU code and select its device.
+ *
+ * Every component running on the GPU calls this when it is set up, before
+ * any expensive work (see src/libnnpgpu/README.md, rule 3). Selects the
+ * device with gpuSelectDevice() and checks that it can run the code of this
+ * build.
+ *
+ * @return Index of the selected device.
+ *
+ * Throws std::runtime_error with an explanation if no device is visible or
+ * the device cannot run the compiled code (architecture mismatch).
+ */
+int         gpuRequireDevice();
 /** Index of the CUDA device currently used by this process.
  */
 int         gpuCurrentDevice();

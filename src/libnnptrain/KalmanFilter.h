@@ -27,6 +27,8 @@
 namespace nnp
 {
 
+class GpuKalmanFilter;
+
 /// Implementation of the Kalman filter method.
 class KalmanFilter : public Updater
 {
@@ -50,6 +52,18 @@ public:
     /** Destructor.
      */
     virtual ~KalmanFilter();
+    KalmanFilter(KalmanFilter const&) = delete;
+    KalmanFilter& operator=(KalmanFilter const&) = delete;
+    /** Switch the GPU implementation of update() on or off.
+     *
+     * @param[in] enabled Use the GPU if true.
+     *
+     * GPU builds use the GPU, CPU builds the CPU. This switch is internal,
+     * for tests comparing both implementations in one binary, not for
+     * users (see src/libnnpgpu/README.md). Throws std::runtime_error when
+     * enabling the GPU in a CPU build.
+     */
+    void                     setGpuEnabled(bool enabled);
     /** Set observation vector size.
      *
      * @param[in] size Size of the observation vector.
@@ -228,12 +242,15 @@ private:
     Eigen::Map<Eigen::VectorXd const>* xi;
     /// Derivative matrix.
     Eigen::Map<Eigen::MatrixXd const>* H;
-    /// Error covariance matrix.
-    Eigen::MatrixXd                    P;
+    /// Error covariance matrix. With the GPU in use, the device copy in
+    /// #gpu is the current one; status() copies it back.
+    mutable Eigen::MatrixXd            P;
     /// Kalman gain matrix.
     Eigen::MatrixXd                    K;
     /// Intermediate result X = P . H.
     Eigen::MatrixXd                    X;
+    /// GPU implementation of update(), nullptr if the CPU is used.
+    GpuKalmanFilter*                   gpu;
 };
 
 //////////////////////////////////
