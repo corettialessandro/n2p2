@@ -13,8 +13,10 @@
 using namespace std;
 using namespace nnp;
 
+// log.lammps prints only 5 to 8 significant digits.
 Tolerance const tolerance =
-    Tolerance(10.0 * numeric_limits<double>::epsilon());
+    buildTolerance(Tolerance(10.0 * numeric_limits<double>::epsilon()),
+                   gpuRelativePrinted);
 
 BoostDataContainer<Example_lammps_hdnnp> container;
 

@@ -27,7 +27,7 @@ namespace bdata = boost::unit_test::data;
 namespace bfs = boost::filesystem;
 
 Tolerance const tolerance =
-    Tolerance(1000.0 * numeric_limits<double>::epsilon());
+    buildTolerance(Tolerance(1000.0 * numeric_limits<double>::epsilon()));
 
 BoostDataContainer<ExamplePrediction> container;
 
