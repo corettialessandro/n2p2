@@ -21,6 +21,10 @@ COMP=gnu
 # used instead.
 MODE=static
 
+# GPU acceleration, off by default. "make GPU=1" builds src/libnnpgpu (needs
+# nvcc and CUDA, see makefile.$(COMP)) and links it into all applications.
+GPU=
+
 # Installation directory for binaries.
 INSTALL_BIN=$(HOME)/local/bin
 
@@ -66,6 +70,7 @@ MAKEFLAGS:=$(MAKEFLAGS_ORIGINAL)
 	doc-sphinx \
 	doc-doxygen \
 	libnnp \
+	libnnpgpu \
 	libnnptrain \
 	libnnpif \
 	lammps-hdnnp \
@@ -75,6 +80,7 @@ MAKEFLAGS:=$(MAKEFLAGS_ORIGINAL)
 	clean-doc-doxygen \
 	clean-no-doc \
 	clean-libnnp \
+	clean-libnnpgpu \
 	clean-libnnptrain \
 	clean-libnnpif \
 	clean-lammps-hdnnp \
@@ -88,6 +94,7 @@ all: libnnp \
      all-app
 
 clean: clean-libnnp \
+       clean-libnnpgpu \
        clean-libnnptrain \
        clean-libnnpif \
        clean-app \
@@ -126,6 +133,16 @@ libnnp:
 clean-libnnp:
 	cd libnnp && $(MAKE) clean
 
+#############
+# libnnpgpu #
+#############
+libnnpgpu:
+	cd $@ && $(MAKE) COMP=$(COMP) MODE=$(MODE)
+
+clean-libnnpgpu: LIBDIR=$(subst clean-,,$@)
+clean-libnnpgpu:
+	cd $(LIBDIR) && $(MAKE) clean
+
 ###############
 # libnnptrain #
 ###############
@@ -149,6 +166,11 @@ clean-libnnpif:
 ####################
 # nnp applications #
 ####################
+# GPU builds link libnnpgpu into every application.
+ifeq ($(GPU), 1)
+all-app $(APP_LIBNNP) $(APP_LIBNNPTRAIN): libnnpgpu
+endif
+
 # All at once (parallel).
 all-app: libnnptrain
 	cd application && $(MAKE) COMP=$(COMP) MODE=$(MODE)

@@ -47,11 +47,23 @@ INCLUDES=-I./ -I$(PROJECT_DIR)/src/libnnp -I$(PROJECT_DIR)/src/libnnptrain -I$(P
 # the archives until all symbols resolve.
 LDFLAGS=-Wl,--start-group $(PROJECT_LIB)/libnnp.a $(PROJECT_LIB)/libnnptrain.a -Wl,--end-group $(PROJECT_LDFLAGS_BLAS) -L$(PROJECT_BOOST)/lib -lboost_unit_test_framework -lboost_filesystem -lpthread
 
+# GPU builds ("make GPU=1", libraries built the same way): makefile.$(COMP)
+# adds N2P2_GPU to the options, which also selects the GPU tolerance profile
+# in tolerance.h. Tests link libnnpgpu and the CUDA libraries.
+ifeq ($(GPU), 1)
+INCLUDES+= -I$(PROJECT_DIR)/src/libnnpgpu
+LDFLAGS=-Wl,--start-group $(PROJECT_LIB)/libnnp.a $(PROJECT_LIB)/libnnptrain.a $(PROJECT_LIB)/libnnpgpu.a -Wl,--end-group $(PROJECT_LDFLAGS_BLAS) $(PROJECT_LDFLAGS_GPU) -L$(PROJECT_BOOST)/lib -lboost_unit_test_framework -lboost_filesystem -lpthread
+endif
+
 
 ###############################################################################
 # DEFINE SOURCES
 ###############################################################################
 SRC=$(wildcard test_*.cpp)
+# Tests of src/libnnpgpu itself (test_Gpu*) exist only in GPU builds.
+ifneq ($(GPU), 1)
+SRC:=$(filter-out test_Gpu%, $(SRC))
+endif
 SRC_NOIF=$(filter-out test_lammps_hdnnp.cpp, $(SRC))
 EXE=$(SRC:%.cpp=%)
 EXE_NOIF=$(SRC_NOIF:%.cpp=%)

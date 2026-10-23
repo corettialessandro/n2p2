@@ -47,6 +47,11 @@ ARFLAGS=$(PROJECT_ARFLAGS)
 # Extra include paths for compiling.
 INCLUDES=-I./ -I$(PROJECT_INCLUDE)/ -I$(PROJECT_GSL) -I$(PROJECT_EIGEN)
 
+# GPU builds call into src/libnnpgpu (built separately with nvcc).
+ifeq ($(GPU), 1)
+INCLUDES+= -I$(PROJECT_DIR)/src/libnnpgpu
+endif
+
 
 ###############################################################################
 # DEFINE SOURCES AND HEADERS

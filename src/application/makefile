@@ -88,12 +88,18 @@ endif
 DEPS_LIBNNP=$(PROJECT_LIB)/libnnp.$(LIB_SUFFIX)
 DEPS_LIBNNPTRAIN=$(PROJECT_LIB)/libnnptrain.$(LIB_SUFFIX) $(DEPS_LIBNNP)
 
+# GPU builds ("make GPU=1") also link libnnpgpu and the CUDA libraries.
+ifeq ($(GPU), 1)
+DEPS_LIBNNP+= $(PROJECT_LIB)/libnnpgpu.a
+LDFLAGS_GPU=$(PROJECT_LIB)/libnnpgpu.a $(PROJECT_LDFLAGS_GPU)
+endif
+
 # Applications which require only libnnp:
 $(APP_CORE): INCLUDES=-I./ -I$(PROJECT_INCLUDE)/ -I$(PROJECT_EIGEN)
 ifeq ($(MODE), shared)
-$(APP_CORE): LDFLAGS=-L$(PROJECT_LIB) -lnnp
+$(APP_CORE): LDFLAGS=-L$(PROJECT_LIB) -lnnp $(LDFLAGS_GPU)
 else
-$(APP_CORE): LDFLAGS=$(PROJECT_LIB)/libnnp.a
+$(APP_CORE): LDFLAGS=$(PROJECT_LIB)/libnnp.a $(LDFLAGS_GPU)
 endif
 $(APP_CORE): %: %.cpp $(DEPS_LIBNNP)
 	$(CC) $(CFLAGS) $(DEBUG) $(INCLUDES) $(OPTIONS) -o $@.o -c $@.cpp
@@ -104,9 +110,9 @@ $(APP_CORE): %: %.cpp $(DEPS_LIBNNP)
 # but do not use class Training (only Dataset):
 $(APP_DATASET): INCLUDES=-I./ -I$(PROJECT_INCLUDE)/ -I$(PROJECT_GSL) -I$(PROJECT_EIGEN)
 ifeq ($(MODE), shared)
-$(APP_DATASET): LDFLAGS=-L$(PROJECT_LIB) -lnnptrain -lnnp -lgsl $(PROJECT_LDFLAGS_BLAS)
+$(APP_DATASET): LDFLAGS=-L$(PROJECT_LIB) -lnnptrain -lnnp -lgsl $(PROJECT_LDFLAGS_BLAS) $(LDFLAGS_GPU)
 else
-$(APP_DATASET): LDFLAGS=$(PROJECT_LIB)/libnnptrain.a $(PROJECT_LIB)/libnnp.a -lgsl $(PROJECT_LDFLAGS_BLAS)
+$(APP_DATASET): LDFLAGS=$(PROJECT_LIB)/libnnptrain.a $(PROJECT_LIB)/libnnp.a -lgsl $(PROJECT_LDFLAGS_BLAS) $(LDFLAGS_GPU)
 endif
 $(APP_DATASET): %: %.cpp $(DEPS_LIBNNPTRAIN)
 	$(MPICC) $(CFLAGS) $(DEBUG) $(INCLUDES) $(OPTIONS) -o $@.o -c $@.cpp
@@ -116,9 +122,9 @@ $(APP_DATASET): %: %.cpp $(DEPS_LIBNNPTRAIN)
 # Applications which require libnnp and libnnptrain, requires Eigen.
 $(APP_TRAINING): INCLUDES=-I./ -I$(PROJECT_INCLUDE)/ -I$(PROJECT_GSL) -I$(PROJECT_EIGEN)
 ifeq ($(MODE), shared)
-$(APP_TRAINING): LDFLAGS=-L$(PROJECT_LIB) -lnnptrain -lnnp -lgsl $(PROJECT_LDFLAGS_BLAS)
+$(APP_TRAINING): LDFLAGS=-L$(PROJECT_LIB) -lnnptrain -lnnp -lgsl $(PROJECT_LDFLAGS_BLAS) $(LDFLAGS_GPU)
 else
-$(APP_TRAINING): LDFLAGS=$(PROJECT_LIB)/libnnptrain.a $(PROJECT_LIB)/libnnp.a -lgsl $(PROJECT_LDFLAGS_BLAS)
+$(APP_TRAINING): LDFLAGS=$(PROJECT_LIB)/libnnptrain.a $(PROJECT_LIB)/libnnp.a -lgsl $(PROJECT_LDFLAGS_BLAS) $(LDFLAGS_GPU)
 endif
 $(APP_TRAINING): %: %.cpp $(DEPS_LIBNNPTRAIN)
 	$(MPICC) $(CFLAGS) $(DEBUG) $(INCLUDES) $(OPTIONS) -o $@.o -c $@.cpp
