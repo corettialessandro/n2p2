@@ -16,6 +16,10 @@
 
 #include "KalmanFilter.h"
 #include "utility.h"
+#ifdef N2P2_GPU
+#include "GpuDevice.h"
+#include "GpuKalmanFilter.h"
+#endif
 #include <Eigen/LU>
 #include <iostream>
 #include <stdexcept>
@@ -43,7 +47,8 @@ KalmanFilter::KalmanFilter(size_t const sizeState,
     gamma          (0.0 ),
     w              (NULL),
     xi             (NULL),
-    H              (NULL)
+    H              (NULL),
+    gpu            (NULL)
 {
     if (!(type == KT_STANDARD ||
           type == KT_FADINGMEMORY))
@@ -67,10 +72,42 @@ KalmanFilter::KalmanFilter(size_t const sizeState,
     // Prevent problems with unallocated K when log starts.
     K.resize(sizeState, sizeObservation);
     K.setZero();
+
+#ifdef N2P2_GPU
+    // Setup of the GPU part, including the device check.
+    setGpuEnabled(true);
+#endif
 }
 
 KalmanFilter::~KalmanFilter()
 {
+#ifdef N2P2_GPU
+    delete gpu;
+#endif
+}
+
+void KalmanFilter::setGpuEnabled(bool enabled)
+{
+#ifdef N2P2_GPU
+    if (enabled && gpu == NULL)
+    {
+        gpu = new GpuKalmanFilter(sizeState);
+        gpu->setP(P.data());
+    }
+    else if (!enabled && gpu != NULL)
+    {
+        gpu->getP(P.data());
+        delete gpu;
+        gpu = NULL;
+    }
+#else
+    if (enabled)
+    {
+        throw runtime_error("ERROR: n2p2 was built without GPU support.\n");
+    }
+#endif
+
+    return;
 }
 
 void KalmanFilter::setSizeObservation(size_t const size)
@@ -131,6 +168,14 @@ void KalmanFilter::update(size_t const sizeObservation)
 
     // Calculate temporary result.
     // X = P . H
+#ifdef N2P2_GPU
+    if (gpu != NULL)
+    {
+        X.resize(sizeState, H->cols());
+        gpu->computeX(H->cols(), H->data(), X.data());
+    }
+    else
+#endif
     X = P.selfadjointView<Lower>() * (*H);
 
     // Calculate scaling matrix.
@@ -157,6 +202,18 @@ void KalmanFilter::update(size_t const sizeObservation)
     K.resize(sizeState, sizeObservation);
     K = X * A.inverse();
 
+#ifdef N2P2_GPU
+    if (gpu != NULL)
+    {
+        // Same three steps as below, on the device.
+        gpu->updateP(K.cols(),
+                     K.data(),
+                     type == KT_FADINGMEMORY ? 1.0 / lambda : 1.0,
+                     q);
+    }
+    else
+    {
+#endif
     // Update error covariance matrix.
     // P = P - K . X^T
     P.noalias() -= K * X.transpose();
@@ -169,6 +226,9 @@ void KalmanFilter::update(size_t const sizeObservation)
     // Add process noise.
     // P = P + Q
     P.diagonal() += VectorXd::Constant(sizeState, q);
+#ifdef N2P2_GPU
+    }
+#endif
 
     //double numAcc = (P - P.transpose()).cwiseAbs().maxCoeff();
     //cout << "Max. deviation of symmetric form of P: " << numAcc << endl;
@@ -215,6 +275,9 @@ void KalmanFilter::setParametersStandard(double const epsilon,
     q = q0;
     eta = eta0;
     P /= epsilon;
+#ifdef N2P2_GPU
+    if (gpu != NULL) gpu->setP(P.data());
+#endif
 
     return;
 }
@@ -235,6 +298,9 @@ void KalmanFilter::setParametersFadingMemory(double const epsilon,
 
     q = q0;
     P /= epsilon;
+#ifdef N2P2_GPU
+    if (gpu != NULL) gpu->setP(P.data());
+#endif
     gamma = 1.0;
 
     return;
@@ -242,6 +308,9 @@ void KalmanFilter::setParametersFadingMemory(double const epsilon,
 
 string KalmanFilter::status(size_t epoch) const
 {
+#ifdef N2P2_GPU
+    if (gpu != NULL) gpu->getP(P.data());
+#endif
 
     double Pasym = 0.5 * (P - P.transpose()).array().abs().mean();
     double Pdiag = P.diagonal().array().abs().sum();
@@ -348,6 +417,19 @@ vector<string> KalmanFilter::info() const
         v.push_back(strpr("nu              = %12.4E\n", nu    ));
     }
     v.push_back(strpr("OpenMP threads used: %d\n", nbThreads()));
+#ifdef N2P2_GPU
+    if (gpu != NULL)
+    {
+        int const device = gpu->getDevice();
+        v.push_back(strpr("Covariance matrix P on GPU %d (%s)\n",
+                          device,
+                          gpuDeviceName(device).c_str()));
+    }
+    else
+    {
+        v.push_back("Covariance matrix P on CPU (GPU switched off)\n");
+    }
+#endif
 
     return v;
 }

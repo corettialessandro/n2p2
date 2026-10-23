@@ -84,6 +84,14 @@ tolerance profile of `test/cpp/tolerance.h`.
 6. Tests compare GPU against CPU in the same binary, plus the full suite with
    `GPU=1` (rule 7).
 
+## Ported features and their device checks
+
+| Feature | GPU part | Device check | Fallback to CPU |
+|---|---|---|---|
+| Kalman filter (`KalmanFilter`, both types) | P on the device; X = P . H and P = scale (P - K . X^T) + q I | `KalmanFilter` constructor (via `GpuKalmanFilter`) | none needed |
+
 ## Programs that require a GPU in a GPU build
 
-None yet: no feature has been ported so far.
+- `nnp-train` with the Kalman filter updater (`updater_type 1`): the
+  updaters are created in `Training::setupTraining()`, before the first
+  epoch.

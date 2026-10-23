@@ -5,6 +5,11 @@
 #include <boost/test/data/monomorphic.hpp>
 
 #include "KalmanFilter.h"
+#include "tolerance.h"
+#include "utility.h"
+#ifdef N2P2_GPU
+#include "gpuTest.h"
+#endif
 #include <algorithm> // std::max
 #include <cmath>     // std::exp, std::fabs, std::sin
 #include <cstddef>   // std::size_t
@@ -296,4 +301,166 @@ BOOST_DATA_TEST_CASE(Update_MultiDimensional_MatchesReference,
     BOOST_REQUIRE_EQUAL(kf.getNumUpdates(), 3);
 }
 
+#ifndef N2P2_GPU
+BOOST_AUTO_TEST_CASE(SetGpuEnabled_CpuBuild_OnlyOffAllowed)
+{
+    KalmanFilter kf(3, KalmanFilter::KT_STANDARD);
+    BOOST_REQUIRE_NO_THROW(kf.setGpuEnabled(false));
+    BOOST_REQUIRE_THROW(kf.setGpuEnabled(true), runtime_error);
+}
+#endif
+
 BOOST_AUTO_TEST_SUITE_END()
+
+#ifdef N2P2_GPU
+// Tests of the GPU implementation of the covariance update against the CPU
+// implementation, in the same binary.
+
+// Kalman filter of state size n with test parameters and its own state.
+struct TestFilter
+{
+    KalmanFilter   kf;
+    vector<double> state;
+
+    TestFilter(size_t n, bool fading, bool gpu) :
+        kf(n, fading ? KalmanFilter::KT_FADINGMEMORY
+                     : KalmanFilter::KT_STANDARD),
+        state(n)
+    {
+        kf.setGpuEnabled(gpu);
+        if (fading)
+        {
+            kf.setParametersFadingMemory(0.5, 0.02, 0.1, 0.001, 0.98, 0.9);
+        }
+        else
+        {
+            kf.setParametersStandard(0.5, 0.02, 0.1, 0.001, 0.8, 0.1, 10.0);
+        }
+        for (size_t i = 0; i < n; ++i) state[i] = 0.01 * i - 0.2;
+        kf.setState(state.data());
+    }
+
+    void update(vector<double> const& xi, vector<double> const& jacobian)
+    {
+        kf.setError(xi.data(), xi.size());
+        kf.setJacobian(jacobian.data(), xi.size());
+        kf.update(xi.size());
+    }
+};
+
+// Compares states and the P and K statistics of status() (Pasym, a
+// round-off quantity, excluded; status() prints 9 significant digits).
+void requireSameFilter(TestFilter& gpu, TestFilter& cpu)
+{
+    Tolerance const tolerance = buildTolerance(Tolerance(0.0));
+    Tolerance const tolerancePrinted = buildTolerance(Tolerance(0.0),
+                                                      gpuRelativePrinted);
+    for (size_t i = 0; i < cpu.state.size(); ++i)
+    {
+        BOOST_TEST_INFO("state component " << i);
+        REQUIRE_CLOSE_TO_REFERENCE(cpu.state[i], gpu.state[i], tolerance);
+    }
+    vector<string> const statusGpu = split(reduce(gpu.kf.status(0)));
+    vector<string> const statusCpu = split(reduce(cpu.kf.status(0)));
+    BOOST_REQUIRE_EQUAL(statusGpu.at(1), statusCpu.at(1));
+    for (size_t column : {2, 3, 5})
+    {
+        BOOST_TEST_INFO("status column " << column);
+        REQUIRE_CLOSE_TO_REFERENCE(stod(statusCpu.at(column)),
+                                   stod(statusGpu.at(column)),
+                                   tolerancePrinted);
+    }
+}
+
+BOOST_AUTO_TEST_SUITE(GpuTests)
+
+BOOST_DATA_TEST_CASE(Update_Gpu_MatchesCpu, bdata::make({false, true}), fading)
+{
+    size_t const n = 300;
+    size_t const m = 8;
+    TestFilter gpu(n, fading, true);
+    TestFilter cpu(n, fading, false);
+    vector<double> xi(m);
+    vector<double> jacobian(n * m);
+    for (size_t u = 0; u < 5; ++u)
+    {
+        BOOST_TEST_INFO("update " << u);
+        UnitTests::fillInputs(u, xi, jacobian);
+        gpu.update(xi, jacobian);
+        cpu.update(xi, jacobian);
+        requireSameFilter(gpu, cpu);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(Update_ObservationSizeChanges_MatchesCpu)
+{
+    // The device buffers for H, X and K grow with the observation size.
+    size_t const n = 50;
+    TestFilter gpu(n, false, true);
+    TestFilter cpu(n, false, false);
+    size_t u = 0;
+    for (size_t m : {2, 9, 1, 12})
+    {
+        BOOST_TEST_INFO("observation size " << m);
+        vector<double> xi(m);
+        vector<double> jacobian(n * m);
+        UnitTests::fillInputs(u++, xi, jacobian);
+        gpu.update(xi, jacobian);
+        cpu.update(xi, jacobian);
+        requireSameFilter(gpu, cpu);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(SetGpuEnabled_SwitchDuringTraining_KeepsCovariance)
+{
+    // P moves between host and device when switching: GPU, CPU, GPU again
+    // must continue exactly like a filter that stays on the CPU.
+    size_t const n = 40;
+    size_t const m = 3;
+    TestFilter switching(n, true, true);
+    TestFilter cpu(n, true, false);
+    vector<double> xi(m);
+    vector<double> jacobian(n * m);
+    for (size_t u = 0; u < 6; ++u)
+    {
+        BOOST_TEST_INFO("update " << u);
+        if (u == 2) switching.kf.setGpuEnabled(false);
+        if (u == 4) switching.kf.setGpuEnabled(true);
+        UnitTests::fillInputs(u, xi, jacobian);
+        switching.update(xi, jacobian);
+        cpu.update(xi, jacobian);
+        requireSameFilter(switching, cpu);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(Info_GpuOrCpu_Reported)
+{
+    KalmanFilter kf(4, KalmanFilter::KT_STANDARD);
+    vector<string> info = kf.info();
+    BOOST_REQUIRE(info.back().find("Covariance matrix P on GPU")
+                  != string::npos);
+    kf.setGpuEnabled(false);
+    info = kf.info();
+    BOOST_REQUIRE(info.back().find("Covariance matrix P on CPU")
+                  != string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(Constructor_NoVisibleDevice_Throws)
+{
+    // The device check belongs to the setup of the filter.
+    BOOST_REQUIRE_EQUAL(runWithoutGpu("WithoutGpu"), 0);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// Run only by runWithoutGpu() above, in a process without visible devices.
+BOOST_AUTO_TEST_SUITE(WithoutGpu, *boost::unit_test::disabled())
+
+BOOST_AUTO_TEST_CASE(Constructor_NoVisibleDevice_Throws)
+{
+    BOOST_REQUIRE_THROW(KalmanFilter(10, KalmanFilter::KT_STANDARD),
+                        runtime_error);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+#endif

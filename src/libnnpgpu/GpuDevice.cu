@@ -18,8 +18,19 @@
 #include "GpuError.h"
 #include <cstdlib>   // std::getenv, std::atoi
 #include <stdexcept> // std::runtime_error
+#include <string>    // std::string, std::to_string
 
 using namespace std;
+
+namespace
+{
+
+// Empty kernel: loading it shows whether the device can run this build.
+__global__ void probeKernel()
+{
+}
+
+}
 
 namespace nnp
 {
@@ -59,6 +70,36 @@ int gpuSelectDevice()
     }
     int const device = gpuLocalRank() % count;
     NNP_CUDA_CHECK(cudaSetDevice(device));
+    return device;
+}
+
+int gpuRequireDevice()
+{
+    if (gpuDeviceCount() == 0)
+    {
+        throw runtime_error("ERROR: This n2p2 was built with GPU support "
+                            "(GPU=1), but no CUDA device is visible to this "
+                            "process. Run it on a node with a GPU, or rebuild "
+                            "n2p2 without GPU=1.\n");
+    }
+    int const device = gpuSelectDevice();
+    cudaFuncAttributes attributes;
+    cudaError_t const error = cudaFuncGetAttributes(&attributes, probeKernel);
+    if (error != cudaSuccess)
+    {
+        cudaGetLastError();
+        cudaDeviceProp properties;
+        NNP_CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
+        throw runtime_error("ERROR: GPU " + to_string(device) + " ("
+                            + string(properties.name)
+                            + ", compute capability "
+                            + to_string(properties.major) + "."
+                            + to_string(properties.minor)
+                            + ") cannot run the GPU code of this n2p2 build ("
+                            + string(cudaGetErrorString(error))
+                            + "). Rebuild n2p2 with the matching -arch in "
+                            "PROJECT_NVCCFLAGS.\n");
+    }
     return device;
 }
 

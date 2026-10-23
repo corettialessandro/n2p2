@@ -3,6 +3,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include "GpuDevice.h"
+#include "gpuTest.h"
 #include <cstdlib>   // setenv, unsetenv, getenv
 #include <map>       // std::map
 #include <stdexcept> // std::runtime_error
@@ -98,6 +99,44 @@ BOOST_AUTO_TEST_CASE(DeviceName_InvalidDevice_Throws)
 {
     // A failed CUDA call must surface as an exception, not end the process.
     BOOST_REQUIRE_THROW(gpuDeviceName(gpuDeviceCount()), runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(RequireDevice_DeviceAvailable_SelectsIt)
+{
+    int const device = gpuRequireDevice();
+    BOOST_REQUIRE_GE(device, 0);
+    BOOST_REQUIRE_LT(device, gpuDeviceCount());
+    BOOST_REQUIRE_EQUAL(gpuCurrentDevice(), device);
+}
+
+BOOST_AUTO_TEST_CASE(RequireDevice_NoVisibleDevice_ThrowsWithExplanation)
+{
+    BOOST_REQUIRE_EQUAL(runWithoutGpu("WithoutGpu"), 0);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// Run only by runWithoutGpu() above, in a process without visible devices.
+BOOST_AUTO_TEST_SUITE(WithoutGpu, *boost::unit_test::disabled())
+
+BOOST_AUTO_TEST_CASE(DeviceCount_NoVisibleDevice_Zero)
+{
+    BOOST_REQUIRE_EQUAL(gpuDeviceCount(), 0);
+}
+
+BOOST_AUTO_TEST_CASE(RequireDevice_NoVisibleDevice_Throws)
+{
+    try
+    {
+        gpuRequireDevice();
+        BOOST_FAIL("gpuRequireDevice() did not throw.");
+    }
+    catch (runtime_error const& e)
+    {
+        BOOST_TEST_MESSAGE(e.what());
+        BOOST_REQUIRE(string(e.what()).find("no CUDA device is visible")
+                      != string::npos);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()
