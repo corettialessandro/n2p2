@@ -702,6 +702,33 @@ private:
                                std::size_t      indexAtom,
                                std::size_t      indexComponent);
 #endif
+#ifdef N2P2_GPU
+    /** Add the energy or force contributions of one structure to the
+     * Jacobian, calculated on the GPU (same results as the CPU loops in
+     * update()).
+     *
+     * @param[in] structure The structure.
+     * @param[in] property "energy" or "force".
+     * @param[in] derivatives Also calculate dEdG of all atoms (force only).
+     * @param[in] indexAtom Atom of the force component (force only).
+     * @param[in] indexComponent Force component (force only).
+     * @param[in] offset Offset of each element in the Jacobian.
+     * @param[in,out] dXdc Per-element scratch for the derivatives.
+     * @param[in,out] jacobian Jacobian per updater.
+     *
+     * @return False if the networks are not evaluated on the GPU.
+     *
+     * For forces, #dGdxiaAll must hold the derivatives of all atoms.
+     */
+    bool addJacobianGpu(Structure&                              structure,
+                        std::string const&                      property,
+                        bool                                    derivatives,
+                        std::size_t                             indexAtom,
+                        std::size_t                             indexComponent,
+                        std::vector<std::size_t> const&         offset,
+                        std::vector<std::vector<double>>&       dXdc,
+                        std::vector<std::vector<double>>&       jacobian);
+#endif
     /** Randomly initialize specificy neural network weights.
      *
      * @param[in] id Actual network type to initialize ("short" or "elec").

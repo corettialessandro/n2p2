@@ -160,6 +160,42 @@ public:
                                                double const* input,
                                                double*       output,
                                                double*       dEdG);
+    /** Propagate a batch of inputs on the GPU and calculate the derivatives
+     * of the output with respect to the connections, summed over the batch.
+     *
+     * @param[in] numInputs Number of input vectors.
+     * @param[in] input Input vectors, one after the other.
+     * @param[out] output Output neuron value for each input vector.
+     * @param[out] dEdcSum Sum over all input vectors of #calculateDEdc().
+     *
+     * See #propagateBatchGpu().
+     */
+    void                     calculateDEdcBatchGpu(std::size_t   numInputs,
+                                                   double const* input,
+                                                   double*       output,
+                                                   double*       dEdcSum);
+    /** Propagate a batch of inputs on the GPU and calculate the derivatives
+     * of the force contributions with respect to the connections, summed
+     * over the batch.
+     *
+     * @param[in] numInputs Number of input vectors.
+     * @param[in] input Input vectors, one after the other.
+     * @param[in] dGdxyz Derivatives of each input vector with respect to
+     *                   one coordinate, same layout as input.
+     * @param[out] output Output neuron value for each input vector.
+     * @param[out] dEdG Derivatives of the output with respect to the
+     *                  inputs, same layout as input. Not calculated if
+     *                  nullptr.
+     * @param[out] dFdcSum Sum over all input vectors of #calculateDFdc().
+     *
+     * See #propagateBatchGpu().
+     */
+    void                     calculateDFdcBatchGpu(std::size_t   numInputs,
+                                                   double const* input,
+                                                   double const* dGdxyz,
+                                                   double*       output,
+                                                   double*       dEdG,
+                                                   double*       dFdcSum);
     // Prevent copying.
     //NeuralNetwork(const NeuralNetwork&) = delete;
     //NeuralNetwork(NeuralNetwork&&) = delete;
@@ -466,6 +502,11 @@ private:
 
     /// Copy the connections to the GPU twin, if enabled.
     void   updateGpuConnections() const;
+    /// Throw if the GPU twin does not exist (or in CPU builds).
+    void   requireGpu() const;
+    /// Add the neuron statistics of a GPU batch (see GpuNeuralNetwork).
+    void   addNeuronStatistics(std::size_t                numInputs,
+                               std::vector<double> const& statistics);
 
     /** Calculate derivative of output neuron with respect to biases.
      *

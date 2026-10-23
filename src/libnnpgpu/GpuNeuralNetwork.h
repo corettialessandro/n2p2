@@ -84,6 +84,53 @@ public:
                           double*       output,
                           double*       dOutputdInput,
                           double*       statistics);
+    /** Propagate a batch of inputs and calculate the derivatives of the
+     * output with respect to all connections, summed over the batch.
+     *
+     * @param[in] numInputs Number of input vectors.
+     * @param[in] input Input vectors (numNeuronsPerLayer[0] x numInputs).
+     * @param[out] output Output neuron values (numInputs).
+     * @param[out] dOutputdConnectionsSum Sum over the batch of the
+     *             derivatives with respect to the connections, in the order
+     *             of NeuralNetwork::getConnections() (as
+     *             NeuralNetwork::calculateDEdc()).
+     * @param[out] statistics Neuron statistics of this batch, see
+     *                        propagate().
+     */
+    void        propagateDEdc(std::size_t   numInputs,
+                              double const* input,
+                              double*       output,
+                              double*       dOutputdConnectionsSum,
+                              double*       statistics);
+    /** Propagate a batch of inputs and calculate the derivatives of the
+     * force contributions with respect to all connections, summed over the
+     * batch.
+     *
+     * @param[in] numInputs Number of input vectors.
+     * @param[in] input Input vectors (numNeuronsPerLayer[0] x numInputs).
+     * @param[in] dInputdx Derivatives of the inputs with respect to one
+     *                     coordinate, same layout as input.
+     * @param[out] output Output neuron values (numInputs).
+     * @param[out] dOutputdInput Derivatives of the output with respect to
+     *                           the inputs, same layout as input. Not
+     *                           calculated if nullptr.
+     * @param[out] dForcedConnectionsSum Sum over the batch of
+     *             - sum_i dInputdx_i d^2 output / (d input_i d connection),
+     *             in the order of NeuralNetwork::getConnections() (as
+     *             NeuralNetwork::calculateDFdc()).
+     * @param[out] statistics Neuron statistics of this batch, see
+     *                        propagate().
+     *
+     * Uses one forward-mode pass along dInputdx instead of one pass per
+     * input as the CPU implementation.
+     */
+    void        propagateDFdc(std::size_t   numInputs,
+                              double const* input,
+                              double const* dInputdx,
+                              double*       output,
+                              double*       dOutputdInput,
+                              double*       dForcedConnectionsSum,
+                              double*       statistics);
     /** Index of the device holding the network.
      */
     int         getDevice() const;
@@ -96,6 +143,32 @@ private:
     void        reserve(std::size_t numInputs);
     /// Free all device memory and the cuBLAS handle.
     void        release();
+    /// Copy inputs to the device, forward pass and neuron statistics.
+    void        forward(std::size_t numInputs, double const* input);
+    /// Backward pass: derivatives of the output with respect to the
+    /// biases (before summation over the batch) for all layers.
+    void        backward(std::size_t numInputs);
+    /// Derivatives of the output with respect to the inputs, to the host.
+    void        inputDerivatives(std::size_t numInputs, double* dOutputdInput);
+    /// Forward-mode pass along the input direction dInputdx and the
+    /// corresponding backward pass (derivatives of backward() along it).
+    void        tangent(std::size_t numInputs, double const* dInputdx);
+    /// Sum over the batch of the connection derivatives from per-layer
+    /// bias derivatives delta and neuron values y (weights: delta . y^T of
+    /// the previous layer, biases: delta), plus the same from deltaExtra
+    /// and yExtra if not empty, scaled by factor, copied to the host.
+    void        connectionDerivatives(
+                                   std::size_t                 numInputs,
+                                   std::vector<double*> const& delta,
+                                   std::vector<double*> const& y,
+                                   std::vector<double*> const& deltaExtra,
+                                   std::vector<double*> const& yExtra,
+                                   double                      factor,
+                                   double*                     result);
+    /// Copy outputs and neuron statistics to the host.
+    void        results(std::size_t numInputs,
+                        double*     output,
+                        double*     statistics);
 };
 
 }

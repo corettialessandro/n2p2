@@ -1228,6 +1228,22 @@ void Training::setupTraining()
                    "--------------------------------------\n";
     }
 
+#ifdef N2P2_GPU
+    if (elements.front().neuralNetworks.at(nnId).isGpuEnabled())
+    {
+        log << "Jacobians of energy and force updates calculated on the "
+               "GPU.\n";
+#ifdef N2P2_FULL_SFD_MEMORY
+        log << "WARNING: Jacobians of force updates calculated on the CPU "
+               "(no GPU implementation with N2P2_FULL_SFD_MEMORY).\n";
+#endif
+        if (nnpType == NNPType::HDNNP_4G && stage == 1)
+        {
+            log << "WARNING: Jacobians of charge updates calculated on the "
+                   "CPU (no GPU implementation yet).\n";
+        }
+    }
+#endif
     log << strpr("TIMING Finished setup: %.2f seconds.\n",
                  sw["setup"].stop());
     log << "*****************************************"
@@ -2628,6 +2644,10 @@ void Training::update(string const& property)
                    calculateAtomicNeuralNetworks(s, derivatives, "elec");
                    chargeEquilibration(s, derivatives);
                 }
+#ifdef N2P2_GPU
+                if (!addJacobianGpu(s, k, derivatives, 0, 0, offset, dXdc,
+                                    pu.jacobian))
+#endif
                 // Loop over atoms and calculate atomic energy contributions.
                 for (vector<Atom>::iterator it = s.atoms.begin();
                      it != s.atoms.end(); ++it)
@@ -2689,6 +2709,10 @@ void Training::update(string const& property)
                 // For force update save derivative of symmetry function with
                 // respect to coordinate.
                 collectDGdxiaAllAtoms(s, sC->a, sC->c);
+#endif
+#if defined(N2P2_GPU) && !defined(N2P2_FULL_SFD_MEMORY)
+                if (!addJacobianGpu(s, k, derivatives, sC->a, sC->c, offset,
+                                    dXdc, pu.jacobian))
 #endif
                 // Loop over atoms and calculate atomic energy contributions.
                 for (vector<Atom>::iterator it = s.atoms.begin();
@@ -3754,6 +3778,112 @@ void Training::collectDGdxiaAllAtoms(Structure const& structure,
     }
 
     return;
+}
+#endif
+
+#ifdef N2P2_GPU
+bool Training::addJacobianGpu(Structure&              structure,
+                              string const&           property,
+                              bool                    derivatives,
+                              size_t                  indexAtom,
+                              size_t                  indexComponent,
+                              vector<size_t> const&   offset,
+                              vector<vector<double>>& dXdc,
+                              vector<vector<double>>& jacobian)
+{
+    if (!elements.front().neuralNetworks.at(nnId).isGpuEnabled())
+    {
+        return false;
+    }
+    bool const force = (property == "force");
+    bool const chargeInput = (nnpType == NNPType::HDNNP_4G);
+
+    vector<vector<size_t>> atomsOfElement(numElements);
+    for (auto const& a : structure.atoms)
+    {
+        atomsOfElement.at(a.element).push_back(a.index);
+    }
+
+    vector<double> input;
+    vector<double> directions;
+    vector<double> values;
+    vector<double> dEdG;
+    for (size_t e = 0; e < numElements; ++e)
+    {
+        vector<size_t> const& indices = atomsOfElement.at(e);
+        size_t const numAtoms = indices.size();
+        size_t numInputs = 0;
+        if (numAtoms > 0)
+        {
+            numInputs = structure.atoms.at(indices.front()).G.size()
+                      + (chargeInput ? 1 : 0);
+        }
+        // Same inputs as the CPU loops: symmetry functions (and charge),
+        // for forces their derivatives (and dQ/dx) with respect to the
+        // coordinate of the update candidate.
+        input.resize(numInputs * numAtoms);
+        if (force) directions.resize(numInputs * numAtoms);
+        for (size_t t = 0; t < numAtoms; ++t)
+        {
+            Atom const& a = structure.atoms.at(indices.at(t));
+            copy(a.G.begin(), a.G.end(), input.begin() + t * numInputs);
+            if (chargeInput) input.at(t * numInputs + a.G.size()) = a.charge;
+            if (!force) continue;
+#ifndef N2P2_FULL_SFD_MEMORY
+            vector<double>& dGdxiaAtom = dGdxiaAll.at(a.index);
+            if (chargeInput)
+            {
+                dGdxiaAtom.back() = structure.atoms.at(indexAtom)
+                                    .dQdr.at(a.index)[indexComponent];
+            }
+            copy(dGdxiaAtom.begin(),
+                 dGdxiaAtom.end(),
+                 directions.begin() + t * numInputs);
+#endif
+        }
+        values.resize(numAtoms);
+        bool const withDEdG = force && derivatives;
+        if (withDEdG) dEdG.resize(numInputs * numAtoms);
+
+        NeuralNetwork& nn = elements.at(e).neuralNetworks.at(nnId);
+        if (force)
+        {
+            nn.calculateDFdcBatchGpu(numAtoms,
+                                     input.data(),
+                                     directions.data(),
+                                     values.data(),
+                                     withDEdG ? dEdG.data() : nullptr,
+                                     dXdc.at(e).data());
+        }
+        else
+        {
+            nn.calculateDEdcBatchGpu(numAtoms,
+                                     input.data(),
+                                     values.data(),
+                                     dXdc.at(e).data());
+        }
+
+        for (size_t t = 0; t < numAtoms; ++t)
+        {
+            Atom& a = structure.atoms.at(indices.at(t));
+            a.energy = values.at(t);
+            if (withDEdG)
+            {
+                copy(dEdG.begin() + t * numInputs,
+                     dEdG.begin() + (t + 1) * numInputs,
+                     a.dEdG.begin());
+            }
+        }
+
+        // Finally sum up Jacobian.
+        size_t const iu = (updateStrategy == US_ELEMENT) ? e : 0;
+        for (size_t j = 0; j < dXdc.at(e).size(); ++j)
+        {
+            jacobian.at(iu).at(offset.at(e) + j) += dXdc.at(e).at(j);
+        }
+    }
+
+    return true;
 }
 #endif
 

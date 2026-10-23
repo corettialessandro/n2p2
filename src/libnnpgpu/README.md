@@ -90,6 +90,7 @@ tolerance profile of `test/cpp/tolerance.h`.
 |---|---|---|---|
 | Kalman filter (`KalmanFilter`, both types) | P on the device; X = P . H and P = scale (P - K . X^T) + q I | `KalmanFilter` constructor (via `GpuKalmanFilter`) | none needed |
 | Atomic neural networks (`NeuralNetwork`, `Mode::calculateAtomicNeuralNetworks()`): 2G, 4G (elec, short), HDNNP_Q | forward pass and derivatives with respect to the inputs, all atoms of an element as one batch; neuron statistics | when the weights of a network type are set up: `Mode::readNeuralNetworkWeights()`, `Training::randomizeNeuralNetworkWeights()` (via `GpuNeuralNetwork`); not in `setupGeneric()`, which tools without network evaluation use too | none needed (any depth, all activation functions, normalized neurons) |
+| Training Jacobians (`Training::update()`): energy and force updates, 2G and 4G stage 2 | derivatives with respect to all connections summed over the atoms of an element (`NeuralNetwork::calculateDEdcBatchGpu()`, `calculateDFdcBatchGpu()`) | same as the atomic neural networks (they use the same GPU twins) | not ported yet, warning in the training log: charge updates of 4G stage 1, force updates with `N2P2_FULL_SFD_MEMORY` |
 
 ## Programs that require a GPU in a GPU build
 
