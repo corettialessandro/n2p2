@@ -158,19 +158,97 @@ void NeuralNetwork::propagateBatchGpu(size_t        numInputs,
                                       double*       output,
                                       double*       dEdG)
 {
+    requireGpu();
+    if (numInputs == 0) return;
+#ifdef N2P2_GPU
+    vector<double> statistics(4 * getNumNeurons());
+    gpu->propagate(numInputs, input, output, dEdG, statistics.data());
+    addNeuronStatistics(numInputs, statistics);
+#else
+    (void)input;
+    (void)output;
+    (void)dEdG;
+#endif
+
+    return;
+}
+
+void NeuralNetwork::calculateDEdcBatchGpu(size_t        numInputs,
+                                          double const* input,
+                                          double*       output,
+                                          double*       dEdcSum)
+{
+    requireGpu();
+    if (numInputs == 0)
+    {
+        for (int i = 0; i < numConnections; i++) dEdcSum[i] = 0.0;
+        return;
+    }
+#ifdef N2P2_GPU
+    vector<double> statistics(4 * getNumNeurons());
+    gpu->propagateDEdc(numInputs, input, output, dEdcSum, statistics.data());
+    addNeuronStatistics(numInputs, statistics);
+#else
+    (void)input;
+    (void)output;
+#endif
+
+    return;
+}
+
+void NeuralNetwork::calculateDFdcBatchGpu(size_t        numInputs,
+                                          double const* input,
+                                          double const* dGdxyz,
+                                          double*       output,
+                                          double*       dEdG,
+                                          double*       dFdcSum)
+{
+    requireGpu();
+    if (numInputs == 0)
+    {
+        for (int i = 0; i < numConnections; i++) dFdcSum[i] = 0.0;
+        return;
+    }
+#ifdef N2P2_GPU
+    vector<double> statistics(4 * getNumNeurons());
+    gpu->propagateDFdc(numInputs,
+                       input,
+                       dGdxyz,
+                       output,
+                       dEdG,
+                       dFdcSum,
+                       statistics.data());
+    addNeuronStatistics(numInputs, statistics);
+#else
+    (void)input;
+    (void)dGdxyz;
+    (void)output;
+    (void)dEdG;
+#endif
+
+    return;
+}
+
+void NeuralNetwork::requireGpu() const
+{
 #ifdef N2P2_GPU
     if (gpu == NULL)
     {
         throw runtime_error("ERROR: GPU not enabled for this neural "
                             "network.\n");
     }
-    if (numInputs == 0) return;
+#else
+    throw runtime_error("ERROR: n2p2 was built without GPU support.\n");
+#endif
 
+    return;
+}
+
+void NeuralNetwork::addNeuronStatistics(size_t                numInputs,
+                                        vector<double> const& statistics)
+{
+    // Same accumulation as numInputs calls of setInput() and propagate().
     size_t const numNeurons = getNumNeurons();
-    vector<double> statistics(4 * numNeurons);
-    gpu->propagate(numInputs, input, output, dEdG, statistics.data());
-
-    // Neuron statistics as numInputs calls of setInput() and propagate().
     size_t count = 0;
     for (int i = 0; i < numLayers; i++)
     {
@@ -185,13 +263,6 @@ void NeuralNetwork::propagateBatchGpu(size_t        numInputs,
             count++;
         }
     }
-#else
-    (void)numInputs;
-    (void)input;
-    (void)output;
-    (void)dEdG;
-    throw runtime_error("ERROR: n2p2 was built without GPU support.\n");
-#endif
 
     return;
 }

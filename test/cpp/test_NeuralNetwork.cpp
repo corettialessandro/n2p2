@@ -792,7 +792,8 @@ vector<Architecture> gpuArchitectures()
                  false});
     for (int f = NN::AF_IDENTITY; f <= NN::AF_HARMONIC; ++f)
     {
-        NN::ActivationFunction const af = static_cast<NN::ActivationFunction>(f);
+        NN::ActivationFunction const af =
+            static_cast<NN::ActivationFunction>(f);
         v.push_back({{6, 10, 7, 1},
                      {NN::AF_IDENTITY, af, NN::AF_TANH, NN::AF_IDENTITY},
                      false});
@@ -900,7 +901,120 @@ void requireSameStatistics(NeuralNetwork const& cpu, NeuralNetwork const& gpu)
     }
 }
 
+// Requires equal vectors, with round-off scaled by their largest entry.
+void requireCloseScaled(vector<double> const& cpu,
+                        vector<double> const& gpu,
+                        string const&         what)
+{
+    BOOST_REQUIRE_EQUAL(cpu.size(), gpu.size());
+    double scale = 1.0;
+    for (double v : cpu) scale = max(scale, fabs(v));
+    Tolerance const tolerance(gpuRelativeEvaluation * scale,
+                              gpuRelativeEvaluation);
+    for (size_t i = 0; i < cpu.size(); ++i)
+    {
+        BOOST_TEST_INFO(what << " " << i);
+        REQUIRE_CLOSE_TO_REFERENCE(cpu.at(i), gpu.at(i), tolerance);
+    }
+}
+
 BOOST_AUTO_TEST_SUITE(GpuTests)
+
+BOOST_DATA_TEST_CASE(CalculateDEdcBatch_Architectures_MatchesCpuSum,
+                     bdata::make(gpuArchitectures()),
+                     architecture)
+{
+    unique_ptr<NeuralNetwork> cpu = makeNetwork(architecture);
+    unique_ptr<NeuralNetwork> gpu = makeNetwork(architecture);
+    gpu->setGpuEnabled(true);
+    size_t const numIn = architecture.numNeurons.front();
+    size_t const numConnections = cpu->getNumConnections();
+    size_t const numInputs = 23;
+    vector<double> const in = makeInputs(numIn, numInputs, 5);
+
+    vector<double> dEdcSum(numConnections, 0.0);
+    vector<double> dEdc(numConnections);
+    vector<double> out(numInputs);
+    for (size_t t = 0; t < numInputs; ++t)
+    {
+        cpu->setInput(&(in.at(t * numIn)));
+        cpu->propagate();
+        cpu->getOutput(&(out.at(t)));
+        cpu->calculateDEdc(dEdc.data());
+        for (size_t j = 0; j < numConnections; ++j) dEdcSum.at(j) += dEdc.at(j);
+    }
+
+    vector<double> outGpu(numInputs);
+    vector<double> dEdcSumGpu(numConnections);
+    gpu->calculateDEdcBatchGpu(numInputs, in.data(), outGpu.data(),
+                               dEdcSumGpu.data());
+    requireCloseScaled(out, outGpu, "output");
+    requireCloseScaled(dEdcSum, dEdcSumGpu, "dEdc");
+    requireSameStatistics(*cpu, *gpu);
+}
+
+BOOST_DATA_TEST_CASE(CalculateDFdcBatch_Architectures_MatchesCpuSum,
+                     bdata::make(gpuArchitectures()),
+                     architecture)
+{
+    unique_ptr<NeuralNetwork> cpu = makeNetwork(architecture);
+    unique_ptr<NeuralNetwork> gpu = makeNetwork(architecture);
+    gpu->setGpuEnabled(true);
+    size_t const numIn = architecture.numNeurons.front();
+    size_t const numConnections = cpu->getNumConnections();
+    size_t const numInputs = 17;
+    vector<double> const in = makeInputs(numIn, numInputs, 7);
+    // Derivatives of the inputs with respect to a coordinate.
+    vector<double> dGdx(numIn * numInputs);
+    for (size_t i = 0; i < dGdx.size(); ++i) dGdx.at(i) = cos(0.45 * i + 1.0);
+
+    vector<double> dFdcSum(numConnections, 0.0);
+    vector<double> dFdc(numConnections);
+    vector<double> out(numInputs);
+    vector<double> dEdG(numIn * numInputs);
+    for (size_t t = 0; t < numInputs; ++t)
+    {
+        cpu->setInput(&(in.at(t * numIn)));
+        cpu->propagate();
+        cpu->getOutput(&(out.at(t)));
+        cpu->calculateDEdG(&(dEdG.at(t * numIn)));
+        cpu->calculateDFdc(dFdc.data(), &(dGdx.at(t * numIn)));
+        for (size_t j = 0; j < numConnections; ++j) dFdcSum.at(j) += dFdc.at(j);
+    }
+
+    vector<double> outGpu(numInputs);
+    vector<double> dEdGGpu(numIn * numInputs);
+    vector<double> dFdcSumGpu(numConnections);
+    gpu->calculateDFdcBatchGpu(numInputs, in.data(), dGdx.data(),
+                               outGpu.data(), dEdGGpu.data(),
+                               dFdcSumGpu.data());
+    requireCloseScaled(out, outGpu, "output");
+    requireCloseScaled(dEdG, dEdGGpu, "dEdG");
+    requireCloseScaled(dFdcSum, dFdcSumGpu, "dFdc");
+    requireSameStatistics(*cpu, *gpu);
+
+    // Without dEdG output.
+    BOOST_REQUIRE_NO_THROW(gpu->calculateDFdcBatchGpu(numInputs,
+                                                      in.data(),
+                                                      dGdx.data(),
+                                                      outGpu.data(),
+                                                      nullptr,
+                                                      dFdcSumGpu.data()));
+    requireCloseScaled(dFdcSum, dFdcSumGpu, "dFdc without dEdG");
+}
+
+BOOST_AUTO_TEST_CASE(CalculateJacobianBatch_NoInputs_Zero)
+{
+    unique_ptr<NeuralNetwork> gpu = makeNetwork(gpuArchitectures().front());
+    gpu->setGpuEnabled(true);
+    vector<double> d(gpu->getNumConnections(), 1.0);
+    gpu->calculateDEdcBatchGpu(0, nullptr, nullptr, d.data());
+    for (double v : d) BOOST_REQUIRE_EQUAL(v, 0.0);
+    d.assign(d.size(), 1.0);
+    gpu->calculateDFdcBatchGpu(0, nullptr, nullptr, nullptr, nullptr,
+                               d.data());
+    for (double v : d) BOOST_REQUIRE_EQUAL(v, 0.0);
+}
 
 BOOST_DATA_TEST_CASE(PropagateBatch_Architectures_MatchesCpu,
                      bdata::make(gpuArchitectures()),

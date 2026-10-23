@@ -11,6 +11,7 @@
 #include <boost/test/data/monomorphic.hpp>
 #include <boost/filesystem.hpp>
 #include "fileHelpers.h"
+#include "tolerance.h"
 
 #include "Training.h"
 #include "utility.h"
@@ -132,28 +133,37 @@ struct FixtureH2OTrainingGD : public FixtureRepairDir
     Training training;
 };
 
-// Runs the given number of epochs of 4G stage-2 (energy and force) training
-// on the H2O_RPBE-D3_4G example, with or without memorize_symfunc_results
-// and with the given short_force_fraction, and returns the stage-2
-// learning-curve values {energy RMSE train, test, force RMSE train, test} of
-// epochs 0 to epochs. Same setup sequence as src/application/nnp-train.cpp
-// for stage 2.
-vector<double> trainStage2Epochs4G(bool          memorize,
-                                   size_t        epochs,
-                                   string const& forceFraction)
+// Runs the given number of epochs of energy and force training (stage 2 for
+// 4G) on an nnp-train example and returns the learning-curve values {energy
+// RMSE train, test, force RMSE train, test} of epochs 0 to epochs. Same setup
+// sequence as src/application/nnp-train.cpp. epochsLine is the epochs line
+// of the example's input.nn. A non-empty forceFraction replaces the
+// example's short_force_fraction 0.025. With memorize,
+// memorize_symfunc_results is switched on. Without gpuNetworks (GPU builds),
+// the neural networks are evaluated on the CPU.
+vector<double> trainEpochs(string const& example,
+                           size_t        stage,
+                           string const& epochsLine,
+                           size_t        epochs,
+                           string const& forceFraction,
+                           bool          memorize,
+                           bool          gpuNetworks)
 {
     if (bfs::exists("test")) bfs::remove_all("test");
     BOOST_REQUIRE(copy_directory_recursively(
-        "../../examples/nnp-train/H2O_RPBE-D3_4G", "test"));
+        "../../examples/nnp-train/" + example, "test"));
     bfs::current_path("test");
     BOOST_REQUIRE(replaceInFile("input.nn",
-                                "epochs                          10",
+                                epochsLine,
                                 "epochs                          "
                                 + to_string(epochs)));
-    BOOST_REQUIRE(replaceInFile("input.nn",
-                                "short_force_fraction            0.025",
-                                "short_force_fraction            "
-                                + forceFraction));
+    if (!forceFraction.empty())
+    {
+        BOOST_REQUIRE(replaceInFile("input.nn",
+                                    "short_force_fraction            0.025",
+                                    "short_force_fraction            "
+                                    + forceFraction));
+    }
     if (memorize)
     {
         BOOST_REQUIRE(replaceInFile("input.nn",
@@ -167,7 +177,7 @@ vector<double> trainStage2Epochs4G(bool          memorize,
         training.setupMPI();
         training.initialize();
         training.loadSettingsFile();
-        training.setStage(2);
+        training.setStage(stage);
         training.setupGeneric(
             "", training.settingsKeywordExists("normalize_data_set"), false);
         training.setupSymmetryFunctionScaling();
@@ -176,6 +186,14 @@ vector<double> trainStage2Epochs4G(bool          memorize,
         training.distributeStructures(true);
         training.selectSets();
         training.initializeWeights();
+        if (!gpuNetworks)
+        {
+            training.setNeuralNetworkGpuEnabled("short", false);
+            if (training.getNnpType() == Mode::NNPType::HDNNP_4G)
+            {
+                training.setNeuralNetworkGpuEnabled("elec", false);
+            }
+        }
         if (training.settingsKeywordExists("normalize_data_set"))
         {
             training.dataSetNormalization();
@@ -187,7 +205,8 @@ vector<double> trainStage2Epochs4G(bool          memorize,
     }
 
     vector<double> rows(4 * (epochs + 1), 0.0);
-    ifstream file("learning-curve.out.stage-2");
+    ifstream file(stage == 0 ? "learning-curve.out"
+                             : "learning-curve.out.stage-2");
     BOOST_REQUIRE(file.is_open());
     string line;
     while (getline(file, line))
@@ -205,6 +224,33 @@ vector<double> trainStage2Epochs4G(bool          memorize,
     bfs::current_path("..");
     bfs::remove_all("test");
     return rows;
+}
+
+// 4G stage-2 training on the H2O_RPBE-D3_4G example.
+vector<double> trainStage2Epochs4G(bool          memorize,
+                                   size_t        epochs,
+                                   string const& forceFraction,
+                                   bool          gpuNetworks = true)
+{
+    return trainEpochs("H2O_RPBE-D3_4G",
+                       2,
+                       "epochs                          10",
+                       epochs,
+                       forceFraction,
+                       memorize,
+                       gpuNetworks);
+}
+
+// One epoch of 2G training on the H2O_RPBE-D3 example.
+vector<double> trainOneEpoch2G(bool gpuNetworks)
+{
+    return trainEpochs("H2O_RPBE-D3",
+                       0,
+                       "epochs                          2",
+                       1,
+                       "",
+                       false,
+                       gpuNetworks);
 }
 
 // Copy of the H2O_RPBE-D3_4G example for 4G stage-1 tests, which may modify
@@ -738,3 +784,40 @@ int main(int argc, char* argv[])
     MPI_Finalize();
     return result;
 }
+
+#ifdef N2P2_GPU
+// Training with the neural networks (evaluation and the energy and force
+// Jacobians of the updates) on the GPU against the CPU, in the same binary.
+// The learning curve prints 9 significant digits; after one epoch of
+// updates the trajectories agree to about 1E-9 relative.
+BOOST_AUTO_TEST_SUITE(GpuTests)
+
+void requireSameLearningCurve(vector<double> const& cpu,
+                              vector<double> const& gpu)
+{
+    Tolerance const tolerance(0.0, 1.0E-6);
+    for (size_t i = 0; i < cpu.size(); ++i)
+    {
+        BOOST_TEST_INFO("learning-curve value " << i);
+        BOOST_REQUIRE(cpu.at(i) > 0.0);
+        REQUIRE_CLOSE_TO_REFERENCE(cpu.at(i), gpu.at(i), tolerance);
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(Train2G_GpuNetworks_MatchesCpu, FixtureRepairDir)
+{
+    vector<double> const gpu = trainOneEpoch2G(true);
+    vector<double> const cpu = trainOneEpoch2G(false);
+    requireSameLearningCurve(cpu, gpu);
+}
+
+BOOST_FIXTURE_TEST_CASE(TrainStage2_4G_GpuNetworks_MatchesCpu,
+                        FixtureRepairDir)
+{
+    vector<double> const gpu = trainStage2Epochs4G(false, 1, "0.025", true);
+    vector<double> const cpu = trainStage2Epochs4G(false, 1, "0.025", false);
+    requireSameLearningCurve(cpu, gpu);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+#endif

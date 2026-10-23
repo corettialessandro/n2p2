@@ -18,6 +18,7 @@
 #include "GpuDevice.h"
 #include "GpuError.h"
 #include "NeuralNetwork.h"
+#include <algorithm> // std::max
 #include <cfloat>    // DBL_MAX
 #include <stdexcept> // std::runtime_error
 
@@ -174,15 +175,53 @@ __global__ void activateLayer(int           f,
     activate(f, v, value[i], dfdx[i], d2fdx2[i]);
 }
 
-// g = g * dfdx / scale (one step of the backward pass).
-__global__ void scaleByDerivative(size_t        numEntries,
-                                  double const* dfdx,
-                                  double        scale,
-                                  double*       g)
+// ydot = dfdx * xdot (tangent of the activation).
+__global__ void multiplyDerivative(size_t        numEntries,
+                                   double const* dfdx,
+                                   double const* xdot,
+                                   double*       ydot)
 {
     size_t const i = blockIdx.x * static_cast<size_t>(blockDim.x)
                    + threadIdx.x;
-    if (i < numEntries) g[i] *= dfdx[i] / scale;
+    if (i < numEntries) ydot[i] = dfdx[i] * xdot[i];
+}
+
+// gdot = (h * dfdx + hPrime * d2fdx2 * xdot) / scale, the tangent of
+// g = h * dfdx / scale with h = W^T g_next and hPrime = W^T gdot_next.
+__global__ void tangentBackward(size_t        numEntries,
+                                double const* hPrime,
+                                double const* h,
+                                double const* dfdx,
+                                double const* d2fdx2,
+                                double const* xdot,
+                                double        scale,
+                                double*       gdot)
+{
+    size_t const i = blockIdx.x * static_cast<size_t>(blockDim.x)
+                   + threadIdx.x;
+    if (i < numEntries)
+    {
+        gdot[i] = (hPrime[i] * dfdx[i] + h[i] * d2fdx2[i] * xdot[i]) / scale;
+    }
+}
+
+// a = b * c / scale.
+__global__ void multiplyScaled(size_t        numEntries,
+                               double const* b,
+                               double const* c,
+                               double        scale,
+                               double*       a)
+{
+    size_t const i = blockIdx.x * static_cast<size_t>(blockDim.x)
+                   + threadIdx.x;
+    if (i < numEntries) a[i] = b[i] * c[i] / scale;
+}
+
+__global__ void fill(size_t numEntries, double value, double* a)
+{
+    size_t const i = blockIdx.x * static_cast<size_t>(blockDim.x)
+                   + threadIdx.x;
+    if (i < numEntries) a[i] = value;
 }
 
 // Minimum, maximum, sum and sum of squares of each row of a numRows x
@@ -261,14 +300,25 @@ struct GpuNeuralNetwork::Data
     size_t          capacity;
     double*         connections;
     /// Per layer, numNeurons[l] x capacity: x (before activation), value,
-    /// dfdx, d2fdx2 and the backward pass g. Layer 0 uses value only.
+    /// dfdx, d2fdx2, the backward pass g (derivatives with respect to the
+    /// biases), the tangents xdot, ydot (value) and gdot along an input
+    /// direction and the scratch matrix h. Layer 0 uses value and ydot
+    /// only.
     vector<double*> x;
     vector<double*> value;
     vector<double*> dfdx;
     vector<double*> d2fdx2;
     vector<double*> g;
+    vector<double*> xdot;
+    vector<double*> ydot;
+    vector<double*> gdot;
+    vector<double*> h;
     /// Derivatives of the output with respect to the inputs.
     double*         dOutputdInput;
+    /// Vector of ones (capacity), sums over the batch.
+    double*         ones;
+    /// Summed derivatives with respect to the connections.
+    double*         dConnections;
     double*         statistics;
     cublasHandle_t  handle;
 };
@@ -287,13 +337,15 @@ GpuNeuralNetwork::GpuNeuralNetwork(
     d.capacity = 0;
     d.connections = nullptr;
     d.dOutputdInput = nullptr;
+    d.ones = nullptr;
+    d.dConnections = nullptr;
     d.statistics = nullptr;
     d.handle = nullptr;
-    d.x.assign(d.numLayers, nullptr);
-    d.value.assign(d.numLayers, nullptr);
-    d.dfdx.assign(d.numLayers, nullptr);
-    d.d2fdx2.assign(d.numLayers, nullptr);
-    d.g.assign(d.numLayers, nullptr);
+    for (vector<double*>* b : {&d.x, &d.value, &d.dfdx, &d.d2fdx2, &d.g,
+                               &d.xdot, &d.ydot, &d.gdot, &d.h})
+    {
+        b->assign(d.numLayers, nullptr);
+    }
     try
     {
         if (d.numLayers < 3 || d.activation.size() != d.numLayers
@@ -336,6 +388,8 @@ GpuNeuralNetwork::GpuNeuralNetwork(
         d.device = gpuRequireDevice();
         NNP_CUDA_CHECK(cudaMalloc(&d.connections,
                                   d.numConnections * sizeof(double)));
+        NNP_CUDA_CHECK(cudaMalloc(&d.dConnections,
+                                  d.numConnections * sizeof(double)));
         NNP_CUDA_CHECK(cudaMalloc(&d.statistics,
                                   4 * d.numNeuronsTotal * sizeof(double)));
         NNP_CUBLAS_CHECK(cublasCreate(&d.handle));
@@ -359,15 +413,14 @@ void GpuNeuralNetwork::release()
     cudaSetDevice(d.device);
     if (d.handle != nullptr) cublasDestroy(d.handle);
     cudaFree(d.connections);
+    cudaFree(d.dConnections);
     cudaFree(d.statistics);
     cudaFree(d.dOutputdInput);
-    for (size_t l = 0; l < d.numLayers; ++l)
+    cudaFree(d.ones);
+    for (vector<double*>* b : {&d.x, &d.value, &d.dfdx, &d.d2fdx2, &d.g,
+                               &d.xdot, &d.ydot, &d.gdot, &d.h})
     {
-        cudaFree(d.x.at(l));
-        cudaFree(d.value.at(l));
-        cudaFree(d.dfdx.at(l));
-        cudaFree(d.d2fdx2.at(l));
-        cudaFree(d.g.at(l));
+        for (double* p : *b) cudaFree(p);
     }
     delete data;
     data = nullptr;
@@ -381,21 +434,25 @@ void GpuNeuralNetwork::reserve(size_t numInputs)
     size_t const capacity = max(numInputs, d.capacity + d.capacity / 2);
     d.capacity = 0;
     NNP_CUDA_CHECK(cudaFree(d.dOutputdInput));
+    NNP_CUDA_CHECK(cudaFree(d.ones));
     d.dOutputdInput = nullptr;
+    d.ones = nullptr;
     NNP_CUDA_CHECK(cudaMalloc(&d.dOutputdInput,
                               d.numNeurons.at(0) * capacity
                               * sizeof(double)));
+    NNP_CUDA_CHECK(cudaMalloc(&d.ones, capacity * sizeof(double)));
+    fill<<<numBlocks(capacity), threadsPerBlock>>>(capacity, 1.0, d.ones);
+    NNP_CUDA_CHECK(cudaGetLastError());
     for (size_t l = 0; l < d.numLayers; ++l)
     {
-        vector<double*>* buffers[] = {&d.x, &d.value, &d.dfdx, &d.d2fdx2,
-                                      &d.g};
         size_t const bytes = d.numNeurons.at(l) * capacity * sizeof(double);
-        for (vector<double*>* b : buffers)
+        for (vector<double*>* b : {&d.x, &d.value, &d.dfdx, &d.d2fdx2, &d.g,
+                                   &d.xdot, &d.ydot, &d.gdot, &d.h})
         {
             NNP_CUDA_CHECK(cudaFree(b->at(l)));
             b->at(l) = nullptr;
-            // Input layer: only values are needed.
-            if (l == 0 && b != &d.value) continue;
+            // Input layer: only values and their tangents are needed.
+            if (l == 0 && b != &d.value && b != &d.ydot) continue;
             NNP_CUDA_CHECK(cudaMalloc(&(b->at(l)), bytes));
         }
     }
@@ -417,12 +474,68 @@ void GpuNeuralNetwork::propagate(size_t        numInputs,
                                  double*       dOutputdInput,
                                  double*       statistics)
 {
-    Data& d = *data;
     if (numInputs == 0) return;
+    forward(numInputs, input);
+    if (dOutputdInput != nullptr)
+    {
+        backward(numInputs);
+        inputDerivatives(numInputs, dOutputdInput);
+    }
+    results(numInputs, output, statistics);
+}
+
+void GpuNeuralNetwork::propagateDEdc(size_t        numInputs,
+                                     double const* input,
+                                     double*       output,
+                                     double*       dOutputdConnectionsSum,
+                                     double*       statistics)
+{
+    if (numInputs == 0) return;
+    forward(numInputs, input);
+    backward(numInputs);
+    // As NeuralNetwork::calculateDEdc(): weights delta . y^T, biases delta.
+    connectionDerivatives(numInputs,
+                          data->g,
+                          data->value,
+                          {},
+                          {},
+                          1.0,
+                          dOutputdConnectionsSum);
+    results(numInputs, output, statistics);
+}
+
+void GpuNeuralNetwork::propagateDFdc(size_t        numInputs,
+                                     double const* input,
+                                     double const* dInputdx,
+                                     double*       output,
+                                     double*       dOutputdInput,
+                                     double*       dForcedConnectionsSum,
+                                     double*       statistics)
+{
+    if (numInputs == 0) return;
+    forward(numInputs, input);
+    backward(numInputs);
+    if (dOutputdInput != nullptr) inputDerivatives(numInputs, dOutputdInput);
+    tangent(numInputs, dInputdx);
+    // Directional derivative of calculateDEdc() along dInputdx, as
+    // NeuralNetwork::calculateD2EdGdc() summed over the inputs: weights
+    // gdot . y^T + g . ydot^T, biases gdot. F = -dE/dx gives the sign.
+    connectionDerivatives(numInputs,
+                          data->gdot,
+                          data->value,
+                          data->g,
+                          data->ydot,
+                          -1.0,
+                          dForcedConnectionsSum);
+    results(numInputs, output, statistics);
+}
+
+void GpuNeuralNetwork::forward(size_t numInputs, double const* input)
+{
+    Data& d = *data;
     NNP_CUDA_CHECK(cudaSetDevice(d.device));
     reserve(numInputs);
     int const numColumns = static_cast<int>(numInputs);
-    size_t const last = d.numLayers - 1;
     double const one = 1.0;
     double const zero = 0.0;
 
@@ -469,64 +582,199 @@ void GpuNeuralNetwork::propagate(size_t        numInputs,
             d.statistics);
         NNP_CUDA_CHECK(cudaGetLastError());
     }
+}
 
-    // Backward pass for the derivatives with respect to the inputs, as in
-    // NeuralNetwork::calculateDEdG(): g = dfdx / scale for the output
+void GpuNeuralNetwork::backward(size_t numInputs)
+{
+    // As NeuralNetwork::calculateDEdb(): g = dfdx / scale for the output
     // layer, then g_l = (W_{l+1}^T . g_{l+1}) * dfdx_l / scale_l.
-    if (dOutputdInput != nullptr)
+    Data& d = *data;
+    int const numColumns = static_cast<int>(numInputs);
+    size_t const last = d.numLayers - 1;
+    double const one = 1.0;
+    double const zero = 0.0;
+    for (size_t l = last; l >= 1; --l)
     {
-        NNP_CUDA_CHECK(cudaMemcpy(d.g.at(last),
-                                  d.dfdx.at(last),
-                                  numInputs * sizeof(double),
-                                  cudaMemcpyDeviceToDevice));
-        for (size_t l = last; l >= 1; --l)
+        int const n = d.numNeurons.at(l);
+        double const scale = d.normalize ? d.numNeurons.at(l - 1) : 1.0;
+        size_t const numEntries = n * numInputs;
+        if (l == last)
         {
-            int const n = d.numNeurons.at(l);
-            int const nPrev = d.numNeurons.at(l - 1);
-            if (l < last)
-            {
-                int const nNext = d.numNeurons.at(l + 1);
-                NNP_CUBLAS_CHECK(cublasDgemm(
-                    d.handle,
-                    CUBLAS_OP_T, CUBLAS_OP_N,
-                    n, numColumns, nNext,
-                    &one,
-                    d.connections + d.weightOffset.at(l + 1), nNext,
-                    d.g.at(l + 1), nNext,
-                    &zero, d.g.at(l), n));
-                size_t const numEntries = n * numInputs;
-                scaleByDerivative<<<numBlocks(numEntries), threadsPerBlock>>>(
-                    numEntries,
-                    d.dfdx.at(l),
-                    d.normalize ? static_cast<double>(nPrev) : 1.0,
-                    d.g.at(l));
-                NNP_CUDA_CHECK(cudaGetLastError());
-            }
-            else if (d.normalize)
-            {
-                // Output layer: g already holds dfdx, only scale.
-                double const scale = 1.0 / nPrev;
-                NNP_CUBLAS_CHECK(cublasDscal(d.handle, numColumns, &scale,
-                                             d.g.at(l), 1));
-            }
+            fill<<<numBlocks(numEntries), threadsPerBlock>>>(numEntries,
+                                                             1.0,
+                                                             d.h.at(l));
         }
-        int const nIn = d.numNeurons.at(0);
-        int const n1 = d.numNeurons.at(1);
-        NNP_CUBLAS_CHECK(cublasDgemm(d.handle,
-                                     CUBLAS_OP_T, CUBLAS_OP_N,
-                                     nIn, numColumns, n1,
-                                     &one,
-                                     d.connections + d.weightOffset.at(1), n1,
-                                     d.g.at(1), n1,
-                                     &zero, d.dOutputdInput, nIn));
-        NNP_CUDA_CHECK(cudaMemcpy(dOutputdInput,
-                                  d.dOutputdInput,
-                                  nIn * numInputs * sizeof(double),
-                                  cudaMemcpyDeviceToHost));
+        else
+        {
+            int const nNext = d.numNeurons.at(l + 1);
+            NNP_CUBLAS_CHECK(cublasDgemm(
+                d.handle,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                n, numColumns, nNext,
+                &one,
+                d.connections + d.weightOffset.at(l + 1), nNext,
+                d.g.at(l + 1), nNext,
+                &zero, d.h.at(l), n));
+        }
+        multiplyScaled<<<numBlocks(numEntries), threadsPerBlock>>>(
+            numEntries, d.h.at(l), d.dfdx.at(l), scale, d.g.at(l));
+        NNP_CUDA_CHECK(cudaGetLastError());
     }
+}
 
+void GpuNeuralNetwork::inputDerivatives(size_t numInputs,
+                                        double* dOutputdInput)
+{
+    // As NeuralNetwork::calculateDEdG(): W_1^T . g_1.
+    Data& d = *data;
+    int const numColumns = static_cast<int>(numInputs);
+    int const nIn = d.numNeurons.at(0);
+    int const n1 = d.numNeurons.at(1);
+    double const one = 1.0;
+    double const zero = 0.0;
+    NNP_CUBLAS_CHECK(cublasDgemm(d.handle,
+                                 CUBLAS_OP_T, CUBLAS_OP_N,
+                                 nIn, numColumns, n1,
+                                 &one,
+                                 d.connections + d.weightOffset.at(1), n1,
+                                 d.g.at(1), n1,
+                                 &zero, d.dOutputdInput, nIn));
+    NNP_CUDA_CHECK(cudaMemcpy(dOutputdInput,
+                              d.dOutputdInput,
+                              nIn * numInputs * sizeof(double),
+                              cudaMemcpyDeviceToHost));
+}
+
+void GpuNeuralNetwork::tangent(size_t numInputs, double const* dInputdx)
+{
+    // Forward mode along the input direction, as NeuralNetwork::
+    // calculateDxdG(): xdot = W . ydot_prev / scale, ydot = dfdx * xdot.
+    // Then the derivative of backward() along it: for the output layer
+    // gdot = d2fdx2 * xdot / scale, otherwise gdot_l = (W^T . gdot_{l+1}
+    // * dfdx_l + W^T . g_{l+1} * d2fdx2_l * xdot_l) / scale_l.
+    Data& d = *data;
+    int const numColumns = static_cast<int>(numInputs);
+    size_t const last = d.numLayers - 1;
+    double const zero = 0.0;
+    double const one = 1.0;
+    NNP_CUDA_CHECK(cudaMemcpy(d.ydot.at(0),
+                              dInputdx,
+                              d.numNeurons.at(0) * numInputs * sizeof(double),
+                              cudaMemcpyHostToDevice));
+    for (size_t l = 1; l < d.numLayers; ++l)
+    {
+        int const n = d.numNeurons.at(l);
+        int const nPrev = d.numNeurons.at(l - 1);
+        double const scaleInv = d.normalize ? 1.0 / nPrev : 1.0;
+        NNP_CUBLAS_CHECK(cublasDgemm(d.handle,
+                                     CUBLAS_OP_N, CUBLAS_OP_N,
+                                     n, numColumns, nPrev,
+                                     &scaleInv,
+                                     d.connections + d.weightOffset.at(l), n,
+                                     d.ydot.at(l - 1), nPrev,
+                                     &zero, d.xdot.at(l), n));
+        size_t const numEntries = n * numInputs;
+        multiplyDerivative<<<numBlocks(numEntries), threadsPerBlock>>>(
+            numEntries, d.dfdx.at(l), d.xdot.at(l), d.ydot.at(l));
+        NNP_CUDA_CHECK(cudaGetLastError());
+    }
+    for (size_t l = last; l >= 1; --l)
+    {
+        int const n = d.numNeurons.at(l);
+        double const scale = d.normalize ? d.numNeurons.at(l - 1) : 1.0;
+        size_t const numEntries = n * numInputs;
+        if (l == last)
+        {
+            // h (ones) from backward(), hPrime = 0.
+            multiplyScaled<<<numBlocks(numEntries), threadsPerBlock>>>(
+                numEntries, d.d2fdx2.at(l), d.xdot.at(l), scale, d.gdot.at(l));
+        }
+        else
+        {
+            int const nNext = d.numNeurons.at(l + 1);
+            // h_l = W^T . g_{l+1} is still there from backward(); the
+            // scratch for W^T . gdot_{l+1} is gdot_l itself.
+            NNP_CUBLAS_CHECK(cublasDgemm(
+                d.handle,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                n, numColumns, nNext,
+                &one,
+                d.connections + d.weightOffset.at(l + 1), nNext,
+                d.gdot.at(l + 1), nNext,
+                &zero, d.gdot.at(l), n));
+            tangentBackward<<<numBlocks(numEntries), threadsPerBlock>>>(
+                numEntries,
+                d.gdot.at(l),
+                d.h.at(l),
+                d.dfdx.at(l),
+                d.d2fdx2.at(l),
+                d.xdot.at(l),
+                scale,
+                d.gdot.at(l));
+        }
+        NNP_CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+void GpuNeuralNetwork::connectionDerivatives(
+                                        size_t                 numInputs,
+                                        vector<double*> const& delta,
+                                        vector<double*> const& y,
+                                        vector<double*> const& deltaExtra,
+                                        vector<double*> const& yExtra,
+                                        double                 factor,
+                                        double*                result)
+{
+    Data& d = *data;
+    int const numColumns = static_cast<int>(numInputs);
+    double const zero = 0.0;
+    double const one = 1.0;
+    for (size_t l = 1; l < d.numLayers; ++l)
+    {
+        int const n = d.numNeurons.at(l);
+        int const nPrev = d.numNeurons.at(l - 1);
+        double* weights = d.dConnections + d.weightOffset.at(l);
+        // Weights (n x nPrev, same layout as in the connections).
+        NNP_CUBLAS_CHECK(cublasDgemm(d.handle,
+                                     CUBLAS_OP_N, CUBLAS_OP_T,
+                                     n, nPrev, numColumns,
+                                     &factor,
+                                     delta.at(l), n,
+                                     y.at(l - 1), nPrev,
+                                     &zero, weights, n));
+        if (!deltaExtra.empty())
+        {
+            NNP_CUBLAS_CHECK(cublasDgemm(d.handle,
+                                         CUBLAS_OP_N, CUBLAS_OP_T,
+                                         n, nPrev, numColumns,
+                                         &factor,
+                                         deltaExtra.at(l), n,
+                                         yExtra.at(l - 1), nPrev,
+                                         &one, weights, n));
+        }
+        // Biases: sum of delta over the batch.
+        NNP_CUBLAS_CHECK(cublasDgemv(d.handle,
+                                     CUBLAS_OP_N,
+                                     n, numColumns,
+                                     &factor,
+                                     delta.at(l), n,
+                                     d.ones, 1,
+                                     &zero,
+                                     d.dConnections + d.biasOffset.at(l), 1));
+    }
+    NNP_CUDA_CHECK(cudaMemcpy(result,
+                              d.dConnections,
+                              d.numConnections * sizeof(double),
+                              cudaMemcpyDeviceToHost));
+}
+
+void GpuNeuralNetwork::results(size_t  numInputs,
+                               double* output,
+                               double* statistics)
+{
+    Data& d = *data;
     NNP_CUDA_CHECK(cudaMemcpy(output,
-                              d.value.at(last),
+                              d.value.at(d.numLayers - 1),
                               numInputs * sizeof(double),
                               cudaMemcpyDeviceToHost));
     NNP_CUDA_CHECK(cudaMemcpy(statistics,
