@@ -68,6 +68,35 @@ the CPU path in the same test binary (through an internal switch that is not
 visible to users) and against the stored CPU references, with the GPU
 tolerance profile of `test/cpp/tolerance.h`.
 
+## Running with several MPI ranks per GPU
+
+Each MPI rank works on its own structures and sends many small pieces of
+work to the GPU. Without NVIDIA's Multi-Process Service (MPS) the processes
+sharing a GPU take turns on it, and this contention can make a GPU build
+slower than a CPU build. Start the MPS daemon in the job script whenever
+several ranks share a GPU:
+
+```
+export CUDA_MPS_PIPE_DIRECTORY=/tmp/mps_pipe_$SLURM_JOB_ID
+export CUDA_MPS_LOG_DIRECTORY=/tmp/mps_log_$SLURM_JOB_ID
+mkdir -p $CUDA_MPS_PIPE_DIRECTORY $CUDA_MPS_LOG_DIRECTORY
+nvidia-cuda-mps-control -d
+mpirun -np 32 -x CUDA_MPS_PIPE_DIRECTORY -x CUDA_MPS_LOG_DIRECTORY nnp-train
+echo quit | nvidia-cuda-mps-control
+```
+
+Measured on one Leonardo Booster node (32 cores, A100), one training epoch
+with 32 ranks (water, 1254 structures for 2G, 250 for 4G stage 2):
+
+| Setup | 2G | 4G stage 2 |
+|---|---|---|
+| CPU build | 33.3 s | 48.9 s |
+| GPU build, 1 GPU, no MPS | 29.2 s | 49.4 s |
+| GPU build, 1 GPU, MPS | 16.9 s | 29.5 s |
+| GPU build, 4 GPUs, MPS | 15.6 s | 27.6 s |
+
+Ranks are spread over the GPUs of a node automatically (rule 3).
+
 ## Checklist for porting a feature to the GPU
 
 1. The CPU code path is unchanged; the GPU path is a dispatch around it, not
