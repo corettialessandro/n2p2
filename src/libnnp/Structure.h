@@ -36,6 +36,7 @@ namespace nnp
 {
 
 class GpuForceTopology;
+class GpuSymmetryFunctionData;
 
 /// Storage for one atomic configuration.
 struct Structure
@@ -93,6 +94,11 @@ struct Structure
         double            forceTopologyCutoff;
         /// Geometry stamp of the last force calculation.
         std::size_t       lastForceStamp;
+        /// Symmetry functions and derivatives calculated on the GPU, NULL if
+        /// none.
+        GpuSymmetryFunctionData* symmetryFunctions;
+        /// Geometry stamp of the symmetry function derivatives on the GPU.
+        std::size_t       symmetryFunctionStamp;
 
         GpuData();
         GpuData(GpuData const&);

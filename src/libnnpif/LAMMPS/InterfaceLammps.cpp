@@ -277,6 +277,7 @@ void InterfaceLammps::setLocalAtoms(int              numAtomsLocal,
     structure.hasNeighborList                = false;
     structure.hasSymmetryFunctions           = false;
     structure.hasSymmetryFunctionDerivatives = false;
+    structure.geometryStamp                  = 0;
     structure.energy                         = 0.0;
     structure.atoms.clear();
     indexMap.clear();
@@ -463,11 +464,23 @@ void InterfaceLammps::finalizeNeighborList()
 
 void InterfaceLammps::process() //TODO : add comments
 {
-#ifdef N2P2_NO_SF_GROUPS
-    calculateSymmetryFunctions(structure, true);
-#else
-    calculateSymmetryFunctionGroups(structure, true);
+    bool symmetryFunctionsGpu = false;
+#ifdef N2P2_GPU
+    // Derivatives stay on the GPU for getForces(); the 4G electrostatics
+    // need them on the host.
+    if (nnpType == NNPType::HDNNP_2G)
+    {
+        symmetryFunctionsGpu = calculateSymmetryFunctionsGpu(structure, true);
+    }
 #endif
+    if (!symmetryFunctionsGpu)
+    {
+#ifdef N2P2_NO_SF_GROUPS
+        calculateSymmetryFunctions(structure, true);
+#else
+        calculateSymmetryFunctionGroups(structure, true);
+#endif
+    }
     if (nnpType == NNPType::HDNNP_2G)
     {
         calculateAtomicNeuralNetworks(structure, true);
@@ -774,6 +787,35 @@ void InterfaceLammps::getForces(double* const* const& atomF) const {
     if (normalize) {
         convForce = convLength / convEnergy;
     }
+
+#ifdef N2P2_GPU
+    // Symmetry function derivatives on the GPU: contraction with dE/dG there,
+    // for all local and ghost atoms at once.
+    if (hasSymmetryFunctionDerivativesGpu(structure))
+    {
+        vector<double> weights;
+        for (auto const& a : structure.atoms)
+        {
+            weights.insert(weights.end(),
+                           a.dEdG.begin(),
+                           a.dEdG.begin() + a.numSymmetryFunctions);
+        }
+        vector<double> result;
+        size_t const numTargets = applySymmetryFunctionDerivativesGpu(
+                                      structure,
+                                      1,
+                                      weights.data(),
+                                      result);
+        double const conv = cfforce * convForce;
+        for (size_t i = 0; i < numTargets; ++i)
+        {
+            atomF[i][0] -= result.at(3 * i + 0) * conv;
+            atomF[i][1] -= result.at(3 * i + 1) * conv;
+            atomF[i][2] -= result.at(3 * i + 2) * conv;
+        }
+        return;
+    }
+#endif
 
     // Loop over all local atoms. Neural network and Symmetry function
     // derivatives are saved in the dEdG arrays of atoms and dGdr arrays of

@@ -18,6 +18,7 @@
 #include "Structure.h"
 #ifdef N2P2_GPU
 #include "GpuForceAssembly.h"
+#include "GpuSymmetryFunctions.h"
 #endif
 #include "Vec3D.h"
 #include "utility.h"
@@ -1297,7 +1298,9 @@ Structure::GpuData::GpuData() :
     forceTopology      (NULL),
     forceTopologyStamp (0   ),
     forceTopologyCutoff(0.0 ),
-    lastForceStamp     (0   )
+    lastForceStamp     (0   ),
+    symmetryFunctions  (NULL),
+    symmetryFunctionStamp(0 )
 {
 }
 
@@ -1320,11 +1323,14 @@ void Structure::GpuData::clear()
 {
 #ifdef N2P2_GPU
     delete forceTopology;
+    delete symmetryFunctions;
 #endif
     forceTopology = NULL;
     forceTopologyStamp = 0;
     forceTopologyCutoff = 0.0;
     lastForceStamp = 0;
+    symmetryFunctions = NULL;
+    symmetryFunctionStamp = 0;
 
     return;
 }

@@ -30,11 +30,14 @@
 #include "SymFnc.h"
 #include <cstddef> // std::size_t
 #include <map>     // std::map
+#include <memory>  // std::shared_ptr
 #include <string>  // std::string
 #include <vector>  // std::vector
 
 namespace nnp
 {
+
+class GpuSymmetryFunctionSet;
 
 /** Base class for all NNP applications.
  *
@@ -368,6 +371,32 @@ public:
      */
     void                     getForceAssemblyCounts(std::size_t& gpu,
                                                     std::size_t& cpu) const;
+    /** Switch the calculation of symmetry functions on the GPU on or off.
+     *
+     * @param[in] enabled Calculate symmetry functions on the GPU if true.
+     *
+     * Switched together with the GPU evaluation of the "short" neural
+     * networks (see setNeuralNetworkGpuEnabled()), i.e. on in GPU builds
+     * once their weights are set up. Switching it separately is internal,
+     * for tests. Throws std::runtime_error when enabling the GPU in a CPU
+     * build.
+     *
+     * The GPU calculates symmetry functions where their derivatives are
+     * used right away by forces assembled on the GPU: evaluateNNP() and the
+     * LAMMPS interface (see calculateSymmetryFunctionsGpu()). Other callers
+     * of calculateSymmetryFunctions() and calculateSymmetryFunctionGroups()
+     * (training, tools) get them from the CPU, with derivatives on the
+     * host. If a symmetry function type of the model has no GPU
+     * implementation, all symmetry functions are calculated on the CPU,
+     * with a warning in the log.
+     */
+    void                     setSymmetryFunctionGpuEnabled(bool enabled);
+    /** Check if symmetry functions are calculated on the GPU.
+     *
+     * @return False if switched off or if a symmetry function type of the
+     *         model has no GPU implementation.
+     */
+    bool                     isSymmetryFunctionGpuEnabled() const;
     /** Read in atomic hardness of all elements from files (4G-HDNNP).
      *
      * @param[in] fileNameFormat Name format of file containing atomic
@@ -788,6 +817,51 @@ protected:
                                    std::vector<Vec3D>&    shortForces,
                                    std::vector<Vec3D>&    sumTotal,
                                    std::vector<Vec3D>&    sumElec) const;
+    /** Calculate the symmetry functions of a structure on the GPU, if
+     * enabled.
+     *
+     * @param[in] structure Input structure (with neighbor list).
+     * @param[in] derivatives Also calculate the derivatives.
+     *
+     * @return False if the caller has to calculate them on the CPU.
+     *
+     * Same as calculateSymmetryFunctionGroups(), except that the
+     * derivatives stay on the GPU (Structure::gpuData, under a new
+     * Structure::geometryStamp): Atom::dGdr and Atom::Neighbor::dGdr are
+     * not filled and Atom::hasSymmetryFunctionDerivatives stays false.
+     * calculateForces() uses them, as does code calling
+     * applySymmetryFunctionDerivativesGpu().
+     */
+    bool                     calculateSymmetryFunctionsGpu(
+                                                   Structure& structure,
+                                                   bool       derivatives);
+    /** Check if a structure has symmetry function derivatives on the GPU.
+     *
+     * @param[in] structure Input structure.
+     *
+     * @return True if calculateSymmetryFunctionsGpu() calculated them for
+     *         the current geometry.
+     */
+    bool                     hasSymmetryFunctionDerivativesGpu(
+                                       Structure const& structure) const;
+    /** Contract the symmetry function derivatives on the GPU with weights.
+     *
+     * @param[in] structure Input structure (see
+     *                      hasSymmetryFunctionDerivativesGpu()).
+     * @param[in] numWeightVectors Number of weight vectors (at most 3).
+     * @param[in] weights Weight vectors, one entry per symmetry function
+     *                    value (atoms one after the other).
+     * @param[out] result For each weight vector and each target the sum of
+     *                    w * dG/dr (3 per target, see
+     *                    GpuSymmetryFunctionData::apply()).
+     *
+     * @return Number of targets (largest neighbor or atom index + 1).
+     */
+    std::size_t              applySymmetryFunctionDerivativesGpu(
+                                       Structure const&     structure,
+                                       std::size_t          numWeightVectors,
+                                       double const*        weights,
+                                       std::vector<double>& result) const;
     /** Propagate all atoms of a structure through their networks on the
      * GPU, one batch per element.
      *
@@ -878,6 +952,11 @@ protected:
     /// Force calculations assembled on the GPU and on the CPU.
     mutable std::size_t        gpuForceCountGpu;
     mutable std::size_t        gpuForceCountCpu;
+    /// If symmetry functions are calculated on the GPU (GPU builds).
+    bool                       gpuSymmetryFunctionsEnabled;
+    /// Symmetry functions on the GPU, set up at the first use.
+    std::shared_ptr<
+    GpuSymmetryFunctionSet>    gpuSymmetryFunctions;
 
 private:
     /** Short-range force contributions of the neighbors of each atom.
