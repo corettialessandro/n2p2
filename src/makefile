@@ -166,9 +166,9 @@ clean-libnnpif:
 ####################
 # nnp applications #
 ####################
-# GPU builds link libnnpgpu into every application.
+# GPU builds link libnnpgpu into every application (and LAMMPS, via libnnpif).
 ifeq ($(GPU), 1)
-all-app $(APP_LIBNNP) $(APP_LIBNNPTRAIN): libnnpgpu
+all-app $(APP_LIBNNP) $(APP_LIBNNPTRAIN) libnnpif: libnnpgpu
 endif
 
 # All at once (parallel).
