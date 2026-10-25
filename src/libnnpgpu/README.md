@@ -114,10 +114,16 @@ force assembly was ported.)
 
 Ranks are spread over the GPUs of a node automatically (rule 3).
 
-MD with LAMMPS (`pair_style hdnnp`, water, 8640 atoms, 300 steps, 32 ranks)
-takes 33 s with both builds: so far only the neural networks run on the GPU,
-and in MD about two thirds of the time go to the symmetry functions, which
-still run on the CPU.
+MD with LAMMPS (`pair_style hdnnp`, water, 8640 atoms, 300 steps, same
+node):
+
+| Setup | Time |
+|---|---|
+| CPU build, 32 ranks | 33.1 s |
+| GPU build, 32 ranks, 1 GPU, MPS | 11.0 s |
+| GPU build, 32 ranks, 4 GPUs, MPS | 3.8 s |
+| GPU build, 8 ranks, 4 GPUs, MPS | 5.7 s |
+| GPU build, 4 ranks, 4 GPUs | 8.8 s |
 
 ## Checklist for porting a feature to the GPU
 
@@ -142,7 +148,8 @@ still run on the CPU.
 | Kalman filter (`KalmanFilter`, both types) | P on the device; X = P . H and P = scale (P - K . X^T) + q I | `KalmanFilter` constructor (via `GpuKalmanFilter`) | none needed |
 | Atomic neural networks (`NeuralNetwork`, `Mode::calculateAtomicNeuralNetworks()`): 2G, 4G (elec, short), HDNNP_Q | forward pass and derivatives with respect to the inputs, all atoms of an element as one batch; neuron statistics | when the weights of a network type are set up: `Mode::readNeuralNetworkWeights()`, `Training::randomizeNeuralNetworkWeights()` (via `GpuNeuralNetwork`); not in `setupGeneric()`, which tools without network evaluation use too | none needed (any depth, all activation functions, normalized neurons) |
 | Training Jacobians (`Training::update()`): energy and force updates (2G, 4G stage 2), charge updates (4G stage 1) | derivatives with respect to all connections summed (charges: weighted by dError/dChi) over the atoms of an element (`NeuralNetwork::calculateDEdcBatchGpu()`, `calculateDFdcBatchGpu()`) | same as the atomic neural networks (they use the same GPU twins) | not ported yet, warning in the training log: force updates with `N2P2_FULL_SFD_MEMORY` |
-| Force assembly (`Mode::calculateForces()`): short-range forces and the 4G electrostatic dChi/dr sums | sums of weight * dG/dr over all terms of each atom (deterministic, one warp per atom); the topology (`GpuForceTopology`) is kept with its structure (`Structure::gpuData`) for the current geometry (`Structure::geometryStamp`) and freed with the symmetry function derivatives | together with the "short" networks (`Mode::setNeuralNetworkGpuEnabled()`) | performance choice (rule 8): first force calculation of a geometry, or topology beyond the memory budget (half the device memory, shared by the processes using it); the LAMMPS interface has its own force code (not ported yet) |
+| Force assembly (`Mode::calculateForces()`): short-range forces and the 4G electrostatic dChi/dr sums | sums of weight * dG/dr over all terms of each atom (deterministic, one warp per atom); the topology (`GpuForceTopology`) is kept with its structure (`Structure::gpuData`) for the current geometry (`Structure::geometryStamp`) and freed with the symmetry function derivatives | together with the "short" networks (`Mode::setNeuralNetworkGpuEnabled()`) | performance choice (rule 8): first force calculation of a geometry, or topology beyond the memory budget (half the device memory, shared by the processes using it); not needed for symmetry function derivatives calculated on the GPU (see below) |
+| Symmetry functions (`Mode::evaluateNNP()`, LAMMPS `pair_style hdnnp`): types 2, 3 and 9, all cutoff functions and scaling types | values and derivatives of all atoms in one kernel (one thread per neighbor, deterministic); the derivatives stay on the GPU (`GpuSymmetryFunctionData`, kept with its structure in `Structure::gpuData` under the geometry stamp) and are contracted there with dE/dG (and lambda * dChi/dG for 4G) for the forces (`Mode::calculateForces()`, `InterfaceLammps::getForces()`); only values, weights and forces cross to the host | together with the "short" networks (`Mode::setSymmetryFunctionGpuEnabled()`) | other symmetry function types: all symmetry functions of the model on the CPU, warning in the log; performance choice (rule 8): only where forces are assembled right away (`evaluateNNP()`, 2G LAMMPS interface), while training, the tools and the 4G LAMMPS interface use the derivatives on the host and get them from the CPU; structures with an atom with more than 2048 neighbors on the CPU |
 
 ## Programs that require a GPU in a GPU build
 

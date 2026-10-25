@@ -805,6 +805,8 @@ BOOST_DATA_TEST_CASE_F(FixtureRepairDir,
     p.log.writeToStdout = false;
     p.setup();
     BOOST_REQUIRE(p.isForceAssemblyGpuEnabled());
+    // Topologies are built from derivatives on the host.
+    p.setSymmetryFunctionGpuEnabled(false);
     p.readStructureFromFile();
     requireGpuForceAssemblyMatchesCpu(p, name);
     bfs::current_path("..");
@@ -844,6 +846,7 @@ BOOST_FIXTURE_TEST_CASE(ForceAssembly_SameIndexOtherGeometry_MatchesCpu,
     Prediction p;
     p.log.writeToStdout = false;
     p.setup();
+    p.setSymmetryFunctionGpuEnabled(false);
     for (string file : {"input.data", "displaced.data",
                         "input.data", "displaced.data"})
     {
@@ -865,6 +868,7 @@ BOOST_FIXTURE_TEST_CASE(ForceTopology_FreedWithDerivatives, FixtureRepairDir)
     Prediction p;
     p.log.writeToStdout = false;
     p.setup();
+    p.setSymmetryFunctionGpuEnabled(false);
     size_t const before = GpuForceTopology::getTotalMemoryUsage();
     p.readStructureFromFile();
     p.evaluateNNP(p.structure);
@@ -879,6 +883,219 @@ BOOST_FIXTURE_TEST_CASE(ForceTopology_FreedWithDerivatives, FixtureRepairDir)
     BOOST_REQUIRE_GT(GpuForceTopology::getTotalMemoryUsage(), before);
     p.structure.reset();
     BOOST_REQUIRE_EQUAL(GpuForceTopology::getTotalMemoryUsage(), before);
+    bfs::current_path("..");
+    bfs::remove_all("test");
+}
+
+// Symmetry function values, energy and forces of the structure in
+// input.data (current directory), from evaluateNNP().
+struct SymmetryFunctionResult
+{
+    vector<double> values;
+    double         energy;
+    vector<double> forces;
+};
+
+SymmetryFunctionResult evaluateOnce(Prediction& p)
+{
+    p.readStructureFromFile();
+    p.evaluateNNP(p.structure);
+    SymmetryFunctionResult r;
+    r.energy = p.structure.energy;
+    for (auto const& a : p.structure.atoms)
+    {
+        r.values.insert(r.values.end(), a.G.begin(), a.G.end());
+        for (size_t c = 0; c < 3; ++c) r.forces.push_back(a.f[c]);
+    }
+    return r;
+}
+
+// Symmetry functions on the GPU against the CPU (networks on the GPU in
+// both cases), with the settings in the current directory.
+void requireGpuSymmetryFunctionsMatchCpu(string const& what)
+{
+    Prediction p;
+    p.log.writeToStdout = false;
+    p.setup();
+    BOOST_REQUIRE(p.isSymmetryFunctionGpuEnabled());
+    SymmetryFunctionResult const gpu = evaluateOnce(p);
+    // Derivatives stayed on the GPU.
+    for (auto const& a : p.structure.atoms)
+    {
+        BOOST_REQUIRE(!a.hasSymmetryFunctionDerivatives);
+        BOOST_REQUIRE(a.dGdr.empty());
+    }
+    // Deterministic: same results again.
+    SymmetryFunctionResult const again = evaluateOnce(p);
+    BOOST_REQUIRE(gpu.values == again.values);
+    BOOST_REQUIRE(gpu.forces == again.forces);
+    p.setSymmetryFunctionGpuEnabled(false);
+    SymmetryFunctionResult const cpu = evaluateOnce(p);
+    BOOST_REQUIRE(p.structure.atoms.front().hasSymmetryFunctionDerivatives);
+
+    requireClose(cpu.values, gpu.values, what + " symmetry function");
+    requireClose({cpu.energy}, {gpu.energy}, what + " energy");
+    requireClose(cpu.forces, gpu.forces, what + " force component");
+}
+
+// Examples whose symmetry function types are all available on the GPU.
+vector<string> const gpuSymmetryFunctionExamples = {"AlAuMgO_4G",
+                                                    "Carbon_chain_4G",
+                                                    "Cu2S_PBE",
+                                                    "H2O_RPBE-D3",
+                                                    "H2O_RPBE-D3_4G"};
+
+BOOST_DATA_TEST_CASE_F(FixtureRepairDir,
+                       SymmetryFunctions_Gpu_MatchesCpu,
+                       bdata::make(gpuSymmetryFunctionExamples),
+                       name)
+{
+    BOOST_REQUIRE(copy_directory_recursively("../../examples/nnp-predict/"
+                                             + name, "test"));
+    bfs::current_path("test");
+    requireGpuSymmetryFunctionsMatchCpu(name);
+    bfs::current_path("..");
+    bfs::remove_all("test");
+}
+
+BOOST_DATA_TEST_CASE_F(FixtureRepairDir,
+                       SymmetryFunctions_UnavailableType_FallBackToCpu,
+                       bdata::make({"Anisole_SCAN",
+                                    "DMABN_SCAN",
+                                    "Ethylbenzene_SCAN"}),
+                       name)
+{
+    BOOST_REQUIRE(copy_directory_recursively("../../examples/nnp-predict/"
+                                             + string(name), "test"));
+    bfs::current_path("test");
+    Prediction p;
+    p.log.writeToStdout = false;
+    p.setup();
+    BOOST_REQUIRE(!p.isSymmetryFunctionGpuEnabled());
+    p.readStructureFromFile();
+    p.evaluateNNP(p.structure);
+    BOOST_REQUIRE(p.structure.atoms.front().hasSymmetryFunctionDerivatives);
+    bfs::current_path("..");
+    bfs::remove_all("test");
+}
+
+BOOST_DATA_TEST_CASE_F(FixtureRepairDir,
+                       SymmetryFunctions_SmallCell_Gpu_MatchesCpu,
+                       bdata::make({"H2O_RPBE-D3", "H2O_RPBE-D3_4G"}),
+                       name)
+{
+    // Periodic images of each atom among its own neighbors (cell vector
+    // shorter than the cutoff), see test_ForcesFiniteDifference.
+    BOOST_REQUIRE(copy_directory_recursively("../../examples/nnp-predict/"
+                                             + string(name), "test"));
+    bfs::current_path("test");
+    {
+        ofstream file("input.data");
+        file << "begin\n"
+             << "lattice 10.0 0.0 0.0\n"
+             << "lattice 0.0 10.0 0.0\n"
+             << "lattice 0.0 0.0 10.0\n"
+             << "atom 5.0000000 5.0000000 5.0000000 O 0.0 0.0 0.0 0.0 0.0\n"
+             << "atom 4.0625069 5.3600306 6.5729116 H 0.0 0.0 0.0 0.0 0.0\n"
+             << "atom 6.7495085 5.0876455 5.5389499 H 0.0 0.0 0.0 0.0 0.0\n"
+             << "energy 0.0\n"
+             << "charge 0.0\n"
+             << "end\n";
+    }
+    requireGpuSymmetryFunctionsMatchCpu(string(name) + " (small cell)");
+    bfs::current_path("..");
+    bfs::remove_all("test");
+}
+
+// Variants of the H2O_RPBE-D3 settings covering all cutoff function types,
+// all scaling types, wide angular symmetry functions, non-integer zeta and
+// shifted angular symmetry functions.
+vector<string> const symmetryFunctionVariants = {"cutoff 0",
+                                                 "cutoff 1 0.5",
+                                                 "cutoff 2",
+                                                 "cutoff 3",
+                                                 "cutoff 4 0.5",
+                                                 "cutoff 5 0.5",
+                                                 "cutoff 6 0.0",
+                                                 "cutoff 7 0.5",
+                                                 "cutoff 8 0.5",
+                                                 "scaling none",
+                                                 "scaling scale",
+                                                 "scaling center",
+                                                 "scaling sigma",
+                                                 "wide",
+                                                 "zeta rs"};
+
+void writeVariant(string const& variant)
+{
+    vector<string> const v = split(variant);
+    vector<string> lines;
+    {
+        ifstream in("input.nn");
+        string line;
+        while (getline(in, line)) lines.push_back(line);
+    }
+    ofstream out("input.nn");
+    if (v.at(0) == "cutoff")
+    {
+        out << "cutoff_type " << v.at(1)
+            << (v.size() > 2 ? " " + v.at(2) : "") << "\n";
+    }
+    else if (v.at(0) == "scaling" && v.at(1) == "scale")
+    {
+        out << "scale_symmetry_functions\n";
+    }
+    else if (v.at(0) == "scaling" && v.at(1) == "center")
+    {
+        out << "center_symmetry_functions\n";
+    }
+    else if (v.at(0) == "scaling" && v.at(1) == "sigma")
+    {
+        out << "scale_symmetry_functions_sigma\n";
+    }
+    for (auto const& line : lines)
+    {
+        vector<string> t = split(reduce(line));
+        if (!t.empty() && t.at(0) == "cutoff_type" && v.at(0) == "cutoff")
+        {
+            continue;
+        }
+        if (!t.empty() && v.at(0) == "scaling" &&
+            (t.at(0) == "scale_symmetry_functions" ||
+             t.at(0) == "center_symmetry_functions"))
+        {
+            continue;
+        }
+        if (t.size() > 2 && t.at(0) == "symfunction_short" &&
+            t.at(2) == "3")
+        {
+            if (v.at(0) == "wide") t.at(2) = "9";
+            if (v.at(0) == "zeta")
+            {
+                // zeta 1 -> 1.7, 4 -> 4.3 etc. and rs = 0.5.
+                t.at(7) = strpr("%.1f", stod(t.at(7)) + 0.7);
+                t.resize(9);
+                t.push_back("0.5");
+            }
+            out << "symfunction_short";
+            for (size_t i = 1; i < t.size(); ++i) out << " " << t.at(i);
+            out << "\n";
+            continue;
+        }
+        out << line << "\n";
+    }
+}
+
+BOOST_DATA_TEST_CASE_F(FixtureRepairDir,
+                       SymmetryFunctions_Variants_Gpu_MatchesCpu,
+                       bdata::make(symmetryFunctionVariants),
+                       variant)
+{
+    BOOST_REQUIRE(copy_directory_recursively(
+        "../../examples/nnp-predict/H2O_RPBE-D3", "test"));
+    bfs::current_path("test");
+    writeVariant(variant);
+    requireGpuSymmetryFunctionsMatchCpu(variant);
     bfs::current_path("..");
     bfs::remove_all("test");
 }

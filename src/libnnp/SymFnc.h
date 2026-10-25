@@ -175,9 +175,18 @@ public:
     /** Get private #Gmax member variable.
      */
     double              getGmax() const;
+    /** Get private #Gmean member variable.
+     */
+    double              getGmean() const;
+    /** Get private #Smin member variable.
+     */
+    double              getSmin() const;
     /** Get private #scalingFactor member variable.
      */
     double              getScalingFactor() const;
+    /** Get private #scalingType member variable.
+     */
+    ScalingType         getScalingType() const;
     /** Get private #convLength member variable.
      */
     double              getConvLength() const;
@@ -360,7 +369,13 @@ inline std::size_t SymFnc::getMinNeighbors() const { return minNeighbors; }
 inline double SymFnc::getRc() const { return rc; }
 inline double SymFnc::getGmin() const { return Gmin; }
 inline double SymFnc::getGmax() const { return Gmax; }
+inline double SymFnc::getGmean() const { return Gmean; }
+inline double SymFnc::getSmin() const { return Smin; }
 inline double SymFnc::getScalingFactor() const { return scalingFactor; }
+inline SymFnc::ScalingType SymFnc::getScalingType() const
+{
+    return scalingType;
+}
 inline double SymFnc::getConvLength() const { return convLength; }
 
 inline void SymFnc::setIndex(std::size_t index)

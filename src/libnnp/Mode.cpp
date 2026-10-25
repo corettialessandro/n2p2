@@ -21,6 +21,10 @@
 #ifdef N2P2_GPU
 #include "GpuDevice.h"
 #include "GpuForceAssembly.h"
+#include "GpuSymmetryFunctions.h"
+#include "SymFncBaseCutoff.h"
+#include "SymFncBaseExpAng.h"
+#include "SymFncExpRad.h"
 #endif
 #include <cmath>
 #ifdef _OPENMP
@@ -59,7 +63,8 @@ Mode::Mode() : nnpType                   (NNPType::HDNNP_2G      ),
                gpuForceAssembly          (false                  ),
                gpuForceBudget            (0                      ),
                gpuForceCountGpu          (0                      ),
-               gpuForceCountCpu          (0                      )
+               gpuForceCountCpu          (0                      ),
+               gpuSymmetryFunctionsEnabled(false                )
 {
 }
 
@@ -976,6 +981,9 @@ void Mode::setupSymmetryFunctions()
 
 void Mode::setupSymmetryFunctionScalingNone()
 {
+    // GPU symmetry functions are set up again with the new parameters.
+    gpuSymmetryFunctions.reset();
+
     log << "\n";
     log << "*** SETUP: SYMMETRY FUNCTION SCALING ****"
            "**************************************\n";
@@ -996,6 +1004,9 @@ void Mode::setupSymmetryFunctionScalingNone()
 
 void Mode::setupSymmetryFunctionScaling(string const& fileName)
 {
+    // GPU symmetry functions are set up again with the new parameters.
+    gpuSymmetryFunctions.reset();
+
     scalingFileName = fileName;
     log << "\n";
     log << "*** SETUP: SYMMETRY FUNCTION SCALING ****"
@@ -1179,6 +1190,9 @@ void Mode::setupSymmetryFunctionGroups()
 
 void Mode::setupSymmetryFunctionMemory(bool verbose)
 {
+    // GPU symmetry functions are set up again with the new parameters.
+    gpuSymmetryFunctions.reset();
+
     log << "\n";
     log << "*** SETUP: SYMMETRY FUNCTION MEMORY *****"
            "**************************************\n";
@@ -2223,16 +2237,20 @@ bool Mode::assembleForcesGpu(Structure&      structure,
     }
     size_t const numValues = valueOffset.back();
 
+    // Derivatives calculated on the GPU, or a topology built from the
+    // derivatives on the host.
+    bool const derivativesGpu = hasSymmetryFunctionDerivativesGpu(structure);
+    Structure::GpuData& gpu = structure.gpuData;
     // Derivatives without stamp (should not happen): new data.
     if (structure.geometryStamp == 0)
     {
         structure.geometryStamp = Structure::newGeometryStamp();
     }
     size_t const stamp = structure.geometryStamp;
-    Structure::GpuData& gpu = structure.gpuData;
-    if (gpu.forceTopology == NULL ||
-        gpu.forceTopologyStamp != stamp ||
-        gpu.forceTopologyCutoff != maxCutoffRadius)
+    if (!derivativesGpu &&
+        (gpu.forceTopology == NULL ||
+         gpu.forceTopologyStamp != stamp ||
+         gpu.forceTopologyCutoff != maxCutoffRadius))
     {
         // Free an outdated topology, but remember the last geometry.
         size_t const lastStamp = gpu.lastForceStamp;
@@ -2340,7 +2358,25 @@ bool Mode::assembleForcesGpu(Structure&      structure,
         }
     }
     vector<double> result(numWeightVectors * 3 * numAtoms);
-    gpu.forceTopology->apply(numWeightVectors, weights.data(), result.data());
+    if (derivativesGpu)
+    {
+        size_t const numTargets = applySymmetryFunctionDerivativesGpu(
+                                      structure,
+                                      numWeightVectors,
+                                      weights.data(),
+                                      result);
+        if (numTargets != numAtoms)
+        {
+            throw runtime_error("ERROR: Inconsistent atom indices for GPU "
+                                "symmetry function derivatives.\n");
+        }
+    }
+    else
+    {
+        gpu.forceTopology->apply(numWeightVectors,
+                                 weights.data(),
+                                 result.data());
+    }
 
     shortForces.resize(numAtoms);
     for (size_t i = 0; i < numAtoms; ++i)
@@ -2420,6 +2456,210 @@ void Mode::propagateAtomsGpu(Structure&            structure,
     }
 
     return;
+}
+
+bool Mode::calculateSymmetryFunctionsGpu(Structure& structure,
+                                         bool const derivatives)
+{
+    if (!gpuSymmetryFunctionsEnabled) return false;
+    // Derivatives already on the host (e.g. kept from an earlier
+    // calculation): nothing to do for calculateSymmetryFunctionGroups().
+    if (structure.hasSymmetryFunctionDerivatives) return false;
+
+    if (!gpuSymmetryFunctions)
+    {
+        vector<vector<GpuSymmetryFunction>> parameters(elements.size());
+        for (size_t ec = 0; ec < elements.size(); ++ec)
+        {
+            Element const& e = elements.at(ec);
+            for (size_t i = 0; i < e.numSymmetryFunctions(); ++i)
+            {
+                SymFnc const& sf = e.getSymmetryFunction(i);
+                GpuSymmetryFunction p = {};
+                p.type = sf.getType();
+                p.index = sf.getIndex();
+                p.rc = sf.getRc();
+                p.scalingType = sf.getScalingType();
+                p.Smin = sf.getSmin();
+                p.Gmin = sf.getGmin();
+                p.Gmean = sf.getGmean();
+                p.scalingFactor = sf.getScalingFactor();
+                for (size_t k : sf.getIndexPerElement())
+                {
+                    p.indexPerElement.push_back(
+                        k == numeric_limits<size_t>::max() ? -1 : (int)k);
+                }
+                SymFncBaseCutoff const& c =
+                    dynamic_cast<SymFncBaseCutoff const&>(sf);
+                p.cutoffType = c.getCutoffType();
+                p.cutoffAlpha = c.getCutoffAlpha();
+                if (p.type == 2)
+                {
+                    SymFncExpRad const& r =
+                        dynamic_cast<SymFncExpRad const&>(sf);
+                    p.e1 = r.getE1();
+                    p.e2 = r.getE1();
+                    p.eta = r.getEta();
+                    p.rs = r.getRs();
+                }
+                else
+                {
+                    SymFncBaseExpAng const& a =
+                        dynamic_cast<SymFncBaseExpAng const&>(sf);
+                    p.e1 = a.getE1();
+                    p.e2 = a.getE2();
+                    p.eta = a.getEta();
+                    p.rs = a.getRs();
+                    p.lambda = a.getLambda();
+                    p.zeta = a.getZeta();
+                    p.useIntegerPow = a.getUseIntegerPow();
+                    p.zetaInt = a.getZetaInt();
+                }
+                parameters.at(ec).push_back(p);
+            }
+        }
+        gpuSymmetryFunctions =
+            make_shared<GpuSymmetryFunctionSet>(parameters);
+    }
+
+    // Neighbors within the largest symmetry function cutoff, as in
+    // Atom::allocate().
+    size_t const numAtoms = structure.atoms.size();
+    vector<int> atomElement(numAtoms);
+    vector<int> atomTarget(numAtoms);
+    vector<int> neighborOffset(numAtoms + 1, 0);
+    for (size_t i = 0; i < numAtoms; ++i)
+    {
+        Atom const& a = structure.atoms.at(i);
+        size_t const n = a.getStoredMinNumNeighbors(maxCutoffRadius);
+        // Atoms with very many neighbors: the CPU calculates the whole
+        // structure.
+        if (n > GpuSymmetryFunctionData::maxNeighbors) return false;
+        atomElement.at(i) = a.element;
+        atomTarget.at(i) = a.index;
+        neighborOffset.at(i + 1) = neighborOffset.at(i) + n;
+    }
+    size_t const numSlots = neighborOffset.back();
+    vector<int> neighborElement(numSlots);
+    vector<int> neighborTarget(numSlots);
+    vector<double> neighborGeometry(4 * numSlots);
+    for (size_t i = 0; i < numAtoms; ++i)
+    {
+        Atom& a = structure.atoms.at(i);
+        Element const& e = elements.at(a.element);
+        if (nnpType == NNPType::HDNNP_4G ||
+            nnpType == NNPType::HDNNP_Q) a.useChargeNeuron = true;
+        a.numSymmetryFunctions = e.numSymmetryFunctions();
+#ifndef N2P2_NO_NEIGH_CHECK
+        size_t const numNeighbors = a.calculateNumNeighbors(
+                minCutoffRadius.at(e.getIndex()));
+        if (numNeighbors < minNeighbors.at(e.getIndex()))
+        {
+            log << strpr("WARNING: Structure %6zu Atom %6zu : %zu "
+                         "neighbors.\n",
+                         a.indexStructure,
+                         a.index,
+                         numNeighbors);
+        }
+#endif
+        for (int j = neighborOffset.at(i); j < neighborOffset.at(i + 1); ++j)
+        {
+            Atom::Neighbor& n = a.neighbors.at(j - neighborOffset.at(i));
+            neighborElement.at(j) = n.element;
+            neighborTarget.at(j) = n.index;
+            neighborGeometry.at(4 * j + 0) = n.d;
+            neighborGeometry.at(4 * j + 1) = n.dr[0];
+            neighborGeometry.at(4 * j + 2) = n.dr[1];
+            neighborGeometry.at(4 * j + 3) = n.dr[2];
+            if (!n.dGdr.empty()) n.dGdr.clear();
+        }
+    }
+
+    Structure::GpuData& gpu = structure.gpuData;
+    if (gpu.symmetryFunctions == NULL)
+    {
+        gpu.symmetryFunctions = new GpuSymmetryFunctionData();
+    }
+    gpu.symmetryFunctionStamp = 0;
+    vector<double> values;
+    for (auto const& a : structure.atoms)
+    {
+        values.resize(values.size() + a.numSymmetryFunctions);
+    }
+    gpu.symmetryFunctions->calculate(*gpuSymmetryFunctions,
+                                     atomElement,
+                                     atomTarget,
+                                     neighborOffset,
+                                     neighborElement,
+                                     neighborTarget,
+                                     neighborGeometry,
+                                     derivatives,
+                                     values.data());
+
+    // Values to the atoms, room for the network derivatives (as
+    // Atom::allocate()), no derivatives on the host.
+    size_t offset = 0;
+    for (auto& a : structure.atoms)
+    {
+        size_t const n = a.numSymmetryFunctions;
+        a.G.assign(values.begin() + offset, values.begin() + offset + n);
+        offset += n;
+        a.dGdr.clear();
+        if (derivatives)
+        {
+            a.dEdG.assign(a.useChargeNeuron ? n + 1 : n, 0.0);
+            a.dQdG.assign(n, 0.0);
+            a.dChidG.assign(n, 0.0);
+        }
+        a.hasSymmetryFunctions = true;
+        a.hasSymmetryFunctionDerivatives = false;
+    }
+    if (checkExtrapolationWarnings)
+    {
+        for (auto& a : structure.atoms)
+        {
+            elements.at(a.element).updateSymmetryFunctionStatistics(a);
+        }
+    }
+    structure.hasSymmetryFunctions = true;
+    if (derivatives)
+    {
+        structure.geometryStamp = Structure::newGeometryStamp();
+        gpu.symmetryFunctionStamp = structure.geometryStamp;
+    }
+
+    return true;
+}
+
+bool Mode::hasSymmetryFunctionDerivativesGpu(Structure const& structure) const
+{
+    Structure::GpuData const& gpu = structure.gpuData;
+    return gpuSymmetryFunctions &&
+           gpu.symmetryFunctions != NULL &&
+           gpu.symmetryFunctionStamp != 0 &&
+           gpu.symmetryFunctionStamp == structure.geometryStamp;
+}
+
+size_t Mode::applySymmetryFunctionDerivativesGpu(
+                                       Structure const& structure,
+                                       size_t           numWeightVectors,
+                                       double const*    weights,
+                                       vector<double>&  result) const
+{
+    if (!hasSymmetryFunctionDerivativesGpu(structure))
+    {
+        throw runtime_error("ERROR: No symmetry function derivatives on the "
+                            "GPU for this structure.\n");
+    }
+    GpuSymmetryFunctionData& data = *structure.gpuData.symmetryFunctions;
+    size_t const numTargets = data.getNumTargets();
+    result.resize(3 * numWeightVectors * numTargets);
+    data.apply(*gpuSymmetryFunctions,
+               numWeightVectors,
+               weights,
+               result.data());
+
+    return numTargets;
 }
 #endif
 
@@ -2582,8 +2822,10 @@ void Mode::calculateForces(Structure& structure) const
     vector<Vec3D> shortForcesGpu;
     bool forcesGpu = false;
 #ifdef N2P2_GPU
+    // Symmetry function derivatives on the GPU are only usable there.
     // Committees: per-member forces on the CPU.
-    if (gpuForceAssembly && !committee)
+    if ((gpuForceAssembly || hasSymmetryFunctionDerivativesGpu(structure)) &&
+        !committee)
     {
         forcesGpu = assembleForcesGpu(structure,
                                       lambdaTotal,
@@ -2808,11 +3050,19 @@ void Mode::evaluateNNP(Structure& structure, bool useForces, bool useDEdG,
     //       CI tests because of small numeric changes).
     else structure.calculateNeighborList(maxCutoffRadius, false);
 
-#ifdef N2P2_NO_SF_GROUPS
-    calculateSymmetryFunctions(structure, true);
-#else
-    calculateSymmetryFunctionGroups(structure, useForces);
+    bool symmetryFunctionsGpu = false;
+#ifdef N2P2_GPU
+    symmetryFunctionsGpu = calculateSymmetryFunctionsGpu(structure,
+                                                         useForces);
 #endif
+    if (!symmetryFunctionsGpu)
+    {
+#ifdef N2P2_NO_SF_GROUPS
+        calculateSymmetryFunctions(structure, true);
+#else
+        calculateSymmetryFunctionGroups(structure, useForces);
+#endif
+    }
 
     // Needed if useForces == false but sensitivity data is requested.
     if (useDEdG && !useForces)
@@ -3171,7 +3421,11 @@ void Mode::setNeuralNetworkGpuEnabled(string const& id, bool enabled)
                             .isGpuEnabled();
     for (auto& e : elements) e.neuralNetworks.at(id).setGpuEnabled(enabled);
     // Forces need the derivatives of the short-range networks.
-    if (id == "short") setForceAssemblyGpuEnabled(enabled);
+    if (id == "short")
+    {
+        setForceAssemblyGpuEnabled(enabled);
+        setSymmetryFunctionGpuEnabled(enabled);
+    }
 #ifdef N2P2_GPU
     if (enabled && !wasEnabled)
     {
@@ -3235,6 +3489,56 @@ void Mode::getForceAssemblyCounts(size_t& gpu, size_t& cpu) const
     cpu = gpuForceCountCpu;
 
     return;
+}
+
+void Mode::setSymmetryFunctionGpuEnabled(bool enabled)
+{
+#ifdef N2P2_GPU
+    if (enabled && !gpuSymmetryFunctionsEnabled)
+    {
+        int const device = gpuRequireDevice();
+        // All symmetry functions of the model must be available on the GPU.
+        for (auto const& e : elements)
+        {
+            for (size_t i = 0; i < e.numSymmetryFunctions(); ++i)
+            {
+                size_t const type = e.getSymmetryFunction(i).getType();
+                if (!GpuSymmetryFunctionSet::isSupported(type))
+                {
+                    log << strpr("WARNING: Symmetry function type %zu is not "
+                                 "available on the GPU, all symmetry "
+                                 "functions are calculated on the CPU.\n",
+                                 type);
+                    return;
+                }
+            }
+        }
+        gpuSymmetryFunctionsEnabled = true;
+        gpuSymmetryFunctions.reset();
+        log << strpr("Symmetry functions for energy and force predictions "
+                     "calculated on GPU %d (%s).\n",
+                     device,
+                     gpuDeviceName(device).c_str());
+    }
+    else if (!enabled && gpuSymmetryFunctionsEnabled)
+    {
+        gpuSymmetryFunctionsEnabled = false;
+        gpuSymmetryFunctions.reset();
+        log << "Symmetry functions calculated on the CPU.\n";
+    }
+#else
+    if (enabled)
+    {
+        throw runtime_error("ERROR: n2p2 was built without GPU support.\n");
+    }
+#endif
+
+    return;
+}
+
+bool Mode::isSymmetryFunctionGpuEnabled() const
+{
+    return gpuSymmetryFunctionsEnabled;
 }
 
 void Mode::readHardness(string const& fileNameFormat)
