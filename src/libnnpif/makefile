@@ -123,6 +123,9 @@ lammps-cmake:
 	for flag in $(LAMMPS_OPTIONS); do \
 		echo "target_compile_definitions(lammps PRIVATE $${flag})" >> $(PROJECT_LIB)/lammps-extra.cmake; \
 	done
+ifeq ($(GPU), 1)
+	echo 'target_link_libraries(lammps PRIVATE $${CMAKE_CURRENT_LIST_DIR}/libnnpgpu.a $(PROJECT_LDFLAGS_GPU))' >> $(PROJECT_LIB)/lammps-extra.cmake
+endif
 
 $(LIB).so: CFLAGS+= -fPIC
 $(LIB).so: $(OBJ)
