@@ -106,8 +106,18 @@ with 32 ranks (water, 1254 structures for 2G, 250 for 4G stage 2):
 | GPU build, 1 GPU, no MPS | 29.2 s | 49.4 s |
 | GPU build, 1 GPU, MPS | 16.9 s | 29.5 s |
 | GPU build, 4 GPUs, MPS | 15.6 s | 27.6 s |
+| GPU build with GPU force assembly, 1 GPU, MPS | 15.9 s | 16.1 s |
+| GPU build with GPU force assembly, 4 GPUs, MPS | 8.9 s | 13.9 s |
+
+(The rows without MPS and the first two MPS rows were measured before the
+force assembly was ported.)
 
 Ranks are spread over the GPUs of a node automatically (rule 3).
+
+MD with LAMMPS (`pair_style hdnnp`, water, 8640 atoms, 300 steps, 32 ranks)
+takes 33 s with both builds: so far only the neural networks run on the GPU,
+and in MD about two thirds of the time go to the symmetry functions, which
+still run on the CPU.
 
 ## Checklist for porting a feature to the GPU
 
