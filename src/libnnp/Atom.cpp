@@ -44,6 +44,52 @@ Atom::Atom() : hasNeighborList               (false),
 {
 }
 
+void Atom::reset()
+{
+    hasNeighborList                = false;
+    NeighborListIsSorted           = false;
+    hasSymmetryFunctions           = false;
+    hasSymmetryFunctionDerivatives = false;
+    useChargeNeuron                = false;
+    index                          = 0;
+    indexStructure                 = 0;
+    tag                            = 0;
+    element                        = 0;
+    numNeighbors                   = 0;
+    numNeighborsUnique             = 0;
+    numSymmetryFunctions           = 0;
+    energy                         = 0.0;
+    dEelecdQ                       = 0.0;
+    chi                            = 0.0;
+    charge                         = 0.0;
+    chargeRef                      = 0.0;
+    r                              = Vec3D();
+    f                              = Vec3D();
+    fElec                          = Vec3D();
+    fRef                           = Vec3D();
+    pEelecpr                       = Vec3D();
+    neighborsUnique.clear();
+    numNeighborsPerElement.clear();
+    numSymmetryFunctionDerivatives.clear();
+#ifndef N2P2_NO_SF_CACHE
+    cacheSizePerElement.clear();
+#endif
+    G.clear();
+    dEdG.clear();
+    dQdG.clear();
+    dChidG.clear();
+#ifdef N2P2_FULL_SFD_MEMORY
+    dGdxia.clear();
+#endif
+    dGdr.clear();
+    dQdr.clear();
+    dAdrQ.clear();
+    neighbors.clear();
+    neighborCutoffs.clear();
+
+    return;
+}
+
 #ifdef N2P2_FULL_SFD_MEMORY
 void Atom::collectDGdxia(size_t indexAtom,
                          size_t indexComponent,

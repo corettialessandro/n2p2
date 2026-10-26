@@ -42,6 +42,104 @@ BOOST_AUTO_TEST_CASE(Constructor_Defaults)
     BOOST_REQUIRE_SMALL(a.chargeRef, accuracy);
 }
 
+// reset() restores the state of a new atom (all members), but keeps the
+// memory of the vectors (InterfaceLammps reuses its atoms every MD step).
+BOOST_AUTO_TEST_CASE(Reset_EqualsNewAtomAndKeepsCapacity)
+{
+    Atom a;
+    a.hasNeighborList = true;
+    a.NeighborListIsSorted = true;
+    a.hasSymmetryFunctions = true;
+    a.hasSymmetryFunctionDerivatives = true;
+    a.useChargeNeuron = true;
+    a.index = 3;
+    a.indexStructure = 4;
+    a.tag = 5;
+    a.element = 1;
+    a.numNeighbors = 7;
+    a.numNeighborsUnique = 6;
+    a.numSymmetryFunctions = 2;
+    a.energy = 1.5;
+    a.dEelecdQ = 2.5;
+    a.chi = 3.5;
+    a.charge = 4.5;
+    a.chargeRef = 5.5;
+    a.r = Vec3D(1.0, 2.0, 3.0);
+    a.f = Vec3D(1.0, 2.0, 3.0);
+    a.fElec = Vec3D(1.0, 2.0, 3.0);
+    a.fRef = Vec3D(1.0, 2.0, 3.0);
+    a.pEelecpr = Vec3D(1.0, 2.0, 3.0);
+    a.neighborsUnique.assign(3, 1);
+    a.numNeighborsPerElement.assign(2, 3);
+    a.numSymmetryFunctionDerivatives.assign(2, 4);
+#ifndef N2P2_NO_SF_CACHE
+    a.cacheSizePerElement.assign(2, 5);
+#endif
+    a.G.assign(2, 1.0);
+    a.dEdG.assign(2, 1.0);
+    a.dQdG.assign(2, 1.0);
+    a.dChidG.assign(2, 1.0);
+#ifdef N2P2_FULL_SFD_MEMORY
+    a.dGdxia.assign(2, 1.0);
+#endif
+    a.dGdr.assign(2, Vec3D(1.0, 1.0, 1.0));
+    a.dQdr.assign(2, Vec3D(1.0, 1.0, 1.0));
+    a.dAdrQ.assign(2, Vec3D(1.0, 1.0, 1.0));
+    a.neighbors.resize(7);
+    a.neighborCutoffs[6.0] = 7;
+    size_t const capacity = a.neighbors.capacity();
+
+    a.reset();
+
+    Atom const b;
+    BOOST_REQUIRE(a.info() == b.info());
+    BOOST_REQUIRE_EQUAL(a.hasNeighborList, b.hasNeighborList);
+    BOOST_REQUIRE_EQUAL(a.NeighborListIsSorted, b.NeighborListIsSorted);
+    BOOST_REQUIRE_EQUAL(a.hasSymmetryFunctions, b.hasSymmetryFunctions);
+    BOOST_REQUIRE_EQUAL(a.hasSymmetryFunctionDerivatives,
+                        b.hasSymmetryFunctionDerivatives);
+    BOOST_REQUIRE_EQUAL(a.useChargeNeuron, b.useChargeNeuron);
+    BOOST_REQUIRE_EQUAL(a.index, b.index);
+    BOOST_REQUIRE_EQUAL(a.indexStructure, b.indexStructure);
+    BOOST_REQUIRE_EQUAL(a.tag, b.tag);
+    BOOST_REQUIRE_EQUAL(a.element, b.element);
+    BOOST_REQUIRE_EQUAL(a.numNeighbors, b.numNeighbors);
+    BOOST_REQUIRE_EQUAL(a.numNeighborsUnique, b.numNeighborsUnique);
+    BOOST_REQUIRE_EQUAL(a.numSymmetryFunctions, b.numSymmetryFunctions);
+    BOOST_REQUIRE_EQUAL(a.energy, b.energy);
+    BOOST_REQUIRE_EQUAL(a.dEelecdQ, b.dEelecdQ);
+    BOOST_REQUIRE_EQUAL(a.chi, b.chi);
+    BOOST_REQUIRE_EQUAL(a.charge, b.charge);
+    BOOST_REQUIRE_EQUAL(a.chargeRef, b.chargeRef);
+    for (size_t i = 0; i < 3; ++i)
+    {
+        BOOST_REQUIRE_EQUAL(a.r[i], b.r[i]);
+        BOOST_REQUIRE_EQUAL(a.f[i], b.f[i]);
+        BOOST_REQUIRE_EQUAL(a.fElec[i], b.fElec[i]);
+        BOOST_REQUIRE_EQUAL(a.fRef[i], b.fRef[i]);
+        BOOST_REQUIRE_EQUAL(a.pEelecpr[i], b.pEelecpr[i]);
+    }
+    BOOST_REQUIRE(a.neighborsUnique.empty());
+    BOOST_REQUIRE(a.numNeighborsPerElement.empty());
+    BOOST_REQUIRE(a.numSymmetryFunctionDerivatives.empty());
+#ifndef N2P2_NO_SF_CACHE
+    BOOST_REQUIRE(a.cacheSizePerElement.empty());
+#endif
+    BOOST_REQUIRE(a.G.empty());
+    BOOST_REQUIRE(a.dEdG.empty());
+    BOOST_REQUIRE(a.dQdG.empty());
+    BOOST_REQUIRE(a.dChidG.empty());
+#ifdef N2P2_FULL_SFD_MEMORY
+    BOOST_REQUIRE(a.dGdxia.empty());
+#endif
+    BOOST_REQUIRE(a.dGdr.empty());
+    BOOST_REQUIRE(a.dQdr.empty());
+    BOOST_REQUIRE(a.dAdrQ.empty());
+    BOOST_REQUIRE(a.neighbors.empty());
+    BOOST_REQUIRE(a.neighborCutoffs.empty());
+    BOOST_REQUIRE_EQUAL(a.neighbors.capacity(), capacity);
+}
+
 BOOST_AUTO_TEST_CASE(NeighborConstructor_Defaults)
 {
     Atom::Neighbor n;

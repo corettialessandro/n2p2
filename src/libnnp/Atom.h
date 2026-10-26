@@ -183,6 +183,13 @@ struct Atom
     /** Atom constructor, initialize to zero.
      */
     Atom();
+    /** Reset to the state of a newly constructed atom.
+     *
+     * Unlike assigning Atom(), keeps the allocated memory of all vectors
+     * (e.g. the neighbor list), so an atom can be reused for a new
+     * configuration without reallocating.
+     */
+    void                     reset();
 #ifdef N2P2_FULL_SFD_MEMORY
     /** Collect derivative of symmetry functions with repect to one atom's
      * coordinate.
