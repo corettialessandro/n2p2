@@ -45,6 +45,9 @@ namespace nnp
  * where gamma_ij = sqrt(2 (sigma_i^2 + sigma_j^2)). The charges follow with
  * b = -chi and c = total charge, the Lagrange multipliers of the 4G forces
  * with b = -dE/dQ and c = 0, both from the same factorization.
+ *
+ * Alternatively, factorizes a complete matrix of the linear system built
+ * elsewhere (Structure::calculateElectrostaticEnergy()).
  */
 class GpuChargeEquilibration
 {
@@ -81,6 +84,16 @@ public:
                           double                     realCutoff,
                           std::vector<double> const& kvector,
                           std::vector<double> const& kcoeff);
+    /** Factorize a complete matrix of the linear system.
+     *
+     * @param[in] numAtoms Number of atoms N.
+     * @param[in] matrix Matrix including the constraint row and column
+     *                   ((N + 1) x (N + 1), column-major).
+     *
+     * Throws std::runtime_error if the memory cannot be allocated or if the
+     * matrix is singular.
+     */
+    void        factorize(std::size_t numAtoms, double const* matrix);
     /** Solve with the last factorization.
      *
      * @param[in] b Right-hand side (one value per atom).
@@ -90,21 +103,40 @@ public:
     void        solve(std::vector<double> const& b,
                       double                     c,
                       std::vector<double>&       x);
+    /** Solve for several right-hand sides with the last factorization.
+     *
+     * @param[in] numRhs Number of right-hand sides.
+     * @param[in,out] rhs Right-hand sides (b, c) as columns of length N + 1
+     *                    (column-major), overwritten with the solutions
+     *                    (x, mu).
+     */
+    void        solve(std::size_t numRhs, double* rhs);
     /** Number of atoms of the last factorization (0 if none).
      */
     std::size_t getNumAtoms() const;
+    /** Identifies the last factorization, unique among all objects (0 if
+     *  none).
+     */
+    std::size_t getFactorizationId() const;
     /** Device memory needed for a structure.
      *
      * @param[in] numAtoms Number of atoms.
      * @param[in] numK Number of reciprocal vectors.
+     * @param[in] numRhs Number of right-hand sides solved at once.
      *
      * @return Bytes.
      */
-    static std::size_t memoryUsage(std::size_t numAtoms, std::size_t numK);
+    static std::size_t memoryUsage(std::size_t numAtoms,
+                                   std::size_t numK,
+                                   std::size_t numRhs = 1);
 
 private:
     struct Data;
     Data* data;
+
+    /** LU factorization of the matrix on the device.
+     */
+    void        factorizeDeviceMatrix(std::size_t numAtoms);
 };
 
 }

@@ -682,7 +682,8 @@ vector<string> const predictionExamples = {"AlAuMgO_4G",
                                            "DMABN_SCAN",
                                            "Ethylbenzene_SCAN",
                                            "H2O_RPBE-D3",
-                                           "H2O_RPBE-D3_4G"};
+                                           "H2O_RPBE-D3_4G",
+                                           "H2O_SPCFw_4G"};
 
 // Results of one prediction.
 struct GpuPredictionResult
@@ -740,10 +741,15 @@ BOOST_DATA_TEST_CASE_F(FixtureRepairDir,
     p.log.writeToStdout = false;
     p.setup();
     GpuPredictionResult const gpu = predictOnce(p);
+    bool const is4G = p.getNnpType() == Mode::NNPType::HDNNP_4G;
+    // The charge equilibration is solved on the GPU.
+    BOOST_REQUIRE_EQUAL(static_cast<bool>(p.structure.AGpu), is4G);
     vector<string> ids = {"short"};
     if (p.getNnpType() != Mode::NNPType::HDNNP_2G) ids.push_back("elec");
     for (auto const& id : ids) p.setNeuralNetworkGpuEnabled(id, false);
+    BOOST_REQUIRE_EQUAL(p.getChargeEquilibrationGpuMaxAtoms(), 0);
     GpuPredictionResult const cpu = predictOnce(p);
+    BOOST_REQUIRE(!p.structure.AGpu);
 
     BOOST_TEST_INFO(name);
     requireClose({cpu.energy}, {gpu.energy}, name + " energy");

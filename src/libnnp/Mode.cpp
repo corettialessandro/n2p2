@@ -19,6 +19,7 @@
 #include "utility.h"
 #include "version.h"
 #ifdef N2P2_GPU
+#include "GpuChargeEquilibration.h"
 #include "GpuDevice.h"
 #include "GpuForceAssembly.h"
 #include "GpuSymmetryFunctions.h"
@@ -64,7 +65,8 @@ Mode::Mode() : nnpType                   (NNPType::HDNNP_2G      ),
                gpuForceBudget            (0                      ),
                gpuForceCountGpu          (0                      ),
                gpuForceCountCpu          (0                      ),
-               gpuSymmetryFunctionsEnabled(false                )
+               gpuSymmetryFunctionsEnabled(false                 ),
+               gpuChargeEquilibrationMaxAtoms(0                  )
 {
 }
 
@@ -2686,13 +2688,26 @@ void Mode::chargeEquilibration( Structure& structure,
         }
     }
 
+    shared_ptr<GpuChargeEquilibration> gpuSolver;
+#ifdef N2P2_GPU
+    if (s.numAtoms <= gpuChargeEquilibrationMaxAtoms)
+    {
+        if (!gpuChargeEquilibration)
+        {
+            gpuChargeEquilibration = make_shared<GpuChargeEquilibration>();
+        }
+        gpuSolver = gpuChargeEquilibration;
+    }
+#endif
+
     s.calculateElectrostaticEnergy(ewaldSetup,
                                    hardness,
                                    gammaSqrt2,
                                    sigmaSqrtPi,
                                    screeningFunction,
                                    fourPiEps,
-                                   erfcBuf);
+                                   erfcBuf,
+                                   gpuSolver);
 
     // TODO: leave these 2 functions here or move it to e.g. forces? Needs to be
     // executed after calculateElectrostaticEnergy.
@@ -3426,6 +3441,7 @@ void Mode::setNeuralNetworkGpuEnabled(string const& id, bool enabled)
         setForceAssemblyGpuEnabled(enabled);
         setSymmetryFunctionGpuEnabled(enabled);
     }
+    if (id == "elec") setChargeEquilibrationGpuEnabled(enabled);
 #ifdef N2P2_GPU
     if (enabled && !wasEnabled)
     {
@@ -3539,6 +3555,46 @@ void Mode::setSymmetryFunctionGpuEnabled(bool enabled)
 bool Mode::isSymmetryFunctionGpuEnabled() const
 {
     return gpuSymmetryFunctionsEnabled;
+}
+
+void Mode::setChargeEquilibrationGpuEnabled(bool enabled)
+{
+#ifdef N2P2_GPU
+    if (enabled && gpuChargeEquilibrationMaxAtoms == 0)
+    {
+        int const device = gpuRequireDevice();
+        size_t const budget = gpuDefaultCacheBudget() / 2;
+        size_t n = static_cast<size_t>(sqrt(budget / (2.0 * sizeof(double))));
+        while (n > 0 && GpuChargeEquilibration::memoryUsage(n, 0, n) > budget)
+        {
+            --n;
+        }
+        gpuChargeEquilibrationMaxAtoms = n;
+        log << strpr("Charge equilibration solved on GPU %d (%s) for "
+                     "structures up to %zu atoms.\n",
+                     device,
+                     gpuDeviceName(device).c_str(),
+                     gpuChargeEquilibrationMaxAtoms);
+    }
+    else if (!enabled && gpuChargeEquilibrationMaxAtoms > 0)
+    {
+        gpuChargeEquilibrationMaxAtoms = 0;
+        gpuChargeEquilibration.reset();
+        log << "Charge equilibration solved on the CPU.\n";
+    }
+#else
+    if (enabled)
+    {
+        throw runtime_error("ERROR: n2p2 was built without GPU support.\n");
+    }
+#endif
+
+    return;
+}
+
+size_t Mode::getChargeEquilibrationGpuMaxAtoms() const
+{
+    return gpuChargeEquilibrationMaxAtoms;
 }
 
 void Mode::readHardness(string const& fileNameFormat)

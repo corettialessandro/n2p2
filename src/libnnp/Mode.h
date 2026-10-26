@@ -37,6 +37,7 @@
 namespace nnp
 {
 
+class GpuChargeEquilibration;
 class GpuSymmetryFunctionSet;
 
 /** Base class for all NNP applications.
@@ -397,6 +398,33 @@ public:
      *         model has no GPU implementation.
      */
     bool                     isSymmetryFunctionGpuEnabled() const;
+    /** Switch the solution of the charge equilibration on the GPU on or off
+     *  (4G-HDNNP).
+     *
+     * @param[in] enabled Solve on the GPU if true.
+     *
+     * Switched together with the GPU evaluation of the "elec" neural
+     * networks (see setNeuralNetworkGpuEnabled()), i.e. on in GPU builds
+     * once their weights are set up. Switching it separately is internal,
+     * for tests. Throws std::runtime_error when enabling the GPU in a CPU
+     * build.
+     *
+     * chargeEquilibration() builds the A matrix on the CPU; the GPU
+     * factorizes it (LU instead of QR) and solves all linear systems with it
+     * (Structure::solveA()), for structures up to a size given by the memory
+     * budget (see getChargeEquilibrationGpuMaxAtoms()). Larger structures
+     * are solved on the CPU.
+     */
+    void                     setChargeEquilibrationGpuEnabled(bool enabled);
+    /** Largest structure whose charge equilibration is solved on the GPU.
+     *
+     * @return Number of atoms, 0 if switched off.
+     *
+     * The device memory of a structure with N atoms (matrix and N right-hand
+     * sides, see GpuChargeEquilibration::memoryUsage()) must fit into a
+     * quarter of the device memory per process (gpuDefaultCacheBudget() / 2).
+     */
+    std::size_t              getChargeEquilibrationGpuMaxAtoms() const;
     /** Read in atomic hardness of all elements from files (4G-HDNNP).
      *
      * @param[in] fileNameFormat Name format of file containing atomic
@@ -957,6 +985,12 @@ protected:
     /// Symmetry functions on the GPU, set up at the first use.
     std::shared_ptr<
     GpuSymmetryFunctionSet>    gpuSymmetryFunctions;
+    /// Largest structure whose charge equilibration is solved on the GPU, 0
+    /// if none (GPU builds).
+    std::size_t                gpuChargeEquilibrationMaxAtoms;
+    /// Charge equilibration solver on the GPU, set up at the first use.
+    std::shared_ptr<
+    GpuChargeEquilibration>    gpuChargeEquilibration;
 
 private:
     /** Short-range force contributions of the neighbors of each atom.
