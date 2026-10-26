@@ -519,6 +519,50 @@ __global__ void contractKernel(int           numWeightVectors,
     }
 }
 
+/* One thread per atom: derivatives of its values with respect to one
+ * coordinate of one target, from its neighbor entries pointing to the target
+ * and, if the atom itself is the target, minus all of its entries (entries of
+ * periodic images of the target itself cancel). Each atom's values are only
+ * written by its own thread, in neighbor order.
+ */
+__global__ void targetDerivativeKernel(int           numAtoms,
+                                       int           numElements,
+                                       int           target,
+                                       int           component,
+                                       int const*    atomElement,
+                                       int const*    atomTarget,
+                                       int const*    valueOffset,
+                                       int const*    neighborOffset,
+                                       int const*    neighborElement,
+                                       int const*    neighborTarget,
+                                       int const*    derivOffset,
+                                       int const*    tableOffset,
+                                       int const*    tableCount,
+                                       int const*    table,
+                                       double const* deriv,
+                                       double*       result)
+{
+    int const atom = blockIdx.x * blockDim.x + threadIdx.x;
+    if (atom >= numAtoms) return;
+    int const element = atomElement[atom];
+    int const self = atomTarget[atom] == target ? 1 : 0;
+    double* r = result + valueOffset[atom];
+    for (int slot = neighborOffset[atom]; slot < neighborOffset[atom + 1];
+         ++slot)
+    {
+        int const factor = (neighborTarget[slot] == target ? 1 : 0) - self;
+        if (factor == 0) continue;
+        int const t = element * numElements + neighborElement[slot];
+        int const count = tableCount[t];
+        int const* tbl = table + tableOffset[t];
+        double const* d = deriv + 3 * static_cast<size_t>(derivOffset[slot]);
+        for (int k = 0; k < count; ++k)
+        {
+            r[tbl[k]] += factor * d[3 * k + component];
+        }
+    }
+}
+
 // One warp per target: sum of its contributions in a fixed order.
 __global__ void gatherKernel(int           numTargets,
                              int           numWeightVectors,
@@ -832,6 +876,8 @@ struct GpuSymmetryFunctionData::Data
     Buffer                                valueOffset;
     Buffer                                neighborOffset;
     Buffer                                neighborElement;
+    Buffer                                atomTarget;
+    Buffer                                neighborTarget;
     Buffer                                neighborGeometry;
     Buffer                                derivOffset;
     Buffer                                deriv;
@@ -862,7 +908,8 @@ GpuSymmetryFunctionData::~GpuSymmetryFunctionData()
     Data& d = *data;
     cudaSetDevice(d.device);
     for (Buffer* b : {&d.atomElement, &d.valueOffset, &d.neighborOffset,
-                      &d.neighborElement, &d.neighborGeometry, &d.derivOffset,
+                      &d.neighborElement, &d.atomTarget, &d.neighborTarget,
+                      &d.neighborGeometry, &d.derivOffset,
                       &d.deriv, &d.values, &d.targetOffset, &d.targetContrib,
                       &d.weights, &d.contrib, &d.result})
     {
@@ -957,6 +1004,10 @@ void GpuSymmetryFunctionData::calculate(GpuSymmetryFunctionSet const& set,
     {
         upload(d.derivOffset, derivOffset.data(), numSlots * sizeof(int),
                d.total);
+        upload(d.atomTarget, atomTarget.data(), numAtoms * sizeof(int),
+               d.total);
+        upload(d.neighborTarget, neighborTarget.data(),
+               numSlots * sizeof(int), d.total);
         d.deriv.ensure(3 * numDerivs * sizeof(double) + 1, d.total);
         NNP_CUDA_CHECK(cudaMemset(d.deriv.p, 0,
                                   3 * numDerivs * sizeof(double)));
@@ -1098,6 +1149,51 @@ void GpuSymmetryFunctionData::apply(GpuSymmetryFunctionSet const& set,
                                   3 * nw * d.numTargets * sizeof(double),
                                   cudaMemcpyDeviceToHost));
     }
+}
+
+void GpuSymmetryFunctionData::derivativesOfTarget(
+                                        GpuSymmetryFunctionSet const& set,
+                                        size_t                        target,
+                                        size_t                        component,
+                                        double*                       result)
+{
+    Data& d = *data;
+    GpuSymmetryFunctionSet::Data const& s = *set.data;
+    if (!d.hasDerivatives || d.set != set.data)
+    {
+        throw runtime_error("ERROR: No GPU symmetry function derivatives for "
+                            "these symmetry functions.\n");
+    }
+    if (target >= d.numTargets || component > 2)
+    {
+        throw runtime_error("ERROR: Wrong target or component for GPU "
+                            "symmetry function derivatives.\n");
+    }
+    if (d.numValues == 0) return;
+    NNP_CUDA_CHECK(cudaSetDevice(d.device));
+    d.result.ensure(d.numValues * sizeof(double), d.total);
+    NNP_CUDA_CHECK(cudaMemset(d.result.p, 0, d.numValues * sizeof(double)));
+    targetDerivativeKernel<<<(d.numAtoms + 127) / 128, 128>>>(
+        d.numAtoms,
+        s.numElements,
+        target,
+        component,
+        d.atomElement.get<int>(),
+        d.atomTarget.get<int>(),
+        d.valueOffset.get<int>(),
+        d.neighborOffset.get<int>(),
+        d.neighborElement.get<int>(),
+        d.neighborTarget.get<int>(),
+        d.derivOffset.get<int>(),
+        s.tableOffset,
+        s.tableCountDevice,
+        s.table,
+        d.deriv.get<double>(),
+        d.result.get<double>());
+    NNP_CUDA_CHECK(cudaGetLastError());
+    NNP_CUDA_CHECK(cudaMemcpy(result, d.result.p,
+                              d.numValues * sizeof(double),
+                              cudaMemcpyDeviceToHost));
 }
 
 size_t GpuSymmetryFunctionData::getNumTargets() const

@@ -376,9 +376,9 @@ public:
      *
      * @param[in] enabled Calculate symmetry functions on the GPU if true.
      *
-     * Switched together with the GPU evaluation of the "short" neural
-     * networks (see setNeuralNetworkGpuEnabled()), i.e. on in GPU builds
-     * once their weights are set up. Switching it separately is internal,
+     * Switched on while the "short" or the "elec" neural networks are
+     * evaluated on the GPU (see setNeuralNetworkGpuEnabled()), i.e. in GPU
+     * builds once the weights of either type are set up. Switching it separately is internal,
      * for tests. Throws std::runtime_error when enabling the GPU in a CPU
      * build.
      *
@@ -892,6 +892,21 @@ protected:
                                        Structure const&     structure,
                                        std::size_t          numWeightVectors,
                                        double const*        weights,
+                                       std::vector<double>& result) const;
+    /** Derivatives of all symmetry functions of a structure with respect to
+     * one coordinate of one atom, from the GPU.
+     *
+     * @param[in] structure Input structure (see
+     *                      hasSymmetryFunctionDerivativesGpu()).
+     * @param[in] indexAtom Index of the atom.
+     * @param[in] indexComponent Coordinate (0, 1 or 2).
+     * @param[out] result Derivatives of the symmetry functions of all atoms,
+     *                    one atom after the other (as Atom::G).
+     */
+    void                     getSymmetryFunctionDerivativesGpu(
+                                       Structure const&     structure,
+                                       std::size_t          indexAtom,
+                                       std::size_t          indexComponent,
                                        std::vector<double>& result) const;
     /** Propagate all atoms of a structure through their networks on the
      * GPU, one batch per element.

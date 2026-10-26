@@ -2642,6 +2642,27 @@ bool Mode::hasSymmetryFunctionDerivativesGpu(Structure const& structure) const
            gpu.symmetryFunctionStamp == structure.geometryStamp;
 }
 
+void Mode::getSymmetryFunctionDerivativesGpu(
+                                       Structure const& structure,
+                                       size_t           indexAtom,
+                                       size_t           indexComponent,
+                                       vector<double>&  result) const
+{
+    if (!hasSymmetryFunctionDerivativesGpu(structure))
+    {
+        throw runtime_error("ERROR: No symmetry function derivatives on the "
+                            "GPU for this structure.\n");
+    }
+    GpuSymmetryFunctionData& data = *structure.gpuData.symmetryFunctions;
+    result.resize(data.getNumValues());
+    data.derivativesOfTarget(*gpuSymmetryFunctions,
+                             indexAtom,
+                             indexComponent,
+                             result.data());
+
+    return;
+}
+
 size_t Mode::applySymmetryFunctionDerivativesGpu(
                                        Structure const& structure,
                                        size_t           numWeightVectors,
@@ -3436,12 +3457,16 @@ void Mode::setNeuralNetworkGpuEnabled(string const& id, bool enabled)
                             .isGpuEnabled();
     for (auto& e : elements) e.neuralNetworks.at(id).setGpuEnabled(enabled);
     // Forces need the derivatives of the short-range networks.
-    if (id == "short")
-    {
-        setForceAssemblyGpuEnabled(enabled);
-        setSymmetryFunctionGpuEnabled(enabled);
-    }
+    if (id == "short") setForceAssemblyGpuEnabled(enabled);
     if (id == "elec") setChargeEquilibrationGpuEnabled(enabled);
+    // Symmetry functions for the networks of either type (4G stage 1 only
+    // sets up the electronegativity networks).
+    bool anyGpu = false;
+    for (auto const& nn : elements.front().neuralNetworks)
+    {
+        if (nn.second.isGpuEnabled()) anyGpu = true;
+    }
+    setSymmetryFunctionGpuEnabled(anyGpu);
 #ifdef N2P2_GPU
     if (enabled && !wasEnabled)
     {
