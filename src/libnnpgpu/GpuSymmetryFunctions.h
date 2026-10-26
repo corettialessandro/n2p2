@@ -185,6 +185,24 @@ public:
                       std::size_t                   numWeightVectors,
                       double const*                 weights,
                       double*                       result);
+    /** Derivatives of all values with respect to one coordinate of one
+     *  target.
+     *
+     * @param[in] set Symmetry functions of the model (same as for
+     *                calculate()).
+     * @param[in] target Target index.
+     * @param[in] component Coordinate (0, 1 or 2).
+     * @param[out] result dG/dr_target of all symmetry function values
+     *                    (getNumValues(), same order as the values of
+     *                    calculate()).
+     *
+     * Requires derivatives from the last calculate() call. Throws
+     * std::runtime_error otherwise.
+     */
+    void        derivativesOfTarget(GpuSymmetryFunctionSet const& set,
+                                    std::size_t                   target,
+                                    std::size_t                   component,
+                                    double*                       result);
     /** Number of targets of the last calculation (largest target index + 1).
      */
     std::size_t getNumTargets() const;

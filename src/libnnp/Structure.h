@@ -422,6 +422,18 @@ struct Structure
                                 std::vector<size_t> const&  compIndices,
                                 double const                maxCutoffRadius,
                                 std::vector<Element> const& elements);
+    /** Calculates derivative of the charges with respect to one coordinate
+     * of one atom, from the derivatives of the electronegativities.
+     * @param[in] atomIndex Index of the atom.
+     * @param[in] compIndex Index of the vector component.
+     * @param[in] dChidr Derivative of the electronegativity of each atom
+     *                   with respect to this coordinate (as
+     *                   Atom::calculateDChidr()).
+     */
+    void                    calculateDQdr(
+                                std::size_t                atomIndex,
+                                std::size_t                compIndex,
+                                std::vector<double> const& dChidr);
      /** Calculates partial derivatives of electrostatic Energy with respect
      * to atom's coordinates and charges.
      * @param[in] hardness Vector containing the hardness of all elements.

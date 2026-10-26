@@ -2676,9 +2676,17 @@ void Training::update(string const& property)
             if (nnpType == NNPType::HDNNP_2G || nnpType == NNPType::HDNNP_4G )
             {
                 // Derivatives of an update candidate calculated on the GPU
-                // stay there (calculateSymmetryFunctionsTraining()); dQ/dr
-                // and the Jacobian below need them on the host.
-                if (!s.hasSymmetryFunctionDerivatives)
+                // stay there (calculateSymmetryFunctionsTraining()): dQ/dr
+                // and the Jacobian below take those with respect to the atom
+                // of the update from there (collectDGdxiaAllAtoms()).
+                // Otherwise they are needed on the host.
+#if defined(N2P2_GPU) && !defined(N2P2_FULL_SFD_MEMORY)
+                bool const derivativesGpu =
+                    hasSymmetryFunctionDerivativesGpu(s);
+#else
+                bool const derivativesGpu = false;
+#endif
+                if (!s.hasSymmetryFunctionDerivatives && !derivativesGpu)
                 {
 #ifdef N2P2_NO_SF_GROUPS
                     calculateSymmetryFunctions(s, derivatives);
@@ -2697,6 +2705,26 @@ void Training::update(string const& property)
                     // the charge equilibration stayed cached; dQdr and the
                     // forces below need it.
                     else calculateAtomicNeuralNetworks(s, derivatives, "elec");
+#ifndef N2P2_FULL_SFD_MEMORY
+                    if (derivativesGpu)
+                    {
+                        // dChi_j/dx_ia = sum over the symmetry functions of
+                        // dChi_j/dG * dG/dx_ia (Atom::calculateDChidr()).
+                        collectDGdxiaAllAtoms(s, sC->a, sC->c);
+                        vector<double> dChidr(s.numAtoms, 0.0);
+                        for (auto const& a : s.atoms)
+                        {
+                            vector<double> const& d = dGdxiaAll.at(a.index);
+                            for (size_t i = 0; i < a.numSymmetryFunctions;
+                                 ++i)
+                            {
+                                dChidr.at(a.index) += a.dChidG.at(i) * d.at(i);
+                            }
+                        }
+                        s.calculateDQdr(sC->a, sC->c, dChidr);
+                    }
+                    else
+#endif
                     s.calculateDQdr(vector<size_t>{sC->a},
                                     vector<size_t>{sC->c},
                                     maxCutoffRadius,
@@ -2705,8 +2733,12 @@ void Training::update(string const& property)
 
 #ifndef N2P2_FULL_SFD_MEMORY
                 // For force update save derivative of symmetry function with
-                // respect to coordinate.
-                collectDGdxiaAllAtoms(s, sC->a, sC->c);
+                // respect to coordinate (already done above for 4G with
+                // derivatives on the GPU).
+                if (!(nnpType == NNPType::HDNNP_4G && derivativesGpu))
+                {
+                    collectDGdxiaAllAtoms(s, sC->a, sC->c);
+                }
 #endif
 #if defined(N2P2_GPU) && !defined(N2P2_FULL_SFD_MEMORY)
                 if (!addJacobianGpu(s, k, derivatives, sC->a, sC->c, offset,
@@ -3756,6 +3788,26 @@ void Training::collectDGdxiaAllAtoms(Structure const& structure,
                                      size_t           indexComponent)
 {
     Structure const& s = structure;
+
+#ifdef N2P2_GPU
+    // Derivatives calculated on the GPU (calculateSymmetryFunctionsTraining()).
+    if (hasSymmetryFunctionDerivativesGpu(s))
+    {
+        vector<double> d;
+        getSymmetryFunctionDerivativesGpu(s, indexAtom, indexComponent, d);
+        dGdxiaAll.resize(s.numAtoms);
+        size_t offset = 0;
+        for (auto const& a : s.atoms)
+        {
+            size_t const nsf = a.numSymmetryFunctions;
+            vector<double>& da = dGdxiaAll.at(a.index);
+            da.assign(d.begin() + offset, d.begin() + offset + nsf);
+            if (nnpType == NNPType::HDNNP_4G) da.push_back(0.0);
+            offset += nsf;
+        }
+        return;
+    }
+#endif
 
     // Index of all neighbor entries grouped by neighbor atom, in the order
     // collectDGdxia() visits them (atom by atom, then neighbor list order).

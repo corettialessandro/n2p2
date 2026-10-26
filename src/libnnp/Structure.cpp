@@ -1145,6 +1145,31 @@ void Structure::calculateDQdr(  vector<size_t> const&   atomIndices,
 }
 
 
+void Structure::calculateDQdr(size_t                atomIndex,
+                              size_t                compIndex,
+                              vector<double> const& dChidr)
+{
+    Atom& a = atoms.at(atomIndex);
+    if ( a.dAdrQ.size() == 0 )
+        throw runtime_error("ERROR: dAdrQ needs to be calculated before "
+                            "calculating dQdr");
+    a.dQdr.resize(numAtoms);
+
+    // b stores (-dChidr - dAdrQ), last element for charge conservation.
+    VectorXd b = VectorXd::Zero(numAtoms + 1);
+    for (size_t j = 0; j < numAtoms; ++j)
+    {
+        b(j) -= dChidr.at(j);
+        b(j) -= a.dAdrQ.at(j)[compIndex];
+    }
+    VectorXd const dQdr = solveA(b);
+    for (size_t j = 0; j < numAtoms; ++j)
+    {
+        a.dQdr.at(j)[compIndex] = dQdr(j);
+    }
+    return;
+}
+
 void Structure::calculateElectrostaticEnergyDerivatives(
                                         Eigen::VectorXd          hardness,
                                         Eigen::MatrixXd          gammaSqrt2,

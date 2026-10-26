@@ -916,11 +916,55 @@ SymmetryFunctionResult evaluateOnce(Prediction& p)
     return r;
 }
 
+// Prediction with access to the elements and the symmetry function
+// derivatives on the GPU.
+struct DerivativePrediction : public Prediction
+{
+    using Mode::elements;
+    using Mode::getSymmetryFunctionDerivativesGpu;
+};
+
+// Derivatives of all symmetry functions with respect to one coordinate of
+// one atom from the derivatives on the host, one atom after the other (as
+// Training::collectDGdxiaAllAtoms()).
+vector<double> hostDerivatives(DerivativePrediction const& p,
+                               size_t                      indexAtom,
+                               size_t                      component)
+{
+    vector<double> result;
+    for (auto const& a : p.structure.atoms)
+    {
+        vector<double> d(a.numSymmetryFunctions, 0.0);
+        for (size_t m = 0; m < a.numNeighbors; ++m)
+        {
+            Atom::Neighbor const& n = a.neighbors.at(m);
+            if (n.index != indexAtom) continue;
+            vector<size_t> const& table = p.elements.at(a.element)
+                                          .getSymmetryFunctionTable()
+                                          .at(n.element);
+            for (size_t k = 0; k < n.dGdr.size(); ++k)
+            {
+                d.at(table.at(k)) += n.dGdr.at(k)[component];
+            }
+        }
+        if (a.index == indexAtom)
+        {
+            for (size_t i = 0; i < d.size(); ++i)
+            {
+                d.at(i) += a.dGdr.at(i)[component];
+            }
+        }
+        result.insert(result.end(), d.begin(), d.end());
+    }
+    return result;
+}
+
 // Symmetry functions on the GPU against the CPU (networks on the GPU in
-// both cases), with the settings in the current directory.
+// both cases), with the settings in the current directory. Includes the
+// derivatives with respect to single coordinates (training).
 void requireGpuSymmetryFunctionsMatchCpu(string const& what)
 {
-    Prediction p;
+    DerivativePrediction p;
     p.log.writeToStdout = false;
     p.setup();
     BOOST_REQUIRE(p.isSymmetryFunctionGpuEnabled());
@@ -931,10 +975,24 @@ void requireGpuSymmetryFunctionsMatchCpu(string const& what)
         BOOST_REQUIRE(!a.hasSymmetryFunctionDerivatives);
         BOOST_REQUIRE(a.dGdr.empty());
     }
+    // Derivatives with respect to the first and the last atom.
+    size_t const last = p.structure.numAtoms - 1;
+    vector<pair<size_t, size_t>> const coordinates = {{0, 0}, {0, 1}, {0, 2},
+                                                      {last, 1}};
+    vector<vector<double>> derivativesGpu;
+    for (auto const& c : coordinates)
+    {
+        derivativesGpu.emplace_back();
+        p.getSymmetryFunctionDerivativesGpu(p.structure, c.first, c.second,
+                                            derivativesGpu.back());
+    }
     // Deterministic: same results again.
     SymmetryFunctionResult const again = evaluateOnce(p);
     BOOST_REQUIRE(gpu.values == again.values);
     BOOST_REQUIRE(gpu.forces == again.forces);
+    vector<double> derivativeAgain;
+    p.getSymmetryFunctionDerivativesGpu(p.structure, 0, 0, derivativeAgain);
+    BOOST_REQUIRE(derivativeAgain == derivativesGpu.front());
     p.setSymmetryFunctionGpuEnabled(false);
     SymmetryFunctionResult const cpu = evaluateOnce(p);
     BOOST_REQUIRE(p.structure.atoms.front().hasSymmetryFunctionDerivatives);
@@ -942,6 +1000,15 @@ void requireGpuSymmetryFunctionsMatchCpu(string const& what)
     requireClose(cpu.values, gpu.values, what + " symmetry function");
     requireClose({cpu.energy}, {gpu.energy}, what + " energy");
     requireClose(cpu.forces, gpu.forces, what + " force component");
+    for (size_t i = 0; i < coordinates.size(); ++i)
+    {
+        requireClose(hostDerivatives(p, coordinates.at(i).first,
+                                     coordinates.at(i).second),
+                     derivativesGpu.at(i),
+                     what + strpr(" dG/dx (atom %zu, component %zu)",
+                                  coordinates.at(i).first,
+                                  coordinates.at(i).second));
+    }
 }
 
 // Examples whose symmetry function types are all available on the GPU.
