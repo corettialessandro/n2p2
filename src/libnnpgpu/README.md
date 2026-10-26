@@ -59,6 +59,10 @@ errors in n2p2. Library code never calls `exit()`.
 Device memory and caches belong to an object (for example the structure or
 the Kalman filter they serve), are invalidated when what they cache changes,
 and are freed in its destructor. No process-global caches keyed by indices.
+The one process-wide object is the pool of released device memory of the
+symmetry functions (`GpuSymmetryFunctions.cu`): it holds no data, only free
+blocks, reused by size, limited to a quarter of the cache budget of the
+process.
 
 ### 7. CPU and GPU results agree within tolerance
 
@@ -78,7 +82,10 @@ symmetry function derivatives of a structure to the GPU only at the second
 force calculation with the same geometry and only within a memory budget;
 one-off geometries and structures beyond the budget are assembled on the
 CPU, which is faster for them. Such choices are counted (e.g.
-`Mode::getForceAssemblyCounts()`) and listed in the table below.
+`Mode::getForceAssemblyCounts()`) and listed in the table below. The same
+applies to launch configurations: the symmetry function kernel chooses its
+block size from the number of atoms of the launch (fixed threshold), never
+from the device, so a structure always gets the same results.
 
 ## Running with several MPI ranks per GPU
 
@@ -114,16 +121,38 @@ force assembly was ported.)
 
 Ranks are spread over the GPUs of a node automatically (rule 3).
 
-MD with LAMMPS (`pair_style hdnnp`, water, 8640 atoms, 300 steps, same
-node):
+## Performance
 
-| Setup | Time |
-|---|---|
-| CPU build, 32 ranks | 33.1 s |
-| GPU build, 32 ranks, 1 GPU, MPS | 11.0 s |
-| GPU build, 32 ranks, 4 GPUs, MPS | 3.8 s |
-| GPU build, 8 ranks, 4 GPUs, MPS | 5.7 s |
-| GPU build, 4 ranks, 4 GPUs | 8.8 s |
+Leonardo Booster node (32 cores, 4 A100, MPS) against a full CPU node of
+Leonardo DCGP (112 cores) or the CPUs of the same Booster node.
+
+4G training, SPC/Fw water (630 atoms, 1254 structures, 12 bohr cutoff),
+32 ranks:
+
+| Stage | CPU | GPU |
+|---|---|---|
+| Stage 1, one epoch | 48.7 s (same Booster node) | 8.6 s |
+| Stage 2, one epoch | 300 s (DCGP node) | 117 s |
+
+2G MD with LAMMPS (`pair_style hdnnp`, water H2O_RPBE-D3, ns/day; GPU
+rows gpu-port 4ca8737, 233,280 atoms at f80aaae, i.e. without the atom reuse
+of the LAMMPS interface, about 6% at this size):
+
+| Atoms | DCGP node, 112 ranks | Booster CPUs, 32 ranks | 4 GPUs, 32 ranks (MPS) | 4 GPUs, 4 ranks |
+|---|---|---|---|---|
+| 8,640 | 1.47 | 0.39 | 4.04 | 1.89 |
+| 69,120 | 0.19 | 0.055 | 0.668 | 0.227 |
+| 233,280 | 0.064 | 0.016 | 0.190 | |
+
+The GPU part per step is limited by the symmetry function kernel; with few
+ranks per GPU the host work of each rank (neighbor lists) matters more,
+which is why the LAMMPS interface reuses its atoms between steps
+(`Atom::reset()`, no reallocation of the neighbor lists).
+
+4G MD (`pair_style hdnnp/4g`, SPC/Fw water, Ewald 1e-3, time per step):
+630 atoms 0.126 s (Booster CPUs, 32 ranks) vs 0.027 s (4 GPUs, 32 ranks);
+5040 atoms 1.23 s vs 0.144 s. `nnp-predict` of 5040 atoms of the same model:
+78 s on one core vs 24 s on one GPU.
 
 ## Checklist for porting a feature to the GPU
 
@@ -149,7 +178,7 @@ node):
 | Atomic neural networks (`NeuralNetwork`, `Mode::calculateAtomicNeuralNetworks()`): 2G, 4G (elec, short), HDNNP_Q | forward pass and derivatives with respect to the inputs, all atoms of an element as one batch; neuron statistics | when the weights of a network type are set up: `Mode::readNeuralNetworkWeights()`, `Training::randomizeNeuralNetworkWeights()` (via `GpuNeuralNetwork`); not in `setupGeneric()`, which tools without network evaluation use too | none needed (any depth, all activation functions, normalized neurons) |
 | Training Jacobians (`Training::update()`): energy and force updates (2G, 4G stage 2), charge updates (4G stage 1) | derivatives with respect to all connections summed (charges: weighted by dError/dChi) over the atoms of an element (`NeuralNetwork::calculateDEdcBatchGpu()`, `calculateDFdcBatchGpu()`) | same as the atomic neural networks (they use the same GPU twins) | not ported yet, warning in the training log: force updates with `N2P2_FULL_SFD_MEMORY` |
 | Force assembly (`Mode::calculateForces()`): short-range forces and the 4G electrostatic dChi/dr sums | sums of weight * dG/dr over all terms of each atom (deterministic, one warp per atom); the topology (`GpuForceTopology`) is kept with its structure (`Structure::gpuData`) for the current geometry (`Structure::geometryStamp`) and freed with the symmetry function derivatives | together with the "short" networks (`Mode::setNeuralNetworkGpuEnabled()`) | performance choice (rule 8): first force calculation of a geometry, or topology beyond the memory budget (half the device memory, shared by the processes using it); not needed for symmetry function derivatives calculated on the GPU (see below) |
-| Symmetry functions (`Mode::evaluateNNP()`, LAMMPS `pair_style hdnnp` and `hdnnp/4g`, training errors and update candidates): types 2, 3 and 9, all cutoff functions and scaling types | values and derivatives of all atoms in one kernel (one thread per neighbor, deterministic); the derivatives stay on the GPU (`GpuSymmetryFunctionData`, kept with its structure in `Structure::gpuData` under the geometry stamp) and are contracted there with dE/dG (and lambda * dChi/dG for 4G) for the forces (`Mode::calculateForces()`, `InterfaceLammps::getForces()` and `getForcesChi()`; the two passes of a 4G-HDNNP in LAMMPS share them); only values, weights and forces cross to the host | together with the "short" networks (`Mode::setSymmetryFunctionGpuEnabled()`) | other symmetry function types: all symmetry functions of the model on the CPU, warning in the log; performance choice (rule 8): only where forces are assembled right away (`evaluateNNP()`, LAMMPS interface, error calculations and update candidates of the training via `Training::calculateSymmetryFunctionsTraining()`), while force update Jacobians and the tools use the derivatives on the host and get them from the CPU, as does training with `memorize_symfunc_results` (derivatives of all structures kept); structures with an atom with more than 2048 neighbors on the CPU |
+| Symmetry functions (`Mode::evaluateNNP()`, LAMMPS `pair_style hdnnp` and `hdnnp/4g`, training errors and update candidates): types 2, 3 and 9, all cutoff functions and scaling types | values and derivatives of all atoms in one kernel (one block per atom, neighbors grouped by element in shared memory, one thread per neighbor of the chunk's elements, deterministic; 128 threads per atom below 1024 atoms per launch, 64 from 1024 on, at most 128 registers per thread); the derivatives stay on the GPU (`GpuSymmetryFunctionData`, kept with its structure in `Structure::gpuData` under the geometry stamp, its device memory reused through a process-wide pool) and are contracted there with dE/dG (and lambda * dChi/dG for 4G) for the forces (`Mode::calculateForces()`, `InterfaceLammps::getForces()` and `getForcesChi()`; the two passes of a 4G-HDNNP in LAMMPS share them); the derivatives with respect to the coordinate of a force update are gathered there for the training Jacobian and dQ/dr (`GpuSymmetryFunctionData::derivativesOfTarget()`); only values, weights and forces cross to the host | together with the networks of either type (`Mode::setSymmetryFunctionGpuEnabled()`; 4G stage 1 sets up only the "elec" networks) | other symmetry function types or more than 32 elements: all symmetry functions of the model on the CPU, warning in the log; performance choice (rule 8): only where forces follow right away or the derivatives are only contracted (`evaluateNNP()`, LAMMPS interface, error calculations, update candidates and force updates of the training via `Training::calculateSymmetryFunctionsTraining()`), while the tools use the derivatives on the host and get them from the CPU, as does training with `memorize_symfunc_results` (derivatives of all structures kept); structures with an atom with more than 2048 neighbors on the CPU |
 | Charge equilibration and force Lagrange multipliers of the 4G LAMMPS interface (`fix hdnnp`, `pair_style hdnnp/4g`) | the dense matrix of the whole structure is built (real space over periodic images, reciprocal space as one matrix product) and LU-factorized once per step on the GPU of rank 0 (`GpuChargeEquilibration`), charges and multipliers are two solves with it, broadcast to all ranks; replaces the iterative minimizations and their communication | when the solver is first used (`PairHDNNP4G::solveChargeEquilibrationGpu()`), on rank 0 | performance and feature choice (rule 8): PPPM, triclinic boxes and matrices beyond the memory budget use the iterative solvers, stated in the log |
 | Charge equilibration of `Mode` (4G-HDNNP: `nnp-predict`, training stages 1 and 2, tools) | the A matrix built on the CPU is LU-factorized on the GPU instead of the QR factorization on the CPU (`GpuChargeEquilibration`, the same direct solution up to round-off); all solves with it run there (`Structure::solveA()`): charges, dQ/dChi and dQ/dJ (one solve with N right-hand sides), dQ/dr and the force Lagrange multipliers; one solver per process, refactorizing from the stored matrix when it was used for another structure since | together with the "elec" networks (`Mode::setChargeEquilibrationGpuEnabled()`) | performance choice (rule 8): structures whose matrix and N right-hand sides exceed a quarter of the device memory per process on the CPU (size limit stated in the log) |
 
