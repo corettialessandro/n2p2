@@ -702,6 +702,21 @@ private:
                                std::size_t      indexAtom,
                                std::size_t      indexComponent);
 #endif
+    /** Calculate the symmetry functions of a structure for error
+     * calculations and update candidates.
+     *
+     * @param[in] structure The structure.
+     * @param[in] derivatives Also calculate the derivatives.
+     *
+     * In GPU builds on the GPU (Mode::calculateSymmetryFunctionsGpu()), the
+     * derivatives staying there for calculateForces(), unless the results
+     * are kept in memory (memorize_symfunc_results). Otherwise, and where
+     * the GPU cannot, calculateSymmetryFunctionGroups()
+     * (calculateSymmetryFunctions() with N2P2_NO_SF_GROUPS). Returns
+     * immediately if the results are already there.
+     */
+    void calculateSymmetryFunctionsTraining(Structure& structure,
+                                            bool       derivatives);
 #ifdef N2P2_GPU
     /** Add the energy or force contributions of one structure to the
      * Jacobian, calculated on the GPU (same results as the CPU loops in

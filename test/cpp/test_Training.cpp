@@ -696,8 +696,11 @@ BOOST_FIXTURE_TEST_CASE(Stage2_4G_NormalizeDataSetThrows, FixtureRepairDir)
 BOOST_FIXTURE_TEST_CASE(Stage2_4G_MemorizeSymfuncResults_DoesNotChangeTraining,
                         FixtureRepairDir)
 {
-    vector<double> const memo = trainStage2Epochs4G(true, 1, "0.025");
-    vector<double> const freed = trainStage2Epochs4G(false, 1, "0.025");
+    // CPU code paths in both runs (GPU builds calculate the symmetry
+    // functions of the run without memorized results on the GPU, see the
+    // GPU tests below).
+    vector<double> const memo = trainStage2Epochs4G(true, 1, "0.025", false);
+    vector<double> const freed = trainStage2Epochs4G(false, 1, "0.025", false);
 
     for (size_t i = 0; i < memo.size(); ++i)
     {
@@ -717,8 +720,9 @@ BOOST_FIXTURE_TEST_CASE(
     Stage2_4G_MemorizeSymfuncResults_DoesNotChangeTrainingErrors,
     FixtureRepairDir)
 {
-    vector<double> const memo = trainStage2Epochs4G(true, 2, "0.1");
-    vector<double> const freed = trainStage2Epochs4G(false, 2, "0.1");
+    // CPU code paths in both runs, as above.
+    vector<double> const memo = trainStage2Epochs4G(true, 2, "0.1", false);
+    vector<double> const freed = trainStage2Epochs4G(false, 2, "0.1", false);
 
     for (size_t i = 0; i < memo.size(); ++i)
     {
@@ -849,8 +853,8 @@ BOOST_FIXTURE_TEST_CASE(TrainStage2_4G_Memorized_GpuForces_MatchesCpu,
     // With memorized symmetry functions the forces of a structure are
     // calculated repeatedly with the same geometry, so they are assembled
     // on the GPU (topologies kept with the structures).
-    vector<double> const gpu = trainStage2OneEpoch4G(true, true);
-    vector<double> const cpu = trainStage2OneEpoch4G(true, false);
+    vector<double> const gpu = trainStage2Epochs4G(true, 1, "0.025", true);
+    vector<double> const cpu = trainStage2Epochs4G(true, 1, "0.025", false);
     requireSameLearningCurve(cpu, gpu);
 }
 
