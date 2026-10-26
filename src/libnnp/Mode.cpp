@@ -3538,6 +3538,13 @@ void Mode::setSymmetryFunctionGpuEnabled(bool enabled)
     if (enabled && !gpuSymmetryFunctionsEnabled)
     {
         int const device = gpuRequireDevice();
+        if (elements.size() > GpuSymmetryFunctionSet::maxElements)
+        {
+            log << strpr("WARNING: More than %zu elements, all symmetry "
+                         "functions are calculated on the CPU.\n",
+                         GpuSymmetryFunctionSet::maxElements);
+            return;
+        }
         // All symmetry functions of the model must be available on the GPU.
         for (auto const& e : elements)
         {
