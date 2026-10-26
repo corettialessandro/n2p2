@@ -279,17 +279,24 @@ void InterfaceLammps::setLocalAtoms(int              numAtomsLocal,
     structure.hasSymmetryFunctionDerivatives = false;
     structure.geometryStamp                  = 0;
     structure.energy                         = 0.0;
-    structure.atoms.clear();
+    // The atoms of the previous call are reused (reset, but keeping the
+    // memory of their vectors, e.g. the neighbor lists): this is called
+    // every MD step.
+    size_t numAtoms = 0;
+    for (int i = 0; i < numAtomsLocal; i++)
+    {
+        if (!ignoreType[atomType[i]]) numAtoms++;
+    }
+    structure.atoms.resize(numAtoms);
     indexMap.clear();
-    structure.atoms.reserve(numAtomsLocal);
     indexMap.resize(numAtomsLocal, numeric_limits<size_t>::max());
     for (int i = 0; i < numAtomsLocal; i++)
     {
         if (ignoreType[atomType[i]]) continue;
         indexMap.at(i) = structure.numAtoms;
+        Atom& a = structure.atoms.at(structure.numAtoms);
         structure.numAtoms++;
-        structure.atoms.push_back(Atom());
-        Atom& a = structure.atoms.back();
+        a.reset();
         a.index                          = i;
         a.indexStructure                 = myRank;
         a.element                        = mapTypeToElement[atomType[i]];
