@@ -466,9 +466,15 @@ void InterfaceLammps::process() //TODO : add comments
 {
     bool symmetryFunctionsGpu = false;
 #ifdef N2P2_GPU
-    // Derivatives stay on the GPU for getForces(); the 4G electrostatics
-    // need them on the host.
-    if (nnpType == NNPType::HDNNP_2G)
+    // Derivatives stay on the GPU for getForces() and getForcesChi(). The
+    // second pass of a 4G-HDNNP (short-range networks, same geometry) reuses
+    // those of the first one.
+    if (nnpType == NNPType::HDNNP_4G && isElecDone &&
+        hasSymmetryFunctionDerivativesGpu(structure))
+    {
+        symmetryFunctionsGpu = true;
+    }
+    else
     {
         symmetryFunctionsGpu = calculateSymmetryFunctionsGpu(structure, true);
     }
@@ -1034,6 +1040,37 @@ void InterfaceLammps::getForcesChi(double const* const&  lambda,
         // dG/dr (lambda is a physical charge).
         convForce = convLength * convCharge / convEnergy;
     }
+
+#ifdef N2P2_GPU
+    // Symmetry function derivatives on the GPU: contraction with
+    // lambda * dChi/dG there, for all local and ghost atoms at once.
+    if (hasSymmetryFunctionDerivativesGpu(structure))
+    {
+        vector<double> weights;
+        for (auto const& a : structure.atoms)
+        {
+            double const l = lambda[a.tag - 1];
+            for (size_t s = 0; s < a.numSymmetryFunctions; ++s)
+            {
+                weights.push_back(l * a.dChidG.at(s));
+            }
+        }
+        vector<double> result;
+        size_t const numTargets = applySymmetryFunctionDerivativesGpu(
+                                      structure,
+                                      1,
+                                      weights.data(),
+                                      result);
+        double const conv = cfforce * convForce;
+        for (size_t i = 0; i < numTargets; ++i)
+        {
+            atomF[i][0] -= result.at(3 * i + 0) * conv;
+            atomF[i][1] -= result.at(3 * i + 1) * conv;
+            atomF[i][2] -= result.at(3 * i + 2) * conv;
+        }
+        return;
+    }
+#endif
 
     // Loop over all local atoms. Neural network and Symmetry function
     // derivatives are saved in the dEdG arrays of atoms and dGdr arrays of
