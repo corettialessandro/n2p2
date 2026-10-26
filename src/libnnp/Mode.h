@@ -383,11 +383,14 @@ public:
      * build.
      *
      * The GPU calculates symmetry functions where their derivatives are
-     * used right away by forces assembled on the GPU: evaluateNNP() and the
-     * LAMMPS interface (see calculateSymmetryFunctionsGpu()). Other callers
-     * of calculateSymmetryFunctions() and calculateSymmetryFunctionGroups()
-     * (training, tools) get them from the CPU, with derivatives on the
-     * host. If a symmetry function type of the model has no GPU
+     * used right away by forces assembled on the GPU: evaluateNNP(), the
+     * LAMMPS interface and the error calculations and update candidates of
+     * the training without memorized results (see
+     * calculateSymmetryFunctionsGpu() and
+     * Training::calculateSymmetryFunctionsTraining()). Other callers of
+     * calculateSymmetryFunctions() and calculateSymmetryFunctionGroups()
+     * (force update Jacobians, tools) get them from the CPU, with
+     * derivatives on the host. If a symmetry function type of the model has no GPU
      * implementation, all symmetry functions are calculated on the CPU,
      * with a warning in the log.
      */

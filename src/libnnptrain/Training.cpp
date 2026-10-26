@@ -1460,11 +1460,7 @@ void Training::calculateError(
     for (vector<Structure>::iterator it = structures.begin();
          it != structures.end(); ++it)
     {
-#ifdef N2P2_NO_SF_GROUPS
-        calculateSymmetryFunctions((*it), useForces);
-#else
-        calculateSymmetryFunctionGroups((*it), useForces);
-#endif
+        calculateSymmetryFunctionsTraining((*it), useForces);
         // TODO: Can we use evaluateNNP?
         if ( nnpType == Mode::NNPType::HDNNP_4G )
         {
@@ -2391,12 +2387,8 @@ void Training::update(string const& property)
             // Shortcut for current structure.
             Structure& s = structures.at(c->s);
             // Calculate symmetry functions (if results are already stored
-            // these functions will return immediately).
-#ifdef N2P2_NO_SF_GROUPS
-            calculateSymmetryFunctions(s, derivatives);
-#else
-            calculateSymmetryFunctionGroups(s, derivatives);
-#endif
+            // this function will return immediately).
+            calculateSymmetryFunctionsTraining(s, derivatives);
             // For SM_THRESHOLD calculate RMSE of update candidate.
             if (pu.selectionMode == SM_THRESHOLD)
             {
@@ -2683,6 +2675,17 @@ void Training::update(string const& property)
         {
             if (nnpType == NNPType::HDNNP_2G || nnpType == NNPType::HDNNP_4G )
             {
+                // Derivatives of an update candidate calculated on the GPU
+                // stay there (calculateSymmetryFunctionsTraining()); dQ/dr
+                // and the Jacobian below need them on the host.
+                if (!s.hasSymmetryFunctionDerivatives)
+                {
+#ifdef N2P2_NO_SF_GROUPS
+                    calculateSymmetryFunctions(s, derivatives);
+#else
+                    calculateSymmetryFunctionGroups(s, derivatives);
+#endif
+                }
                 if (nnpType == NNPType::HDNNP_4G)
                 {
                     if (!s.hasAMatrix)
@@ -3676,6 +3679,32 @@ void Training::addTrainingLogEntry(int                 proc,
     string s = strpr("  Q %5zu %10zu %5d %3zu %10.2E %10zu %5zu %5zu\n",
                      epoch, countUpdates, proc, il + 1, f, isg, is, ia);
     trainingLog << s;
+
+    return;
+}
+
+void Training::calculateSymmetryFunctionsTraining(Structure& structure,
+                                                  bool const derivatives)
+{
+#ifdef N2P2_GPU
+    // Results kept in memory (memorize_symfunc_results) are calculated once,
+    // on the CPU: derivatives of all structures do not fit on the GPU.
+    if (freeMemory)
+    {
+        if (structure.hasSymmetryFunctionDerivatives) return;
+        if (structure.hasSymmetryFunctions &&
+            (!derivatives || hasSymmetryFunctionDerivativesGpu(structure)))
+        {
+            return;
+        }
+        if (calculateSymmetryFunctionsGpu(structure, derivatives)) return;
+    }
+#endif
+#ifdef N2P2_NO_SF_GROUPS
+    calculateSymmetryFunctions(structure, derivatives);
+#else
+    calculateSymmetryFunctionGroups(structure, derivatives);
+#endif
 
     return;
 }
