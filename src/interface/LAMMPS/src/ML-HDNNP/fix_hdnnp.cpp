@@ -12,6 +12,7 @@
 ------------------------------------------------------------------------- */
 
 #include "fix_hdnnp.h"
+#include <vector>
 #include "pair_hdnnp_4g.h"
 #include <iostream>
 #include <gsl/gsl_vector.h>
@@ -685,6 +686,25 @@ void FixHDNNP::calculate_QEqCharges()
 
     nsize = atom->natoms; // total number of atoms
     nlocal = atom->nlocal; // total number of atoms
+
+#ifdef N2P2_GPU
+    {
+        // Direct solution on the GPU: A q + mu = -chi, sum q = qRef, then
+        // the energies at the solution (QEq_f() sets E_elec, E_recip_global).
+        std::vector<double> rhs(nlocal);
+        for (i = 0; i < nlocal; i++) rhs[i] = -hdnnp->chi[i];
+        std::vector<double> charges(nsize);
+        if (hdnnp->solveChargeEquilibrationGpu(rhs.data(), qRef,
+                                               charges.data(), true)) {
+            for (i = 0; i < nlocal; i++) q[i] = charges[tag[i] - 1];
+            gsl_vector *v = gsl_vector_alloc(nsize);
+            for (i = 0; i < nsize; i++) gsl_vector_set(v, i, charges[i]);
+            QEq_f(v);
+            gsl_vector_free(v);
+            return;
+        }
+    }
+#endif
 
     gsl_vector *Q; // charge vector
 

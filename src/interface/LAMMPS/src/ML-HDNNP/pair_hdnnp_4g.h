@@ -33,6 +33,8 @@ PairStyle(hdnnp/4g,PairHDNNP4G)
 #include <gsl/gsl_vector.h>
 #include <cmath>
 
+namespace nnp { class GpuChargeEquilibration; }
+
 namespace LAMMPS_NS {
 
 /* Conjugate gradient solution of the minimum of the quadratic function
@@ -195,6 +197,17 @@ protected:
     double **kcos,**ksinx,**ksiny,**ksinz;
 
     void calculateForceLambda();
+    // Direct solution of the charge equilibration system on the GPU of rank
+    // 0 (GPU builds), see the definition; false: use the iterative solvers.
+    bool solveChargeEquilibrationGpu(double const* rhsLocal,
+                                     double constraint,
+                                     double* solutionAll,
+                                     bool factorize);
+    // Direct solver: 0 not decided yet, 1 on the GPU, -1 iterative solvers.
+    int gpuQeqMode;
+    // Factorized matrix on rank 0 (GPU builds) and its time step.
+    nnp::GpuChargeEquilibration* gpuQeq;
+    bigint gpuQeqStep;
     void calculateElecDerivatives(double*,double**);
     void calculateElecForce(double**);
     void calculate_kspace_terms();

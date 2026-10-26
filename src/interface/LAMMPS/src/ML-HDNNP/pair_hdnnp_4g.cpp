@@ -39,6 +39,11 @@
 #include "domain.h" //periodicity
 #include "fix_hdnnp.h"
 #include "kspace_hdnnp.h"
+#ifdef N2P2_GPU
+#include "GpuChargeEquilibration.h"
+#include "GpuDevice.h"
+#include <exception>
+#endif
 #include <chrono> //time
 #include <thread>
 
@@ -102,6 +107,9 @@ PairHDNNP4G::PairHDNNP4G(LAMMPS *lmp) : Pair(lmp),
     ksinx                          (nullptr),
     ksiny                          (nullptr),
     ksinz                          (nullptr),
+    gpuQeqMode                     (0      ),
+    gpuQeq                         (nullptr),
+    gpuQeqStep                     (-1     ),
     screening_info                 (nullptr)
 {
 
@@ -115,6 +123,9 @@ PairHDNNP4G::PairHDNNP4G(LAMMPS *lmp) : Pair(lmp),
 
 PairHDNNP4G::~PairHDNNP4G()
 {
+#ifdef N2P2_GPU
+  delete gpuQeq;
+#endif
 }
 
 void PairHDNNP4G::compute(int eflag, int vflag)
@@ -841,6 +852,21 @@ void PairHDNNP4G::forceLambda_df(const gsl_vector *v, gsl_vector *dEdLambda)
 // Calculate forcelambda vector $\lambda_i$ that is required for optimized force calculation
 void PairHDNNP4G::calculateForceLambda()
 {
+#ifdef N2P2_GPU
+    {
+        // Direct solution on the GPU: A lambda + mu = -dE/dQ, sum lambda = 0,
+        // with the factorization of the charge equilibration of this step.
+        std::vector<double> rhs(atom->nlocal);
+        for (int i = 0; i < atom->nlocal; i++) rhs[i] = -dEdQ[i];
+        std::vector<double> lambda(atom->natoms);
+        if (solveChargeEquilibrationGpu(rhs.data(), 0.0, lambda.data(), false)) {
+            for (int i = 0; i < atom->nlocal; i++) {
+                forceLambda[i] = lambda[atom->tag[i] - 1];
+            }
+            return;
+        }
+    }
+#endif
     int i;
     int nsize;
     int nlocal;
@@ -951,6 +977,138 @@ void PairHDNNP4G::calculate_kspace_terms()
 }
 
 // Calculate $dEelec/dQ_i$ and add one part of the $\partial Eelec/\partial Q_i$ contribution to the total force vector
+/* ----------------------------------------------------------------------
+   direct solution of the charge equilibration system (GPU builds)
+
+   Solves [A 1; 1^T 0] [x; mu] = [b; c] for all atoms with the matrix of the
+   charge equilibration (see nnp::GpuChargeEquilibration) on the GPU of
+   rank 0, which replaces the iterative minimization of the charges
+   (b = -chi, c = total charge) and of the Lagrange multipliers of the forces
+   (b = -dE/dQ, c = 0). rhsLocal: b of the local atoms; solutionAll: x of
+   all atoms by tag - 1, on all ranks. factorize: build and factorize the
+   matrix for the current positions (otherwise the factorization of this
+   time step is reused). Returns false if the iterative solvers are used:
+   PPPM, triclinic box or a matrix exceeding the memory budget.
+------------------------------------------------------------------------- */
+
+bool PairHDNNP4G::solveChargeEquilibrationGpu(double const* rhsLocal,
+                                              double constraint,
+                                              double* solutionAll,
+                                              bool factorize)
+{
+#ifdef N2P2_GPU
+  // Set in compute(), which may not have run yet (fix hdnnp at setup).
+  if (periodic && kspacehdnnp == nullptr) {
+    kspacehdnnp = (KSpaceHDNNP *) force->kspace_match("^hdnnp", 0);
+  }
+  int const natoms = atom->natoms;
+  int const nlocal = atom->nlocal;
+  int const numK = periodic && kspacehdnnp ? kspacehdnnp->kcount : 0;
+  if (gpuQeqMode == 0) {
+    // Decided once by rank 0 (its device holds the matrix).
+    int mode = 1;
+    std::string reason;
+    if (periodic && (!kspacehdnnp || !kspacehdnnp->ewaldflag)) {
+      mode = -1;
+      reason = "PPPM";
+    } else if (periodic && domain->triclinic) {
+      mode = -1;
+      reason = "triclinic box";
+    } else if (me == 0 && nnp::GpuChargeEquilibration::memoryUsage(natoms, numK)
+               > nnp::gpuDefaultCacheBudget()) {
+      mode = -1;
+      reason = "matrix exceeds the memory budget";
+    }
+    MPI_Bcast(&mode, 1, MPI_INT, 0, world);
+    gpuQeqMode = mode;
+    if (me == 0) {
+      if (mode > 0) {
+        int const device = nnp::gpuCurrentDevice();
+        utils::logmesg(lmp, "Charge equilibration and force Lagrange "
+                       "multipliers solved directly on GPU {} ({}), matrix "
+                       "{:.0f} MB.\n", device, nnp::gpuDeviceName(device),
+                       nnp::GpuChargeEquilibration::memoryUsage(natoms, numK)
+                       / 1048576.0);
+      } else {
+        utils::logmesg(lmp, "Charge equilibration solved iteratively on the "
+                       "CPU ({}).\n", reason);
+      }
+    }
+  }
+  if (gpuQeqMode < 0) return false;
+  if (gpuQeqStep != update->ntimestep) factorize = true;
+
+  // Right-hand side (and positions, types) of all atoms by tag - 1.
+  std::vector<double> b(natoms, 0.0);
+  {
+    std::vector<double> local(natoms, 0.0);
+    for (int i = 0; i < nlocal; i++) local[atom->tag[i] - 1] = rhsLocal[i];
+    MPI_Allreduce(local.data(), b.data(), natoms, MPI_DOUBLE, MPI_SUM, world);
+  }
+  std::vector<double> position;
+  std::vector<int> types;
+  if (factorize) {
+    std::vector<double> positionLocal(3 * natoms, 0.0);
+    std::vector<int> typesLocal(natoms, 0);
+    for (int i = 0; i < nlocal; i++) {
+      int const t = atom->tag[i] - 1;
+      for (int c = 0; c < 3; c++) positionLocal[3 * t + c] = atom->x[i][c] * cflength;
+      typesLocal[t] = atom->type[i] - 1;
+    }
+    position.resize(3 * natoms);
+    types.resize(natoms);
+    MPI_Allreduce(positionLocal.data(), position.data(), 3 * natoms,
+                  MPI_DOUBLE, MPI_SUM, world);
+    MPI_Allreduce(typesLocal.data(), types.data(), natoms, MPI_INT, MPI_SUM,
+                  world);
+  }
+
+  if (me == 0) {
+    try {
+      if (gpuQeq == nullptr) gpuQeq = new nnp::GpuChargeEquilibration();
+      if (factorize) {
+        int const ntypes = atom->ntypes;
+        std::vector<double> J(hardness, hardness + ntypes);
+        std::vector<double> sigma(ntypes);
+        for (int t = 0; t < ntypes; t++) sigma[t] = sigmaSqrtPi[t] / sqrt(M_PI);
+        double box[3] = {0.0, 0.0, 0.0};
+        double eta = 0.0;
+        std::vector<double> kvector(3 * numK);
+        std::vector<double> kcoeff(numK);
+        if (periodic) {
+          box[0] = domain->xprd * cflength;
+          box[1] = domain->yprd * cflength;
+          box[2] = domain->zprd * cflength;
+          eta = 1.0 / kspacehdnnp->g_ewald;
+          for (int k = 0; k < numK; k++) {
+            kvector[3 * k + 0] = kspacehdnnp->kxvecs[k] * kspacehdnnp->unitk[0];
+            kvector[3 * k + 1] = kspacehdnnp->kyvecs[k] * kspacehdnnp->unitk[1];
+            kvector[3 * k + 2] = kspacehdnnp->kzvecs[k] * kspacehdnnp->unitk[2];
+            kcoeff[k] = kspacehdnnp->kcoeff[k];
+          }
+        }
+        gpuQeq->factorize(types, position, J, sigma, periodic, box, eta,
+                          elecCutoff * cflength, kvector, kcoeff);
+      }
+      std::vector<double> x;
+      gpuQeq->solve(b, constraint, x);
+      std::copy(x.begin(), x.end(), solutionAll);
+    } catch (std::exception const& e) {
+      error->one(FLERR, e.what());
+    }
+  }
+  MPI_Bcast(solutionAll, natoms, MPI_DOUBLE, 0, world);
+  if (factorize) gpuQeqStep = update->ntimestep;
+  return true;
+#else
+  (void)rhsLocal;
+  (void)constraint;
+  (void)solutionAll;
+  (void)factorize;
+  return false;
+#endif
+}
+
 void PairHDNNP4G::calculateElecDerivatives(double *dEelecdQ, double **f)
 {
     int i,j,jmap;
