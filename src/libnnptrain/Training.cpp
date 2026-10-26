@@ -2549,11 +2549,7 @@ void Training::update(string const& property)
             // Need to calculate the symmetry functions again, maybe results
             // were not stored.
             Structure& s = structures.at(c->s);
-#ifdef N2P2_NO_SF_GROUPS
-            calculateSymmetryFunctions(s, derivatives);
-#else
-            calculateSymmetryFunctionGroups(s, derivatives);
-#endif
+            calculateSymmetryFunctionsTraining(s, derivatives);
         }
 
         // If new update candidate, determine number of subcandidates needed
