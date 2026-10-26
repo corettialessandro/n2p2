@@ -19,6 +19,7 @@
 #include "GpuError.h"
 #include <cublas_v2.h>
 #include <cusolverDn.h>
+#include <atomic>    // std::atomic
 #include <cmath>     // std::sqrt, std::ceil
 #include <stdexcept> // std::runtime_error
 #include <string>    // std::to_string
@@ -153,6 +154,9 @@ struct Buffer
     template<typename T> T* get() const { return static_cast<T*>(p); }
 };
 
+/// Last factorization identifier handed out (all objects).
+atomic<size_t> lastFactorizationId(0);
+
 void upload(Buffer& b, void const* host, size_t bytes)
 {
     b.ensure(bytes > 0 ? bytes : 1);
@@ -173,6 +177,7 @@ struct GpuChargeEquilibration::Data
     cublasHandle_t     cublas;
     cusolverDnHandle_t cusolver;
     size_t             numAtoms;
+    size_t             factorizationId;
     Buffer             type;
     Buffer             position;
     Buffer             hardness;
@@ -192,6 +197,7 @@ GpuChargeEquilibration::GpuChargeEquilibration() : data(new Data())
     Data& d = *data;
     d.device = gpuCurrentDevice();
     d.numAtoms = 0;
+    d.factorizationId = 0;
     d.cublas = nullptr;
     d.cusolver = nullptr;
     try
@@ -223,11 +229,14 @@ GpuChargeEquilibration::~GpuChargeEquilibration()
     delete data;
 }
 
-size_t GpuChargeEquilibration::memoryUsage(size_t numAtoms, size_t numK)
+size_t GpuChargeEquilibration::memoryUsage(size_t numAtoms,
+                                           size_t numK,
+                                           size_t numRhs)
 {
     return (numAtoms + 1) * (numAtoms + 1) * sizeof(double)
          + 2 * numAtoms * numK * sizeof(double)
-         + numAtoms * (3 * sizeof(double) + sizeof(int));
+         + numAtoms * (3 * sizeof(double) + sizeof(int))
+         + (numAtoms + 1) * numRhs * sizeof(double);
 }
 
 void GpuChargeEquilibration::factorize(vector<int> const&    type,
@@ -243,6 +252,7 @@ void GpuChargeEquilibration::factorize(vector<int> const&    type,
 {
     Data& d = *data;
     d.numAtoms = 0;
+    d.factorizationId = 0;
     size_t const n = type.size();
     size_t const numK = kcoeff.size();
     if (n == 0 || position.size() != 3 * n || hardness.size() != sigma.size()
@@ -330,6 +340,29 @@ void GpuChargeEquilibration::factorize(vector<int> const&    type,
                                      ld));
     }
 
+    factorizeDeviceMatrix(n);
+}
+
+void GpuChargeEquilibration::factorize(size_t numAtoms, double const* matrix)
+{
+    Data& d = *data;
+    d.numAtoms = 0;
+    d.factorizationId = 0;
+    if (numAtoms == 0 || matrix == nullptr)
+    {
+        throw runtime_error("ERROR: Inconsistent input for the GPU charge "
+                            "equilibration.\n");
+    }
+    NNP_CUDA_CHECK(cudaSetDevice(d.device));
+    size_t const ld = numAtoms + 1;
+    upload(d.matrix, matrix, ld * ld * sizeof(double));
+    factorizeDeviceMatrix(numAtoms);
+}
+
+void GpuChargeEquilibration::factorizeDeviceMatrix(size_t numAtoms)
+{
+    Data& d = *data;
+    size_t const ld = numAtoms + 1;
     // LU factorization with partial pivoting (the matrix is symmetric but
     // indefinite because of the constraint).
     int workSize = 0;
@@ -359,7 +392,8 @@ void GpuChargeEquilibration::factorize(vector<int> const&    type,
                             "singular (getrf info " + to_string(info)
                             + ").\n");
     }
-    d.numAtoms = n;
+    d.numAtoms = numAtoms;
+    d.factorizationId = ++lastFactorizationId;
 }
 
 void GpuChargeEquilibration::solve(vector<double> const& b,
@@ -373,28 +407,46 @@ void GpuChargeEquilibration::solve(vector<double> const& b,
         throw runtime_error("ERROR: No GPU charge equilibration matrix for "
                             "this right-hand side.\n");
     }
-    NNP_CUDA_CHECK(cudaSetDevice(d.device));
     vector<double> rhs(b);
     rhs.push_back(c);
-    upload(d.rhs, rhs.data(), (n + 1) * sizeof(double));
+    solve(1, rhs.data());
+    x.assign(rhs.begin(), rhs.begin() + n);
+}
+
+void GpuChargeEquilibration::solve(size_t numRhs, double* rhs)
+{
+    Data& d = *data;
+    size_t const n = d.numAtoms;
+    if (n == 0)
+    {
+        throw runtime_error("ERROR: No GPU charge equilibration matrix for "
+                            "this right-hand side.\n");
+    }
+    if (numRhs == 0) return;
+    NNP_CUDA_CHECK(cudaSetDevice(d.device));
+    size_t const bytes = (n + 1) * numRhs * sizeof(double);
+    upload(d.rhs, rhs, bytes);
     NNP_CUSOLVER_CHECK(cusolverDnDgetrs(d.cusolver,
                                         CUBLAS_OP_N,
                                         n + 1,
-                                        1,
+                                        numRhs,
                                         d.matrix.get<double>(),
                                         n + 1,
                                         d.pivot.get<int>(),
                                         d.rhs.get<double>(),
                                         n + 1,
                                         d.info.get<int>()));
-    x.resize(n);
-    NNP_CUDA_CHECK(cudaMemcpy(x.data(), d.rhs.p, n * sizeof(double),
-                              cudaMemcpyDeviceToHost));
+    NNP_CUDA_CHECK(cudaMemcpy(rhs, d.rhs.p, bytes, cudaMemcpyDeviceToHost));
 }
 
 size_t GpuChargeEquilibration::getNumAtoms() const
 {
     return data->numAtoms;
+}
+
+size_t GpuChargeEquilibration::getFactorizationId() const
+{
+    return data->factorizationId;
 }
 
 }

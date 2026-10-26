@@ -17,6 +17,7 @@
 #include "Kspace.h"
 #include "Structure.h"
 #ifdef N2P2_GPU
+#include "GpuChargeEquilibration.h"
 #include "GpuForceAssembly.h"
 #include "GpuSymmetryFunctions.h"
 #endif
@@ -61,7 +62,8 @@ Structure::Structure() :
     maxCutoffRadiusOverall        (0.0       ),
     sampleType                    (ST_UNKNOWN),
     comment                       (""        ),
-    hasAMatrix                    (false     )
+    hasAMatrix                    (false     ),
+    AGpuId                        (0         )
 {
     for (size_t i = 0; i < 3; i++)
     {
@@ -598,7 +600,9 @@ double Structure::calculateElectrostaticEnergy(
                                             VectorXd                 sigmaSqrtPi,
                                             ScreeningFunction const& fs,
                                             double const             fourPiEps,
-                                            ErfcBuf&                 erfcBuf)
+                                            ErfcBuf&                 erfcBuf,
+                                            shared_ptr<
+                                            GpuChargeEquilibration>  gpuSolver)
 {
     // The Ewald setup is shared by all structures of a Mode and training
     // calculates all neighbor lists before the first charge equilibration:
@@ -760,9 +764,16 @@ double Structure::calculateElectrostaticEnergy(
 #endif
     // Factorize A once, the factorization is reused by all later solves
     // with the same A (calculateDQdChi(), calculateDQdJ(), calculateDQdr(),
-    // calculateForceLambdaTotal(), calculateForceLambdaElec()).
+    // calculateForceLambdaTotal(), calculateForceLambdaElec()). On the GPU
+    // solveA() factorizes at the first solve.
+    AGpu = gpuSolver;
+    AGpuId = 0;
+#ifdef N2P2_GPU
+    if (AGpu) AQr = Eigen::ColPivHouseholderQR<MatrixXd>();
+    else
+#endif
     AQr.compute(A);
-    Q = AQr.solve(b);
+    Q = solveA(b);
 #ifdef _OPENMP
     }
 #endif
@@ -1054,13 +1065,16 @@ void Structure::calculateDQdChi(vector<Eigen::VectorXd> &dQdChi)
 {
     dQdChi.clear();
     dQdChi.reserve(numAtoms);
+    // Including Lagrange multiplier equation.
+    MatrixXd b = MatrixXd::Zero(numAtoms + 1, numAtoms);
     for (size_t i = 0; i < numAtoms; ++i)
     {
-        // Including Lagrange multiplier equation.
-        VectorXd b(numAtoms+1);
-        b.setZero();
-        b(i) = -1.;
-        dQdChi.push_back(AQr.solve(b).head(numAtoms));
+        b(i, i) = -1.;
+    }
+    MatrixXd const x = solveA(b);
+    for (size_t i = 0; i < numAtoms; ++i)
+    {
+        dQdChi.push_back(x.col(i).head(numAtoms));
     }
     return;
 }
@@ -1069,17 +1083,17 @@ void Structure::calculateDQdJ(vector<Eigen::VectorXd> &dQdJ)
 {
     dQdJ.clear();
     dQdJ.reserve(numElements);
+    // Including Lagrange multiplier equation.
+    MatrixXd b = MatrixXd::Zero(numAtoms + 1, numElements);
+    for (size_t j = 0; j < numAtoms; ++j)
+    {
+        Atom const &aj = atoms.at(j);
+        b(j, aj.element) = -aj.charge;
+    }
+    MatrixXd const x = solveA(b);
     for (size_t i = 0; i < numElements; ++i)
     {
-        // Including Lagrange multiplier equation.
-        VectorXd b(numAtoms+1);
-        b.setZero();
-        for (size_t j = 0; j < numAtoms; ++j)
-        {
-            Atom const &aj = atoms.at(j);
-            if (i == aj.element) b(j) = -aj.charge;
-        }
-        dQdJ.push_back(AQr.solve(b).head(numAtoms));
+        dQdJ.push_back(x.col(i).head(numAtoms));
     }
     return;
 }
@@ -1092,6 +1106,8 @@ void Structure::calculateDQdr(  vector<size_t> const&   atomIndices,
     if (atomIndices.size() != compIndices.size())
         throw runtime_error("ERROR: In calculation of dQ/dr both atom index and"
                             " component index must be specified.");
+    // b stores (-dChidr - dAdrQ), last element for charge conservation.
+    MatrixXd b = MatrixXd::Zero(numAtoms + 1, atomIndices.size());
     for (size_t i = 0; i < atomIndices.size(); ++i)
     {
         Atom& a = atoms.at(atomIndices[i]);
@@ -1100,9 +1116,6 @@ void Structure::calculateDQdr(  vector<size_t> const&   atomIndices,
                                 "calculating dQdr");
         a.dQdr.resize(numAtoms);
 
-        // b stores (-dChidr - dAdrQ), last element for charge conservation.
-        VectorXd b(numAtoms + 1);
-        b.setZero();
         for (size_t j = 0; j < numAtoms; ++j)
         {
             Atom const& aj = atoms.at(j);
@@ -1113,15 +1126,19 @@ void Structure::calculateDQdr(  vector<size_t> const&   atomIndices,
 #else
             vector<vector<size_t> > const *const tableFull = nullptr;
 #endif
-            b(j) -= aj.calculateDChidr(atomIndices[i],
-                                       maxCutoffRadius,
-                                       tableFull)[compIndices[i]];
-            b(j) -= a.dAdrQ.at(j)[compIndices[i]];
+            b(j, i) -= aj.calculateDChidr(atomIndices[i],
+                                          maxCutoffRadius,
+                                          tableFull)[compIndices[i]];
+            b(j, i) -= a.dAdrQ.at(j)[compIndices[i]];
         }
-        VectorXd dQdr = AQr.solve(b).head(numAtoms);
+    }
+    MatrixXd const dQdr = solveA(b);
+    for (size_t i = 0; i < atomIndices.size(); ++i)
+    {
+        Atom& a = atoms.at(atomIndices[i]);
         for (size_t j = 0; j < numAtoms; ++j)
         {
-            a.dQdr.at(j)[compIndices[i]] = dQdr(j);
+            a.dQdr.at(j)[compIndices[i]] = dQdr(j, i);
         }
     }
     return;
@@ -1242,7 +1259,7 @@ VectorXd const Structure::calculateForceLambdaTotal() const
         dEdQ(i) = ai.dEelecdQ + ai.dEdG.back();
     }
     dEdQ(numAtoms) = 0;
-    VectorXd const lambdaTotal = AQr.solve(-dEdQ);
+    VectorXd const lambdaTotal = solveA(-dEdQ);
     return lambdaTotal;
 }
 
@@ -1255,8 +1272,34 @@ VectorXd const Structure::calculateForceLambdaElec() const
         dEelecdQ(i) = ai.dEelecdQ;
     }
     dEelecdQ(numAtoms) = 0;
-    VectorXd const lambdaElec = AQr.solve(-dEelecdQ);
+    VectorXd const lambdaElec = solveA(-dEelecdQ);
     return lambdaElec;
+}
+
+MatrixXd Structure::solveA(MatrixXd const& b) const
+{
+#ifdef N2P2_GPU
+    if (AGpu)
+    {
+        // The solver may have factorized another matrix since.
+        if (AGpu->getFactorizationId() != AGpuId || AGpuId == 0)
+        {
+            AGpu->factorize(numAtoms, A.data());
+            AGpuId = AGpu->getFactorizationId();
+        }
+        MatrixXd x = b;
+        AGpu->solve(x.cols(), x.data());
+        return x;
+    }
+#endif
+    // One column after the other, as a single right-hand side.
+    MatrixXd x(b.rows(), b.cols());
+    for (Eigen::Index i = 0; i < b.cols(); ++i)
+    {
+        VectorXd const bi = b.col(i);
+        x.col(i) = AQr.solve(bi);
+    }
+    return x;
 }
 
 void Structure::remap()
@@ -1488,6 +1531,8 @@ void Structure::clearElectrostatics(bool clearDQdr)
 {
     A.resize(0,0);
     AQr = Eigen::ColPivHouseholderQR<Eigen::MatrixXd>();
+    AGpu.reset();
+    AGpuId = 0;
     hasAMatrix = false;
     for (auto& a : atoms)
     {

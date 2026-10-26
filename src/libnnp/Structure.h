@@ -29,12 +29,14 @@
 #include <cstddef>    // std::size_t
 #include <fstream>    // std::ofstream
 #include <map>        // std::map
+#include <memory>     // std::shared_ptr
 #include <string>     // std::string
 #include <vector>     // std::vector
 
 namespace nnp
 {
 
+class GpuChargeEquilibration;
 class GpuForceTopology;
 class GpuSymmetryFunctionData;
 
@@ -155,8 +157,15 @@ struct Structure
     Vec3D                    invbox[3];
     /// Global charge equilibration matrix A'.
     Eigen::MatrixXd          A;
-    /// QR factorization of #A, computed with #A and used for all solves.
+    /// QR factorization of #A, computed with #A and used for all solves
+    /// (unless #AGpu is set).
     Eigen::ColPivHouseholderQR<Eigen::MatrixXd> AQr;
+    /// GPU solver for all solves with #A instead of #AQr, NULL if none (GPU
+    /// builds, see calculateElectrostaticEnergy()).
+    std::shared_ptr<GpuChargeEquilibration> AGpu;
+    /// Factorization of #A on #AGpu (see
+    /// GpuChargeEquilibration::getFactorizationId()), 0 if none.
+    mutable std::size_t      AGpuId;
     /// If A matrix of this structure is currently stored.
     bool                     hasAMatrix;
     /// Same as #energy but for all committee members
@@ -339,6 +348,10 @@ struct Structure
      * @param[in] fourPiEps @f$ \text{fourPiEps} = 4 \pi \varepsilon_0 @f$.
      *                  Value depends on unit system (e.g. normalization).
      * @param[in] erfcBuf helper object to avoid repeated calculation of erfc().
+     * @param[in] gpuSolver GPU solver for all solves with the A matrix (LU
+     *                      factorization on the GPU instead of the QR
+     *                      factorization on the CPU, GPU builds), NULL for
+     *                      the CPU.
      */
     double                   calculateElectrostaticEnergy(
                                             EwaldSetup&              ewaldSetup,
@@ -347,7 +360,10 @@ struct Structure
                                             Eigen::VectorXd          sigmaSqrtPi,
                                             ScreeningFunction const& fs,
                                             double const             fourPiEps,
-                                            ErfcBuf&                 erfcBuf);
+                                            ErfcBuf&                 erfcBuf,
+                                            std::shared_ptr<
+                                            GpuChargeEquilibration>  gpuSolver
+                                                                     = nullptr);
     /** Calculate screening energy which needs to be added (!) to the
      * electrostatic energy in order to remove contributions in the short range
      * domain.
@@ -432,6 +448,19 @@ struct Structure
      *  force calculation in 4G NN.
      */
     Eigen::VectorXd const calculateForceLambdaElec() const;
+    /** Solve the charge equilibration system with the stored A matrix.
+     *
+     * @param[in] b Right-hand sides (columns of length numAtoms + 1, the
+     *              last element for charge conservation).
+     *
+     * @return Solutions (charges or Lagrange multipliers of the atoms and
+     *         the Lagrange multiplier of the constraint).
+     *
+     * Uses the factorization of calculateElectrostaticEnergy(): #AQr, one
+     * column after the other, or #AGpu, refactorizing #A if the solver was
+     * used for another matrix since.
+     */
+    Eigen::MatrixXd          solveA(Eigen::MatrixXd const& b) const;
     /** Translate all atoms back into box if outside.
      */
     void                     remap();

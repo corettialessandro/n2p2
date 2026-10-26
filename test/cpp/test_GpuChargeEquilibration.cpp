@@ -181,6 +181,44 @@ BOOST_AUTO_TEST_CASE(NonPeriodic_MatchesCpu)
     requireSolutionsMatch(false);
 }
 
+BOOST_AUTO_TEST_CASE(FactorizeMatrix_SeveralRhs_MatchesCpu)
+{
+    TestSystem const s(41);
+    size_t const n = s.type.size();
+    Eigen::MatrixXd const a = s.matrix(true);
+    GpuChargeEquilibration q;
+    BOOST_REQUIRE_EQUAL(q.getFactorizationId(), 0);
+    q.factorize(n, a.data());
+    BOOST_REQUIRE_EQUAL(q.getNumAtoms(), n);
+    size_t const id = q.getFactorizationId();
+    BOOST_REQUIRE_NE(id, 0);
+    Eigen::MatrixXd b(n + 1, 3);
+    for (size_t i = 0; i <= n; ++i)
+    {
+        for (size_t k = 0; k < 3; ++k) b(i, k) = cos(0.7 * i + 1.9 * k);
+    }
+    Eigen::MatrixXd const reference = Eigen::PartialPivLU<Eigen::MatrixXd>(a)
+                                      .solve(b);
+    Eigen::MatrixXd x = b;
+    q.solve(3, x.data());
+    for (size_t k = 0; k < 3; ++k)
+    {
+        for (size_t i = 0; i <= n; ++i)
+        {
+            BOOST_TEST_INFO("row " << i << " right-hand side " << k);
+            REQUIRE_CLOSE_TO_REFERENCE(reference(i, k), x(i, k),
+                                       Tolerance(1.0E-10, 1.0E-10));
+        }
+    }
+    // Each factorization has a new identifier, also in other objects.
+    GpuChargeEquilibration other;
+    other.factorize(n, a.data());
+    BOOST_REQUIRE_NE(other.getFactorizationId(), id);
+    q.factorize(n, a.data());
+    BOOST_REQUIRE_NE(q.getFactorizationId(), id);
+    BOOST_REQUIRE_NE(q.getFactorizationId(), other.getFactorizationId());
+}
+
 BOOST_AUTO_TEST_CASE(InconsistentInput_Throws)
 {
     TestSystem s(5);
