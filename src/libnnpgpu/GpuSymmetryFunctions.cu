@@ -35,6 +35,18 @@ namespace
 int const maxMembers = 8;
 int const threadsPerBlock = 128;
 int const warpsPerBlock = threadsPerBlock / 32;
+/* calculateKernel launch: 64 threads per atom (8 blocks per SM, i.e. at
+ * most 65536 / (64 * 8) = 128 registers per thread) from largeLaunchAtoms
+ * atoms per launch on, else 128 threads (4 blocks per SM, same register
+ * limit). A fixed rule depending only on the launch, not on the device, so a
+ * structure always gets the same results (the values depend on the
+ * reduction order, the derivatives do not). Measured on A100 with 2G water
+ * (6.4 A cutoff): with many atoms the smaller blocks leave fewer threads
+ * idle and raise the occupancy (2G MD 13-16% faster); with few atoms per
+ * launch the device is not filled, and the larger blocks finish each atom
+ * sooner (20% faster than 64 threads for 270 atoms per launch).
+ */
+int const largeLaunchAtoms = 1024;
 int const threadsPerTarget = 32;
 int const maxWeightVectors = 3;
 
@@ -220,7 +232,9 @@ __device__ double powInt(double x, int n)
  * Dynamic shared memory: 2 doubles and 1 int per neighbor, for up to
  * neighborStride neighbors.
  */
-__global__ void calculateKernel(Chunk const*  chunks,
+template<int threads, int minBlocks>
+__global__ void __launch_bounds__(threads, minBlocks)
+calculateKernel(Chunk const*  chunks,
                                 int const*    chunkOffset,
                                 int           numElements,
                                 int           neighborStride,
@@ -241,7 +255,8 @@ __global__ void calculateKernel(Chunk const*  chunks,
     __shared__ int elementOffset[nnp::GpuSymmetryFunctionSet::maxElements + 1];
     __shared__ int position[nnp::GpuSymmetryFunctionSet::maxElements];
     __shared__ Chunk ch;
-    __shared__ double partial[warpsPerBlock][maxMembers];
+    int const warps = threads / 32;
+    __shared__ double partial[threads / 32][maxMembers];
 
     int const atom = blockIdx.x;
     int const tid = threadIdx.x;
@@ -460,7 +475,7 @@ __global__ void calculateKernel(Chunk const*  chunks,
         if (tid < ch.numMembers)
         {
             double sum = 0.0;
-            for (int w = 0; w < warpsPerBlock; ++w) sum += partial[w][tid];
+            for (int w = 0; w < warps; ++w) sum += partial[w][tid];
             if (ch.kind != RADIAL) sum = 0.5 * sum * ch.pnorm[tid];
             values[valueOffset[atom] + ch.index[tid]] =
                 ch.scaleOffset[tid]
@@ -1165,23 +1180,32 @@ void GpuSymmetryFunctionData::calculate(GpuSymmetryFunctionSet const& set,
                                                 neighborOffset[i + 1]
                                                 - neighborOffset[i]);
         }
-        calculateKernel<<<numAtoms,
-                          threadsPerBlock,
-                          maxNeighborsStructure
-                          * (2 * sizeof(double) + sizeof(int))>>>(
-            s.chunks,
-            s.chunkOffset,
-            s.numElements,
-            maxNeighborsStructure,
-            d.atomElement.get<int>(),
-            d.valueOffset.get<int>(),
-            d.neighborOffset.get<int>(),
-            d.neighborElement.get<int>(),
-            d.neighborGeometry.get<double>(),
-            d.derivOffset.get<int>(),
-            derivatives,
-            d.values.get<double>(),
-            d.deriv.get<double>());
+        size_t const sharedBytes = maxNeighborsStructure
+                                 * (2 * sizeof(double) + sizeof(int));
+        // See largeLaunchAtoms.
+        void (*kernel)(Chunk const*, int const*, int, int, int const*,
+                       int const*, int const*, int const*, double const*,
+                       int const*, bool, double*, double*)
+            = calculateKernel<128, 4>;
+        int threads = 128;
+        if (numAtoms >= static_cast<size_t>(largeLaunchAtoms))
+        {
+            kernel = calculateKernel<64, 8>;
+            threads = 64;
+        }
+        kernel<<<numAtoms, threads, sharedBytes>>>(s.chunks,
+                                                   s.chunkOffset,
+                                                   s.numElements,
+                                                   maxNeighborsStructure,
+                                                   d.atomElement.get<int>(),
+                                                   d.valueOffset.get<int>(),
+                                                   d.neighborOffset.get<int>(),
+                                                   d.neighborElement.get<int>(),
+                                                   d.neighborGeometry.get<double>(),
+                                                   d.derivOffset.get<int>(),
+                                                   derivatives,
+                                                   d.values.get<double>(),
+                                                   d.deriv.get<double>());
         NNP_CUDA_CHECK(cudaGetLastError());
     }
     if (numValues > 0)
