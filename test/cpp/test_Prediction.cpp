@@ -1011,7 +1011,10 @@ void requireGpuSymmetryFunctionsMatchCpu(string const& what)
     }
 }
 
-// Examples whose symmetry function types are all available on the GPU.
+// Examples whose symmetry function types are all available on the GPU. They
+// cover both launches of the symmetry function kernel: H2O_RPBE-D3 (1080
+// atoms, also used by the variants below) at or above largeLaunchAtoms (1024),
+// the others below.
 vector<string> const gpuSymmetryFunctionExamples = {"AlAuMgO_4G",
                                                     "Carbon_chain_4G",
                                                     "Cu2S_PBE",
