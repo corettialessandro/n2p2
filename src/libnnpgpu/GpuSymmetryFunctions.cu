@@ -19,6 +19,9 @@
 #include "GpuError.h"
 #include <climits>   // INT_MAX
 #include <cmath>     // std::exp, std::pow
+#include <iterator>  // std::prev
+#include <map>       // std::multimap
+#include <mutex>     // std::mutex, std::lock_guard
 #include <stdexcept> // std::runtime_error
 #include <string>    // std::to_string
 
@@ -605,6 +608,74 @@ __global__ void gatherKernel(int           numTargets,
     }
 }
 
+/* Device memory released by GpuSymmetryFunctionData objects, kept for reuse:
+ * in training, the symmetry functions of the structures are freed and
+ * calculated again over and over, and cudaMalloc/cudaFree are slow and
+ * synchronize the device. A request takes the smallest cached block that fits
+ * and is at most twice as large, otherwise new memory (25% headroom). Cached
+ * blocks beyond a quarter of the cache budget of the process
+ * (gpuDefaultCacheBudget()) are freed, largest first. One pool per process,
+ * which uses one device.
+ */
+class DevicePool
+{
+public:
+    DevicePool() : cached(0), limit(nnp::gpuDefaultCacheBudget() / 4) {}
+    void* get(size_t required, size_t& bytes)
+    {
+        lock_guard<mutex> lock(m);
+        auto it = blocks.lower_bound(required);
+        if (it != blocks.end() && it->first <= 2 * required)
+        {
+            bytes = it->first;
+            void* p = it->second;
+            cached -= bytes;
+            blocks.erase(it);
+            return p;
+        }
+        bytes = required + required / 4;
+        void* p = nullptr;
+        if (cudaMalloc(&p, bytes) != cudaSuccess)
+        {
+            // Out of memory: give the cached blocks back and try once more.
+            (void)cudaGetLastError();
+            for (auto const& b : blocks) cudaFree(b.second);
+            blocks.clear();
+            cached = 0;
+            NNP_CUDA_CHECK(cudaMalloc(&p, bytes));
+        }
+        return p;
+    }
+    // No checks: also called from destructors, which must not throw.
+    void put(void* p, size_t bytes)
+    {
+        if (p == nullptr) return;
+        lock_guard<mutex> lock(m);
+        blocks.emplace(bytes, p);
+        cached += bytes;
+        while (cached > limit && !blocks.empty())
+        {
+            auto it = prev(blocks.end());
+            cudaFree(it->second);
+            cached -= it->first;
+            blocks.erase(it);
+        }
+    }
+
+private:
+    mutex                     m;
+    multimap<size_t, void*>   blocks;
+    size_t                    cached;
+    size_t                    limit;
+};
+
+// Never destroyed: at exit the CUDA context may already be gone.
+DevicePool& devicePool()
+{
+    static DevicePool* pool = new DevicePool();
+    return *pool;
+}
+
 /// Device memory that grows when needed and is kept for later use.
 struct Buffer
 {
@@ -615,13 +686,11 @@ struct Buffer
     void ensure(size_t required, size_t& total)
     {
         if (required <= bytes) return;
-        if (p != nullptr) NNP_CUDA_CHECK(cudaFree(p));
-        p = nullptr;
         total -= bytes;
+        devicePool().put(p, bytes);
+        p = nullptr;
         bytes = 0;
-        size_t const allocate = required + required / 4;
-        NNP_CUDA_CHECK(cudaMalloc(&p, allocate));
-        bytes = allocate;
+        p = devicePool().get(required, bytes);
         total += bytes;
     }
     template<typename T> T* get() const { return static_cast<T*>(p); }
@@ -913,7 +982,7 @@ GpuSymmetryFunctionData::~GpuSymmetryFunctionData()
                       &d.deriv, &d.values, &d.targetOffset, &d.targetContrib,
                       &d.weights, &d.contrib, &d.result})
     {
-        cudaFree(b->p);
+        devicePool().put(b->p, b->bytes);
     }
     delete data;
 }
