@@ -84,11 +84,14 @@ public:
      *         angular).
      */
     static bool isSupported(int type);
+    /// Maximum number of elements of a model.
+    static std::size_t const maxElements = 32;
     /** Copy the parameters of all symmetry functions to the current device.
      *
      * @param[in] symmetryFunctions Symmetry functions of each element.
      *
-     * Throws std::runtime_error for unsupported types or inconsistent input.
+     * Throws std::runtime_error for unsupported types, more than maxElements
+     * elements or inconsistent input.
      */
     GpuSymmetryFunctionSet(
         std::vector<std::vector<GpuSymmetryFunction>> const&

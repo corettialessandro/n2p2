@@ -212,9 +212,18 @@ __device__ double powInt(double x, int n)
  * neighbors are therefore computed twice (once by each thread), values are
  * halved. The derivatives with respect to the position of the atom itself
  * follow from translation invariance (see contract()).
+ *
+ * The neighbors are grouped by element (in their order) once per atom: each
+ * chunk assigns the threads to the neighbors of its elements only, and the
+ * angular loop of a thread runs over the neighbors of the partner element
+ * only, in the same order as over all neighbors (same sums per thread).
+ * Dynamic shared memory: 2 doubles and 1 int per neighbor, for up to
+ * neighborStride neighbors.
  */
 __global__ void calculateKernel(Chunk const*  chunks,
                                 int const*    chunkOffset,
+                                int           numElements,
+                                int           neighborStride,
                                 int const*    atomElement,
                                 int const*    valueOffset,
                                 int const*    neighborOffset,
@@ -225,8 +234,12 @@ __global__ void calculateKernel(Chunk const*  chunks,
                                 double*       values,
                                 double*       deriv)
 {
-    // Cutoff function and derivative of each neighbor for the current chunk.
+    // Cutoff function and derivative of each neighbor for the current chunk,
+    // then the neighbors grouped by element.
     extern __shared__ double cache[];
+    int* order = reinterpret_cast<int*>(cache + 2 * neighborStride);
+    __shared__ int elementOffset[nnp::GpuSymmetryFunctionSet::maxElements + 1];
+    __shared__ int position[nnp::GpuSymmetryFunctionSet::maxElements];
     __shared__ Chunk ch;
     __shared__ double partial[warpsPerBlock][maxMembers];
 
@@ -239,6 +252,18 @@ __global__ void calculateKernel(Chunk const*  chunks,
     int const numNeighbors = neighborOffset[atom + 1] - n0;
     double const* geometry = neighborGeometry + 4 * static_cast<size_t>(n0);
     int const* elements = neighborElement + n0;
+
+    if (tid == 0)
+    {
+        for (int e = 0; e <= numElements; ++e) elementOffset[e] = 0;
+        for (int j = 0; j < numNeighbors; ++j) elementOffset[elements[j] + 1]++;
+        for (int e = 0; e < numElements; ++e)
+        {
+            elementOffset[e + 1] += elementOffset[e];
+            position[e] = elementOffset[e];
+        }
+        for (int j = 0; j < numNeighbors; ++j) order[position[elements[j]]++] = j;
+    }
 
     for (int c = chunkOffset[element]; c < chunkOffset[element + 1]; ++c)
     {
@@ -269,11 +294,17 @@ __global__ void calculateKernel(Chunk const*  chunks,
 
         double g[maxMembers];
         for (int m = 0; m < maxMembers; ++m) g[m] = 0.0;
-        for (int j = tid; j < numNeighbors; j += blockDim.x)
+        // Neighbors of element e1, then of e2.
+        int const b1 = elementOffset[ch.e1];
+        int const n1 = elementOffset[ch.e1 + 1] - b1;
+        int const b2 = elementOffset[ch.e2];
+        int const n2 = (ch.e2 != ch.e1) ? elementOffset[ch.e2 + 1] - b2 : 0;
+        for (int w = tid; w < n1 + n2; w += blockDim.x)
         {
+            int const j = order[w < n1 ? b1 + w : b2 + w - n1];
             int const ej = elements[j];
             double const rij = geometry[4 * j];
-            if (!(rij < rc) || (ej != ch.e1 && ej != ch.e2)) continue;
+            if (!(rij < rc)) continue;
             double const* drij = geometry + 4 * j + 1;
             double const pfcij = cache[2 * j];
             double const pdfcij = cache[2 * j + 1];
@@ -310,12 +341,12 @@ __global__ void calculateKernel(Chunk const*  chunks,
                 dg[m][1] = 0.0;
                 dg[m][2] = 0.0;
             }
-            for (int k = 0; k < numNeighbors; ++k)
+            // Neighbors of the partner element.
+            int const ep = (ej == ch.e1) ? ch.e2 : ch.e1;
+            for (int q = elementOffset[ep]; q < elementOffset[ep + 1]; ++q)
             {
+                int const k = order[q];
                 if (k == j) continue;
-                int const ek = elements[k];
-                if (!((ch.e1 == ej && ch.e2 == ek) ||
-                      (ch.e2 == ej && ch.e1 == ek))) continue;
                 double const rik = geometry[4 * k];
                 if (!(rik < rc)) continue;
                 double const* drik = geometry + 4 * k + 1;
@@ -744,6 +775,11 @@ GpuSymmetryFunctionSet::GpuSymmetryFunctionSet(
     try
     {
         int const numElements = symmetryFunctions.size();
+        if (numElements > static_cast<int>(maxElements))
+        {
+            throw runtime_error("ERROR: Too many elements for GPU symmetry "
+                                "functions.\n");
+        }
         d.numElements = numElements;
         vector<Chunk> chunks;
         vector<int> chunkOffset(1, 0);
@@ -1131,9 +1167,12 @@ void GpuSymmetryFunctionData::calculate(GpuSymmetryFunctionSet const& set,
         }
         calculateKernel<<<numAtoms,
                           threadsPerBlock,
-                          2 * maxNeighborsStructure * sizeof(double)>>>(
+                          maxNeighborsStructure
+                          * (2 * sizeof(double) + sizeof(int))>>>(
             s.chunks,
             s.chunkOffset,
+            s.numElements,
+            maxNeighborsStructure,
             d.atomElement.get<int>(),
             d.valueOffset.get<int>(),
             d.neighborOffset.get<int>(),
