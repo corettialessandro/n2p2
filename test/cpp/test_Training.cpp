@@ -858,5 +858,17 @@ BOOST_FIXTURE_TEST_CASE(TrainStage2_4G_Memorized_GpuForces_MatchesCpu,
     requireSameLearningCurve(cpu, gpu);
 }
 
+BOOST_FIXTURE_TEST_CASE(TrainStage2_4G_CutForceGroup_GpuNetworks_MatchesCpu,
+                        FixtureRepairDir)
+{
+    // An epoch ends inside a group of force updates (see
+    // Stage2_4G_MemorizeSymfuncResults_DoesNotChangeTrainingErrors): the
+    // errors of that structure re-evaluate the electronegativity network
+    // on the GPU with the charge equilibration still cached.
+    vector<double> const gpu = trainStage2Epochs4G(false, 2, "0.1", true);
+    vector<double> const cpu = trainStage2Epochs4G(false, 2, "0.1", false);
+    requireSameLearningCurve(cpu, gpu);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 #endif
