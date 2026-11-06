@@ -16,6 +16,7 @@
 
 #include "GpuDevice.h"
 #include "GpuError.h"
+#include <algorithm> // std::max
 #include <cstdlib>   // std::getenv, std::atoi
 #include <stdexcept> // std::runtime_error
 #include <string>    // std::string, std::to_string
@@ -59,6 +60,20 @@ int gpuLocalRank()
         if (value != nullptr) return atoi(value);
     }
     return 0;
+}
+
+int gpuLocalSize()
+{
+    char const* const names[] = {"OMPI_COMM_WORLD_LOCAL_SIZE",
+                                 "MPI_LOCALNRANKS",
+                                 "MV2_COMM_WORLD_LOCAL_SIZE",
+                                 "SLURM_NTASKS_PER_NODE"};
+    for (char const* name : names)
+    {
+        char const* value = getenv(name);
+        if (value != nullptr && atoi(value) > 0) return atoi(value);
+    }
+    return 1;
 }
 
 int gpuSelectDevice()
@@ -108,6 +123,16 @@ int gpuCurrentDevice()
     int device = 0;
     NNP_CUDA_CHECK(cudaGetDevice(&device));
     return device;
+}
+
+size_t gpuDefaultCacheBudget()
+{
+    size_t free = 0;
+    size_t total = 0;
+    NNP_CUDA_CHECK(cudaMemGetInfo(&free, &total));
+    int const devices = max(gpuDeviceCount(), 1);
+    int const processes = (gpuLocalSize() + devices - 1) / devices;
+    return total / 2 / static_cast<size_t>(max(processes, 1));
 }
 
 string gpuDeviceName(int device)

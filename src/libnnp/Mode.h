@@ -341,6 +341,33 @@ public:
     void                     setNeuralNetworkGpuEnabled(
                                  std::string const& id,
                                  bool               enabled);
+    /** Switch the assembly of forces on the GPU on or off.
+     *
+     * @param[in] enabled Assemble forces on the GPU if true.
+     *
+     * Switched together with the GPU evaluation of the "short" neural
+     * networks (see setNeuralNetworkGpuEnabled()), i.e. on in GPU builds
+     * once their weights are set up. Switching it separately is internal,
+     * for tests. Throws std::runtime_error when enabling the GPU in a CPU
+     * build.
+     *
+     * The GPU assembles the forces of a structure from its second force
+     * calculation with the same geometry on, if its topology fits into the
+     * memory budget (see assembleForcesGpu()); otherwise the CPU does.
+     */
+    void                     setForceAssemblyGpuEnabled(bool enabled);
+    /** Check if forces are assembled on the GPU.
+     */
+    bool                     isForceAssemblyGpuEnabled() const;
+    /** Number of force calculations assembled on the GPU and on the CPU.
+     *
+     * @param[out] gpu Force calculations assembled on the GPU.
+     * @param[out] cpu Force calculations assembled on the CPU.
+     *
+     * Counted since the GPU force assembly was enabled (GPU builds).
+     */
+    void                     getForceAssemblyCounts(std::size_t& gpu,
+                                                    std::size_t& cpu) const;
     /** Read in atomic hardness of all elements from files (4G-HDNNP).
      *
      * @param[in] fileNameFormat Name format of file containing atomic
@@ -733,6 +760,34 @@ protected:
                                            Structure&         structure,
                                            bool const         derivatives,
                                            std::string const& id);
+    /** Short-range forces and 4G electrostatic dChi/dr sums from the GPU
+     * force assembly, if worthwhile.
+     *
+     * @param[in] structure Input structure (with symmetry function
+     *                      derivatives, dEdG and, for 4G, dChidG).
+     * @param[in] lambdaTotal Lagrange multipliers for the total forces (4G).
+     * @param[in] lambdaElec Lagrange multipliers for the electrostatic
+     *                       forces (4G).
+     * @param[out] shortForces Short-range force on each atom.
+     * @param[out] sumTotal As calculateDChidrSums() (4G).
+     * @param[out] sumElec As calculateDChidrSums() (4G).
+     *
+     * @return False if the forces are to be assembled on the CPU.
+     *
+     * The topology (symmetry function derivatives) is copied to the GPU and
+     * kept with the structure (Structure::gpuData) at the second call for
+     * the same geometry (Structure::geometryStamp), so later calls only copy
+     * the new weights. Building it costs more than a force calculation on
+     * the CPU, so a geometry used once is left to the CPU, as is a structure
+     * whose topology would exceed the memory budget of this process.
+     */
+    bool                     assembleForcesGpu(
+                                   Structure&             structure,
+                                   Eigen::VectorXd const& lambdaTotal,
+                                   Eigen::VectorXd const& lambdaElec,
+                                   std::vector<Vec3D>&    shortForces,
+                                   std::vector<Vec3D>&    sumTotal,
+                                   std::vector<Vec3D>&    sumElec) const;
     /** Propagate all atoms of a structure through their networks on the
      * GPU, one batch per element.
      *
@@ -816,6 +871,13 @@ protected:
     std::vector<
     std::vector<double>>       cutoffs;
     ErfcBuf                    erfcBuf;
+    /// If forces are assembled on the GPU (GPU builds).
+    bool                       gpuForceAssembly;
+    /// Device memory budget for force assembly topologies (GPU builds).
+    std::size_t                gpuForceBudget;
+    /// Force calculations assembled on the GPU and on the CPU.
+    mutable std::size_t        gpuForceCountGpu;
+    mutable std::size_t        gpuForceCountCpu;
 
 private:
     /** Short-range force contributions of the neighbors of each atom.

@@ -20,7 +20,8 @@
 // Selection of the CUDA device used by this process. Plain C++ interface,
 // included from code compiled without nvcc.
 
-#include <string> // std::string
+#include <cstddef> // std::size_t
+#include <string>  // std::string
 
 namespace nnp
 {
@@ -39,6 +40,15 @@ int         gpuDeviceCount();
  * @return Local rank, 0 if none of these variables is set.
  */
 int         gpuLocalRank();
+/** Number of processes on the node of this process.
+ *
+ * Read from the environment set by the MPI launcher, checking in this order:
+ * OMPI_COMM_WORLD_LOCAL_SIZE (Open MPI), MPI_LOCALNRANKS (MPICH, Intel MPI),
+ * MV2_COMM_WORLD_LOCAL_SIZE (MVAPICH2) and SLURM_NTASKS_PER_NODE (srun).
+ *
+ * @return Local size, 1 if none of these variables is set.
+ */
+int         gpuLocalSize();
 /** Select the CUDA device of this process.
  *
  * Processes on a node are spread over its devices: the device index is the
@@ -65,6 +75,15 @@ int         gpuRequireDevice();
 /** Index of the CUDA device currently used by this process.
  */
 int         gpuCurrentDevice();
+/** Device memory a process should use for caches.
+ *
+ * Half of the memory of its device, shared by the processes of the
+ * node using this device (gpuLocalSize() divided by the number of devices,
+ * rounded up).
+ *
+ * @return Memory in bytes.
+ */
+std::size_t gpuDefaultCacheBudget();
 /** Name of a CUDA device, e.g. "NVIDIA A100-SXM-64GB".
  *
  * @param[in] device Device index.

@@ -16,10 +16,14 @@
 
 #include "Kspace.h"
 #include "Structure.h"
+#ifdef N2P2_GPU
+#include "GpuForceAssembly.h"
+#endif
 #include "Vec3D.h"
 #include "utility.h"
 #include <Eigen/Dense> // MatrixXd, VectorXd
 #include <algorithm>   // std::max
+#include <atomic>      // std::atomic
 #include <cmath>       // fabs, erf
 #include <cstdlib>     // atof
 #include <limits>      // std::numeric_limits
@@ -39,6 +43,7 @@ Structure::Structure() :
     NeighborListIsSorted          (false     ),
     hasSymmetryFunctions          (false     ),
     hasSymmetryFunctionDerivatives(false     ),
+    geometryStamp                 (0         ),
     index                         (0         ),
     numAtoms                      (0         ),
     numElements                   (0         ),
@@ -1288,6 +1293,48 @@ void Structure::remap(Atom& atom)
     return;
 }
 
+Structure::GpuData::GpuData() :
+    forceTopology      (NULL),
+    forceTopologyStamp (0   ),
+    forceTopologyCutoff(0.0 ),
+    lastForceStamp     (0   )
+{
+}
+
+Structure::GpuData::GpuData(GpuData const&) : GpuData()
+{
+}
+
+Structure::GpuData& Structure::GpuData::operator=(GpuData const&)
+{
+    clear();
+    return *this;
+}
+
+Structure::GpuData::~GpuData()
+{
+    clear();
+}
+
+void Structure::GpuData::clear()
+{
+#ifdef N2P2_GPU
+    delete forceTopology;
+#endif
+    forceTopology = NULL;
+    forceTopologyStamp = 0;
+    forceTopologyCutoff = 0.0;
+    lastForceStamp = 0;
+
+    return;
+}
+
+size_t Structure::newGeometryStamp()
+{
+    static atomic<size_t> lastStamp(0);
+    return ++lastStamp;
+}
+
 void Structure::toNormalizedUnits(double meanEnergy,
                                   double convEnergy,
                                   double convLength,
@@ -1318,6 +1365,8 @@ void Structure::toNormalizedUnits(double meanEnergy,
     {
         it->toNormalizedUnits(convEnergy, convLength, convCharge);
     }
+    // Symmetry function derivatives were converted.
+    if (geometryStamp != 0) geometryStamp = newGeometryStamp();
 
     return;
 }
@@ -1352,6 +1401,8 @@ void Structure::toPhysicalUnits(double meanEnergy,
     {
         it->toPhysicalUnits(convEnergy, convLength, convCharge);
     }
+    // Symmetry function derivatives were converted.
+    if (geometryStamp != 0) geometryStamp = newGeometryStamp();
 
     return;
 }
@@ -1364,6 +1415,8 @@ void Structure::freeAtoms(bool all, double const maxCutoffRadius)
     }
     if (all) hasSymmetryFunctions = false;
     hasSymmetryFunctionDerivatives = false;
+    geometryStamp = 0;
+    gpuData.clear();
 
     return;
 }
@@ -1375,7 +1428,9 @@ void Structure::reset()
     hasNeighborList                = false     ;
     hasSymmetryFunctions           = false     ;
     hasSymmetryFunctionDerivatives = false     ;
+    geometryStamp                  = 0         ;
     index                          = 0         ;
+    gpuData.clear();
     numAtoms                       = 0         ;
     numElementsPresent             = 0         ;
     energy                         = 0.0       ;
@@ -1417,6 +1472,8 @@ void Structure::clearNeighborList()
     hasNeighborList = false;
     hasSymmetryFunctions = false;
     hasSymmetryFunctionDerivatives = false;
+    geometryStamp = 0;
+    gpuData.clear();
 
     return;
 }
