@@ -38,15 +38,16 @@ int const warpsPerBlock = threadsPerBlock / 32;
 /* calculateKernel launch: 64 threads per atom (8 blocks per SM, i.e. at
  * most 65536 / (64 * 8) = 128 registers per thread) from largeLaunchAtoms
  * atoms per launch on, else 128 threads (4 blocks per SM, same register
- * limit). A fixed rule depending only on the launch, not on the device, so a
- * structure always gets the same results (the values depend on the
- * reduction order, the derivatives do not). Measured on A100 with 2G water
- * (6.4 A cutoff): with many atoms the smaller blocks leave fewer threads
- * idle and raise the occupancy (2G MD 13-16% faster); with few atoms per
- * launch the device is not filled, and the larger blocks finish each atom
- * sooner (20% faster than 64 threads for 270 atoms per launch).
+ * limit). The results do not
+ * depend on the block size (see calculateKernel), so this is a pure
+ * performance choice. Measured on A100 with 2G water (6.4 A cutoff, 32 ranks
+ * on 4 GPUs with MPS): 128 threads for 270 atoms per launch 25% faster than
+ * 64 in MD; 64 threads slightly faster from about 2000 atoms per launch on.
  */
 int const largeLaunchAtoms = 1024;
+/// Shared memory per block of calculateKernel in the normal case (up to 4
+/// blocks per SM on A100).
+size_t const sharedBudget = 40 * 1024;
 int const threadsPerTarget = 32;
 int const maxWeightVectors = 3;
 
@@ -95,6 +96,8 @@ struct Chunk
     int    e2;
     int    numMembers;
     Cutoff cutoff;
+    /// Index of the cutoff among the distinct cutoffs of the element.
+    int    cutoffSlot;
     /// Index of the value among the symmetry functions of the element.
     int    index[maxMembers];
     /// Index of the derivative for a neighbor of element e1 and e2.
@@ -217,46 +220,226 @@ __device__ double powInt(double x, int n)
     return result;
 }
 
-/* One block per atom, one thread per neighbor j (strided). For each chunk the
- * thread computes all contributions to the symmetry functions involving
- * neighbor j and, as it is the only thread writing them, the derivatives
- * with respect to the position of neighbor j. Angular terms of each pair of
- * neighbors are therefore computed twice (once by each thread), values are
- * halved. The derivatives with respect to the position of the atom itself
- * follow from translation invariance (see contract()).
+/* Contributions of neighbor w (local index among the neighbors of the chunk's
+ * elements: those of e1, then those of e2) to the symmetry functions of the
+ * chunk, added to g, and the derivatives with respect to its position, which
+ * only this call writes. Angular terms of each pair of neighbors are computed
+ * twice (once for each neighbor), values are halved later. cache: cutoff
+ * function and derivative of the chunk's cutoff for each neighbor j.
+ */
+__device__ __forceinline__ void neighborTerms(Chunk const&  ch,
+                                              int           w,
+                                              int           n1,
+                                              int           b1,
+                                              int           b2,
+                                              int const*    order,
+                                              int const*    elementOffset,
+                                              int const*    elements,
+                                              double const* geometry,
+                                              double const* cache,
+                                              int           n0,
+                                              int const*    derivOffset,
+                                              bool          derivatives,
+                                              double*       deriv,
+                                              double        (&g)[maxMembers])
+{
+    double const rc = ch.cutoff.rc;
+    int const j = order[w < n1 ? b1 + w : b2 + w - n1];
+    int const ej = elements[j];
+    double const rij = geometry[4 * j];
+    if (!(rij < rc)) return;
+    double const* drij = geometry + 4 * j + 1;
+    double const pfcij = cache[2 * j];
+    double const pdfcij = cache[2 * j + 1];
+    double* dj = derivatives
+               ? deriv + 3 * static_cast<size_t>(derivOffset[n0 + j])
+               : nullptr;
+    if (ch.kind == RADIAL)
+    {
+        #pragma unroll
+        for (int m = 0; m < maxMembers; ++m)
+        {
+            if (m >= ch.numMembers) continue;
+            double const rijs = rij - ch.rs[m];
+            double const pexp = exp(-ch.eta[m] * rijs * rijs);
+            g[m] += pexp * pfcij;
+            if (!derivatives) continue;
+            double const p1 = ch.scaleFactor[m]
+                            * (pdfcij - 2.0 * ch.eta[m] * rijs
+                               * pfcij) * pexp / rij;
+            double* d = dj + 3 * ch.deriv1[m];
+            d[0] = -p1 * drij[0];
+            d[1] = -p1 * drij[1];
+            d[2] = -p1 * drij[2];
+        }
+        return;
+    }
+
+    bool const narrow = (ch.kind == ANGULAR_NARROW);
+    double const r2ij = rij * rij;
+    double dg[maxMembers][3];
+    for (int m = 0; m < maxMembers; ++m)
+    {
+        dg[m][0] = 0.0;
+        dg[m][1] = 0.0;
+        dg[m][2] = 0.0;
+    }
+    // Neighbors of the partner element.
+    int const ep = (ej == ch.e1) ? ch.e2 : ch.e1;
+    for (int q = elementOffset[ep]; q < elementOffset[ep + 1]; ++q)
+    {
+        int const k = order[q];
+        if (k == j) continue;
+        double const rik = geometry[4 * k];
+        if (!(rik < rc)) continue;
+        double const* drik = geometry + 4 * k + 1;
+        double const drjk[3] = {drik[0] - drij[0],
+                                drik[1] - drij[1],
+                                drik[2] - drij[2]};
+        double rjk = 0.0;
+        double pfcjk = 1.0;
+        double pdfcjk = 0.0;
+        if (narrow)
+        {
+            double const r2jk = drjk[0] * drjk[0]
+                              + drjk[1] * drjk[1]
+                              + drjk[2] * drjk[2];
+            if (!(r2jk < rc * rc)) continue;
+            rjk = sqrt(r2jk);
+            cutoffFunction(ch.cutoff, rjk, pfcjk, pdfcjk);
+        }
+        double const pfcik = cache[2 * k];
+        double const rinvijik = 1.0 / rij / rik;
+        double const costijk = (drij[0] * drik[0] +
+                                drij[1] * drik[1] +
+                                drij[2] * drik[2]) * rinvijik;
+        double const pfc = narrow ? pfcij * pfcik * pfcjk
+                                  : pfcij * pfcik;
+        double rijs = 0.0;
+        double riks = 0.0;
+        double rjks = 0.0;
+        double pexp = 0.0;
+        #pragma unroll
+        for (int m = 0; m < maxMembers; ++m)
+        {
+            if (m >= ch.numMembers) continue;
+            if (ch.newExp[m])
+            {
+                rijs = rij - ch.rs[m];
+                riks = rik - ch.rs[m];
+                if (narrow)
+                {
+                    rjks = rjk - ch.rs[m];
+                    pexp = exp(-ch.eta[m] * (rijs * rijs +
+                                             riks * riks +
+                                             rjks * rjks));
+                }
+                else
+                {
+                    pexp = exp(-ch.eta[m] * (rijs * rijs +
+                                             riks * riks));
+                }
+            }
+            double const plambda = 1.0 + ch.lambda[m] * costijk;
+            double fg = pexp;
+            if (plambda <= 0.0) fg = 0.0;
+            else if (ch.useIntegerPow[m])
+            {
+                fg *= powInt(plambda, ch.zetaInt[m] - 1);
+            }
+            else fg *= pow(plambda, ch.zeta[m] - 1.0);
+            g[m] += fg * plambda * pfc;
+            if (!derivatives) continue;
+            fg *= ch.pnorm[m];
+            double const rinv = rinvijik * ch.pzl[m];
+            double const cost = costijk * ch.pzl[m];
+            double const p2etapl = 2.0 * ch.eta[m] * plambda;
+            double p1;
+            double p3;
+            if (narrow)
+            {
+                p1 = fg * (pfc * (rinv - cost / r2ij
+                                  - p2etapl * rijs / rij)
+                           + pfcik * pfcjk * pdfcij * plambda / rij);
+                p3 = fg * (pfc * (rinv + p2etapl * rjks / rjk)
+                           - pfcij * pfcik * pdfcjk * plambda / rjk);
+            }
+            else
+            {
+                p1 = fg * (pfc * (rinv - cost / r2ij
+                                  - p2etapl * rijs / rij)
+                           + pfcik * pdfcij * plambda / rij);
+                p3 = fg * pfc * rinv;
+            }
+            dg[m][0] -= p1 * drij[0] + p3 * drjk[0];
+            dg[m][1] -= p1 * drij[1] + p3 * drjk[1];
+            dg[m][2] -= p1 * drij[2] + p3 * drjk[2];
+        }
+    }
+    if (!derivatives) return;
+    #pragma unroll
+    for (int m = 0; m < maxMembers; ++m)
+    {
+        if (m >= ch.numMembers) continue;
+        int const index = (ej == ch.e1) ? ch.deriv1[m] : ch.deriv2[m];
+        double* d = dj + 3 * index;
+        d[0] = dg[m][0] * ch.scaleFactor[m];
+        d[1] = dg[m][1] * ch.scaleFactor[m];
+        d[2] = dg[m][2] * ch.scaleFactor[m];
+    }
+}
+
+/* One block per atom. Work items: slices of 32 neighbors of a chunk (the
+ * neighbors of the chunk's elements, those of e1 then those of e2, grouped by
+ * element once per atom in their order). The warps of the block take the
+ * items of all chunks of the atom one after the other, whichever warp is
+ * free next, so items of different chunks run in parallel: many small chunks
+ * (e.g. rare element pairs) do not leave most threads idle, and no block-wide
+ * synchronization is needed per chunk. Each neighbor of an item is done by
+ * one lane (neighborTerms()), which writes its derivatives; the derivatives
+ * with respect to the position of the atom itself follow from translation
+ * invariance (see contract()). The cutoff function of each neighbor is
+ * calculated once per atom for each distinct cutoff of the element.
  *
- * The neighbors are grouped by element (in their order) once per atom: each
- * chunk assigns the threads to the neighbors of its elements only, and the
- * angular loop of a thread runs over the neighbors of the partner element
- * only, in the same order as over all neighbors (same sums per thread).
- * Dynamic shared memory: 2 doubles and 1 int per neighbor, for up to
- * neighborStride neighbors.
+ * Values: each item is summed over the 32 lanes of its warp in a fixed
+ * order, and the items of a chunk are added in their order (after the
+ * items of a wave of at most `capacity` items are done). The results
+ * therefore depend neither on the block size, nor on the capacity, nor on
+ * which warp does which item: these are pure performance choices.
+ *
+ * Dynamic shared memory: cutoff function and derivative of each neighbor for
+ * each distinct cutoff (maxCutoffs * 2 * neighborStride doubles), item sums
+ * (capacity * maxMembers doubles), chunk sums (maxChunks * maxMembers
+ * doubles), neighbors grouped by element (neighborStride ints), first item of
+ * each chunk (maxChunks + 1 ints).
  */
 template<int threads, int minBlocks>
 __global__ void __launch_bounds__(threads, minBlocks)
 calculateKernel(Chunk const*  chunks,
-                                int const*    chunkOffset,
-                                int           numElements,
-                                int           neighborStride,
-                                int const*    atomElement,
-                                int const*    valueOffset,
-                                int const*    neighborOffset,
-                                int const*    neighborElement,
-                                double const* neighborGeometry,
-                                int const*    derivOffset,
-                                bool          derivatives,
-                                double*       values,
-                                double*       deriv)
+                int const*    chunkOffset,
+                Cutoff const* cutoffs,
+                int const*    cutoffOffset,
+                int           numElements,
+                int           neighborStride,
+                int           maxCutoffs,
+                int           maxChunks,
+                int           capacity,
+                int const*    atomElement,
+                int const*    valueOffset,
+                int const*    neighborOffset,
+                int const*    neighborElement,
+                double const* neighborGeometry,
+                int const*    derivOffset,
+                bool          derivatives,
+                double*       values,
+                double*       deriv)
 {
-    // Cutoff function and derivative of each neighbor for the current chunk,
-    // then the neighbors grouped by element.
-    extern __shared__ double cache[];
-    int* order = reinterpret_cast<int*>(cache + 2 * neighborStride);
+    extern __shared__ double shared[];
     __shared__ int elementOffset[nnp::GpuSymmetryFunctionSet::maxElements + 1];
     __shared__ int position[nnp::GpuSymmetryFunctionSet::maxElements];
-    __shared__ Chunk ch;
-    int const warps = threads / 32;
-    __shared__ double partial[threads / 32][maxMembers];
+    __shared__ Chunk warpChunk[threads / 32];
+    __shared__ int nextItem;
+    __shared__ int numItems;
 
     int const atom = blockIdx.x;
     int const tid = threadIdx.x;
@@ -267,6 +450,26 @@ calculateKernel(Chunk const*  chunks,
     int const numNeighbors = neighborOffset[atom + 1] - n0;
     double const* geometry = neighborGeometry + 4 * static_cast<size_t>(n0);
     int const* elements = neighborElement + n0;
+    size_t const stride = 2 * static_cast<size_t>(neighborStride);
+    double* cache = shared;
+    double* partial = cache + stride * maxCutoffs;
+    double* accum = partial + static_cast<size_t>(capacity) * maxMembers;
+    int* order = reinterpret_cast<int*>(accum
+                                        + static_cast<size_t>(maxChunks)
+                                        * maxMembers);
+    int* itemOffset = order + neighborStride;
+    Chunk const* chunksElement = chunks + chunkOffset[element];
+    int const numChunks = chunkOffset[element + 1] - chunkOffset[element];
+    Cutoff const* cutoffsElement = cutoffs + cutoffOffset[element];
+    int const numCutoffs = cutoffOffset[element + 1] - cutoffOffset[element];
+
+    // Number of neighbors of the elements of a chunk.
+    auto chunkNeighbors = [&](Chunk const& c)
+    {
+        int const n = elementOffset[c.e1 + 1] - elementOffset[c.e1];
+        return (c.e2 != c.e1) ? n + elementOffset[c.e2 + 1]
+                                  - elementOffset[c.e2] : n;
+    };
 
     if (tid == 0)
     {
@@ -278,210 +481,137 @@ calculateKernel(Chunk const*  chunks,
             position[e] = elementOffset[e];
         }
         for (int j = 0; j < numNeighbors; ++j) order[position[elements[j]]++] = j;
+        itemOffset[0] = 0;
+        for (int c = 0; c < numChunks; ++c)
+        {
+            itemOffset[c + 1] = itemOffset[c]
+                              + (chunkNeighbors(chunksElement[c]) + 31) / 32;
+        }
+        numItems = itemOffset[numChunks];
     }
-
-    for (int c = chunkOffset[element]; c < chunkOffset[element + 1]; ++c)
+    for (int i = tid; i < numCutoffs * numNeighbors; i += blockDim.x)
     {
-        __syncthreads();
-        int const* src = reinterpret_cast<int const*>(chunks + c);
-        int* dst = reinterpret_cast<int*>(&ch);
-        for (int i = tid; i < static_cast<int>(sizeof(Chunk) / sizeof(int));
-             i += blockDim.x)
-        {
-            dst[i] = src[i];
-        }
-        __syncthreads();
-        double const rc = ch.cutoff.rc;
-        for (int j = tid; j < numNeighbors; j += blockDim.x)
-        {
-            double const r = geometry[4 * j];
-            int const ej = elements[j];
-            double fc = 0.0;
-            double dfc = 0.0;
-            if (r < rc && (ej == ch.e1 || ej == ch.e2))
-            {
-                cutoffFunction(ch.cutoff, r, fc, dfc);
-            }
-            cache[2 * j] = fc;
-            cache[2 * j + 1] = dfc;
-        }
-        __syncthreads();
-
-        double g[maxMembers];
-        for (int m = 0; m < maxMembers; ++m) g[m] = 0.0;
-        // Neighbors of element e1, then of e2.
-        int const b1 = elementOffset[ch.e1];
-        int const n1 = elementOffset[ch.e1 + 1] - b1;
-        int const b2 = elementOffset[ch.e2];
-        int const n2 = (ch.e2 != ch.e1) ? elementOffset[ch.e2 + 1] - b2 : 0;
-        for (int w = tid; w < n1 + n2; w += blockDim.x)
-        {
-            int const j = order[w < n1 ? b1 + w : b2 + w - n1];
-            int const ej = elements[j];
-            double const rij = geometry[4 * j];
-            if (!(rij < rc)) continue;
-            double const* drij = geometry + 4 * j + 1;
-            double const pfcij = cache[2 * j];
-            double const pdfcij = cache[2 * j + 1];
-            double* dj = derivatives
-                       ? deriv + 3 * static_cast<size_t>(derivOffset[n0 + j])
-                       : nullptr;
-            if (ch.kind == RADIAL)
-            {
-                #pragma unroll
-                for (int m = 0; m < maxMembers; ++m)
-                {
-                    if (m >= ch.numMembers) continue;
-                    double const rijs = rij - ch.rs[m];
-                    double const pexp = exp(-ch.eta[m] * rijs * rijs);
-                    g[m] += pexp * pfcij;
-                    if (!derivatives) continue;
-                    double const p1 = ch.scaleFactor[m]
-                                    * (pdfcij - 2.0 * ch.eta[m] * rijs
-                                       * pfcij) * pexp / rij;
-                    double* d = dj + 3 * ch.deriv1[m];
-                    d[0] = -p1 * drij[0];
-                    d[1] = -p1 * drij[1];
-                    d[2] = -p1 * drij[2];
-                }
-                continue;
-            }
-
-            bool const narrow = (ch.kind == ANGULAR_NARROW);
-            double const r2ij = rij * rij;
-            double dg[maxMembers][3];
-            for (int m = 0; m < maxMembers; ++m)
-            {
-                dg[m][0] = 0.0;
-                dg[m][1] = 0.0;
-                dg[m][2] = 0.0;
-            }
-            // Neighbors of the partner element.
-            int const ep = (ej == ch.e1) ? ch.e2 : ch.e1;
-            for (int q = elementOffset[ep]; q < elementOffset[ep + 1]; ++q)
-            {
-                int const k = order[q];
-                if (k == j) continue;
-                double const rik = geometry[4 * k];
-                if (!(rik < rc)) continue;
-                double const* drik = geometry + 4 * k + 1;
-                double const drjk[3] = {drik[0] - drij[0],
-                                        drik[1] - drij[1],
-                                        drik[2] - drij[2]};
-                double rjk = 0.0;
-                double pfcjk = 1.0;
-                double pdfcjk = 0.0;
-                if (narrow)
-                {
-                    double const r2jk = drjk[0] * drjk[0]
-                                      + drjk[1] * drjk[1]
-                                      + drjk[2] * drjk[2];
-                    if (!(r2jk < rc * rc)) continue;
-                    rjk = sqrt(r2jk);
-                    cutoffFunction(ch.cutoff, rjk, pfcjk, pdfcjk);
-                }
-                double const pfcik = cache[2 * k];
-                double const rinvijik = 1.0 / rij / rik;
-                double const costijk = (drij[0] * drik[0] +
-                                        drij[1] * drik[1] +
-                                        drij[2] * drik[2]) * rinvijik;
-                double const pfc = narrow ? pfcij * pfcik * pfcjk
-                                          : pfcij * pfcik;
-                double rijs = 0.0;
-                double riks = 0.0;
-                double rjks = 0.0;
-                double pexp = 0.0;
-                #pragma unroll
-                for (int m = 0; m < maxMembers; ++m)
-                {
-                    if (m >= ch.numMembers) continue;
-                    if (ch.newExp[m])
-                    {
-                        rijs = rij - ch.rs[m];
-                        riks = rik - ch.rs[m];
-                        if (narrow)
-                        {
-                            rjks = rjk - ch.rs[m];
-                            pexp = exp(-ch.eta[m] * (rijs * rijs +
-                                                     riks * riks +
-                                                     rjks * rjks));
-                        }
-                        else
-                        {
-                            pexp = exp(-ch.eta[m] * (rijs * rijs +
-                                                     riks * riks));
-                        }
-                    }
-                    double const plambda = 1.0 + ch.lambda[m] * costijk;
-                    double fg = pexp;
-                    if (plambda <= 0.0) fg = 0.0;
-                    else if (ch.useIntegerPow[m])
-                    {
-                        fg *= powInt(plambda, ch.zetaInt[m] - 1);
-                    }
-                    else fg *= pow(plambda, ch.zeta[m] - 1.0);
-                    g[m] += fg * plambda * pfc;
-                    if (!derivatives) continue;
-                    fg *= ch.pnorm[m];
-                    double const rinv = rinvijik * ch.pzl[m];
-                    double const cost = costijk * ch.pzl[m];
-                    double const p2etapl = 2.0 * ch.eta[m] * plambda;
-                    double p1;
-                    double p3;
-                    if (narrow)
-                    {
-                        p1 = fg * (pfc * (rinv - cost / r2ij
-                                          - p2etapl * rijs / rij)
-                                   + pfcik * pfcjk * pdfcij * plambda / rij);
-                        p3 = fg * (pfc * (rinv + p2etapl * rjks / rjk)
-                                   - pfcij * pfcik * pdfcjk * plambda / rjk);
-                    }
-                    else
-                    {
-                        p1 = fg * (pfc * (rinv - cost / r2ij
-                                          - p2etapl * rijs / rij)
-                                   + pfcik * pdfcij * plambda / rij);
-                        p3 = fg * pfc * rinv;
-                    }
-                    dg[m][0] -= p1 * drij[0] + p3 * drjk[0];
-                    dg[m][1] -= p1 * drij[1] + p3 * drjk[1];
-                    dg[m][2] -= p1 * drij[2] + p3 * drjk[2];
-                }
-            }
-            if (!derivatives) continue;
-            #pragma unroll
-            for (int m = 0; m < maxMembers; ++m)
-            {
-                if (m >= ch.numMembers) continue;
-                int const index = (ej == ch.e1) ? ch.deriv1[m] : ch.deriv2[m];
-                double* d = dj + 3 * index;
-                d[0] = dg[m][0] * ch.scaleFactor[m];
-                d[1] = dg[m][1] * ch.scaleFactor[m];
-                d[2] = dg[m][2] * ch.scaleFactor[m];
-            }
-        }
-
-        // Sum over all threads in a fixed order.
-        for (int m = 0; m < maxMembers; ++m)
-        {
-            double v = g[m];
-            for (int offset = 16; offset > 0; offset /= 2)
-            {
-                v += __shfl_down_sync(0xffffffff, v, offset);
-            }
-            if (lane == 0) partial[warp][m] = v;
-        }
-        __syncthreads();
-        if (tid < ch.numMembers)
-        {
-            double sum = 0.0;
-            for (int w = 0; w < warps; ++w) sum += partial[w][tid];
-            if (ch.kind != RADIAL) sum = 0.5 * sum * ch.pnorm[tid];
-            values[valueOffset[atom] + ch.index[tid]] =
-                ch.scaleOffset[tid]
-                + ch.scaleFactor[tid] * (sum - ch.scaleShift[tid]);
-        }
+        int const k = i / numNeighbors;
+        int const j = i % numNeighbors;
+        Cutoff const& cut = cutoffsElement[k];
+        double const r = geometry[4 * j];
+        double fc = 0.0;
+        double dfc = 0.0;
+        if (r < cut.rc) cutoffFunction(cut, r, fc, dfc);
+        cache[stride * k + 2 * j] = fc;
+        cache[stride * k + 2 * j + 1] = dfc;
     }
+    for (int i = tid; i < numChunks * maxMembers; i += blockDim.x)
+    {
+        accum[i] = 0.0;
+    }
+
+    int current = -1;
+    Chunk& ch = warpChunk[warp];
+    for (int wave = 0; true; wave += capacity)
+    {
+        if (tid == 0) nextItem = wave;
+        __syncthreads();
+        if (wave >= numItems) break;
+        int const waveEnd = min(numItems, wave + capacity);
+        while (true)
+        {
+            int item = 0;
+            if (lane == 0) item = atomicAdd(&nextItem, 1);
+            item = __shfl_sync(0xffffffff, item, 0);
+            if (item >= waveEnd) break;
+            int c = 0;
+            while (itemOffset[c + 1] <= item) ++c;
+            if (c != current)
+            {
+                int const* src = reinterpret_cast<int const*>(chunksElement
+                                                              + c);
+                int* dst = reinterpret_cast<int*>(&ch);
+                for (int i = lane;
+                     i < static_cast<int>(sizeof(Chunk) / sizeof(int));
+                     i += 32)
+                {
+                    dst[i] = src[i];
+                }
+                current = c;
+                __syncwarp();
+            }
+            int const b1 = elementOffset[ch.e1];
+            int const n1 = elementOffset[ch.e1 + 1] - b1;
+            int const b2 = elementOffset[ch.e2];
+            int const n = chunkNeighbors(ch);
+            int const w = 32 * (item - itemOffset[c]) + lane;
+            double g[maxMembers];
+            for (int m = 0; m < maxMembers; ++m) g[m] = 0.0;
+            if (w < n)
+            {
+                neighborTerms(ch, w, n1, b1, b2, order, elementOffset,
+                              elements, geometry,
+                              cache + stride * ch.cutoffSlot, n0,
+                              derivOffset, derivatives, deriv, g);
+            }
+            for (int m = 0; m < maxMembers; ++m)
+            {
+                double v = g[m];
+                for (int offset = 16; offset > 0; offset /= 2)
+                {
+                    v += __shfl_down_sync(0xffffffff, v, offset);
+                }
+                if (lane == 0)
+                {
+                    partial[(item - wave) * maxMembers + m] = v;
+                }
+            }
+        }
+        __syncthreads();
+        // Item sums of this wave added to their chunks, in item order.
+        for (int i = tid; i < numChunks * maxMembers; i += blockDim.x)
+        {
+            int const c = i / maxMembers;
+            int const m = i % maxMembers;
+            int const begin = max(itemOffset[c], wave);
+            int const end = min(itemOffset[c + 1], waveEnd);
+            for (int item = begin; item < end; ++item)
+            {
+                accum[i] += partial[(item - wave) * maxMembers + m];
+            }
+        }
+        __syncthreads();
+    }
+
+    // Scaled values.
+    for (int i = tid; i < numChunks * maxMembers; i += blockDim.x)
+    {
+        int const m = i % maxMembers;
+        Chunk const& c = chunksElement[i / maxMembers];
+        if (m >= c.numMembers) continue;
+        double sum = accum[i];
+        if (c.kind != RADIAL) sum = 0.5 * sum * c.pnorm[m];
+        values[valueOffset[atom] + c.index[m]] =
+            c.scaleOffset[m] + c.scaleFactor[m] * (sum - c.scaleShift[m]);
+    }
+}
+
+typedef void (*CalculateKernel)(Chunk const*, int const*, Cutoff const*,
+                                int const*, int, int, int, int, int,
+                                int const*, int const*, int const*,
+                                int const*, double const*, int const*, bool,
+                                double*, double*);
+
+// calculateKernel for a block size (64 or 128 threads), both limited to
+// 128 registers per thread.
+CalculateKernel calculateKernelFor(int threads)
+{
+    if (threads == 64) return calculateKernel<64, 8>;
+    return calculateKernel<128, 4>;
+}
+
+// Static shared memory of a kernel.
+size_t staticShared(CalculateKernel kernel)
+{
+    cudaFuncAttributes a;
+    NNP_CUDA_CHECK(cudaFuncGetAttributes(&a, kernel));
+    return a.sharedSizeBytes;
 }
 
 /* One block per atom, one thread per neighbor j (strided): contraction of
@@ -767,6 +897,12 @@ struct GpuSymmetryFunctionSet::Data
     vector<int> tableCount;
     Chunk*      chunks;
     int*        chunkOffset;
+    /// Distinct cutoffs of each element (Chunk::cutoffSlot).
+    Cutoff*     cutoffs;
+    int*        cutoffOffset;
+    /// Largest number of distinct cutoffs and of chunks of an element.
+    int         maxCutoffs;
+    int         maxChunks;
     int*        tableOffset;
     int*        tableCountDevice;
     int*        table;
@@ -784,6 +920,10 @@ GpuSymmetryFunctionSet::GpuSymmetryFunctionSet(
     Data& d = *data;
     d.chunks = nullptr;
     d.chunkOffset = nullptr;
+    d.cutoffs = nullptr;
+    d.cutoffOffset = nullptr;
+    d.maxCutoffs = 0;
+    d.maxChunks = 0;
     d.tableOffset = nullptr;
     d.tableCountDevice = nullptr;
     d.table = nullptr;
@@ -798,6 +938,8 @@ GpuSymmetryFunctionSet::GpuSymmetryFunctionSet(
         d.numElements = numElements;
         vector<Chunk> chunks;
         vector<int> chunkOffset(1, 0);
+        vector<Cutoff> cutoffs;
+        vector<int> cutoffOffset(1, 0);
         vector<int> tableOffset;
         vector<int> table;
         double const e = exp(1.0);
@@ -867,6 +1009,22 @@ GpuSymmetryFunctionSet::GpuSymmetryFunctionSet(
                 c.cutoff.rci = first.rc * first.cutoffAlpha;
                 c.cutoff.iw = 1.0 / (first.rc - c.cutoff.rci);
                 c.cutoff.pre = tanhPre;
+                c.cutoffSlot = -1;
+                for (int k = cutoffOffset.back();
+                     k < static_cast<int>(cutoffs.size()); ++k)
+                {
+                    Cutoff const& o = cutoffs.at(k);
+                    if (o.type == c.cutoff.type && o.rc == c.cutoff.rc &&
+                        o.rci == c.cutoff.rci)
+                    {
+                        c.cutoffSlot = k - cutoffOffset.back();
+                    }
+                }
+                if (c.cutoffSlot < 0)
+                {
+                    c.cutoffSlot = cutoffs.size() - cutoffOffset.back();
+                    cutoffs.push_back(c.cutoff);
+                }
                 for (size_t j = i; j < sfs.size(); ++j)
                 {
                     GpuSymmetryFunction const& s = sfs.at(j);
@@ -935,6 +1093,12 @@ GpuSymmetryFunctionSet::GpuSymmetryFunctionSet(
                 chunks.push_back(c);
             }
             chunkOffset.push_back(chunks.size());
+            cutoffOffset.push_back(cutoffs.size());
+            d.maxChunks = max(d.maxChunks,
+                              chunkOffset.back() - *(chunkOffset.end() - 2));
+            d.maxCutoffs = max(d.maxCutoffs,
+                               cutoffOffset.back()
+                               - *(cutoffOffset.end() - 2));
         }
 
         d.device = gpuCurrentDevice();
@@ -949,6 +1113,10 @@ GpuSymmetryFunctionSet::GpuSymmetryFunctionSet(
              chunks.size() * sizeof(Chunk));
         copy(reinterpret_cast<void**>(&d.chunkOffset), chunkOffset.data(),
              chunkOffset.size() * sizeof(int));
+        copy(reinterpret_cast<void**>(&d.cutoffs), cutoffs.data(),
+             cutoffs.size() * sizeof(Cutoff));
+        copy(reinterpret_cast<void**>(&d.cutoffOffset), cutoffOffset.data(),
+             cutoffOffset.size() * sizeof(int));
         copy(reinterpret_cast<void**>(&d.tableOffset), tableOffset.data(),
              tableOffset.size() * sizeof(int));
         copy(reinterpret_cast<void**>(&d.tableCountDevice),
@@ -960,6 +1128,8 @@ GpuSymmetryFunctionSet::GpuSymmetryFunctionSet(
     {
         cudaFree(d.chunks);
         cudaFree(d.chunkOffset);
+        cudaFree(d.cutoffs);
+        cudaFree(d.cutoffOffset);
         cudaFree(d.tableOffset);
         cudaFree(d.tableCountDevice);
         cudaFree(d.table);
@@ -975,6 +1145,8 @@ GpuSymmetryFunctionSet::~GpuSymmetryFunctionSet()
     cudaSetDevice(d.device);
     cudaFree(d.chunks);
     cudaFree(d.chunkOffset);
+    cudaFree(d.cutoffs);
+    cudaFree(d.cutoffOffset);
     cudaFree(d.tableOffset);
     cudaFree(d.tableCountDevice);
     cudaFree(d.table);
@@ -1180,23 +1352,53 @@ void GpuSymmetryFunctionData::calculate(GpuSymmetryFunctionSet const& set,
                                                 neighborOffset[i + 1]
                                                 - neighborOffset[i]);
         }
-        size_t const sharedBytes = maxNeighborsStructure
-                                 * (2 * sizeof(double) + sizeof(int));
         // See largeLaunchAtoms.
-        void (*kernel)(Chunk const*, int const*, int, int, int const*,
-                       int const*, int const*, int const*, double const*,
-                       int const*, bool, double*, double*)
-            = calculateKernel<128, 4>;
         int threads = 128;
-        if (numAtoms >= static_cast<size_t>(largeLaunchAtoms))
+        if (numAtoms >= static_cast<size_t>(largeLaunchAtoms)) threads = 64;
+        CalculateKernel kernel = calculateKernelFor(threads);
+        // Shared memory: fixed part, plus the item sums of one wave
+        // (capacity items). Results do not depend on the capacity: as many
+        // items as all chunks can have, within sharedBudget per block.
+        size_t const stride = maxNeighborsStructure;
+        size_t const fixed = s.maxCutoffs * 2 * stride * sizeof(double)
+                           + s.maxChunks * maxMembers * sizeof(double)
+                           + stride * sizeof(int)
+                           + (s.maxChunks + 1) * sizeof(int);
+        size_t const perItem = maxMembers * sizeof(double);
+        size_t const maxItems = s.maxChunks * ((stride + 31) / 32);
+        size_t const used = fixed + staticShared(kernel);
+        size_t capacity = used + perItem < sharedBudget
+                        ? (sharedBudget - used) / perItem : 1;
+        capacity = max<size_t>(1, min(capacity, maxItems));
+        size_t const sharedBytes = fixed + capacity * perItem;
+        if (sharedBytes + staticShared(kernel) > 48 * 1024)
         {
-            kernel = calculateKernel<64, 8>;
-            threads = 64;
+            // Very many neighbors or cutoffs: opt in to more shared memory.
+            int optin = 0;
+            NNP_CUDA_CHECK(cudaDeviceGetAttribute(
+                               &optin,
+                               cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                               d.device));
+            if (sharedBytes + staticShared(kernel)
+                > static_cast<size_t>(optin))
+            {
+                throw runtime_error("ERROR: Too many neighbors for GPU "
+                                    "symmetry functions on this device.\n");
+            }
+            NNP_CUDA_CHECK(cudaFuncSetAttribute(
+                               kernel,
+                               cudaFuncAttributeMaxDynamicSharedMemorySize,
+                               static_cast<int>(sharedBytes)));
         }
         kernel<<<numAtoms, threads, sharedBytes>>>(s.chunks,
                                                    s.chunkOffset,
+                                                   s.cutoffs,
+                                                   s.cutoffOffset,
                                                    s.numElements,
                                                    maxNeighborsStructure,
+                                                   s.maxCutoffs,
+                                                   s.maxChunks,
+                                                   capacity,
                                                    d.atomElement.get<int>(),
                                                    d.valueOffset.get<int>(),
                                                    d.neighborOffset.get<int>(),
