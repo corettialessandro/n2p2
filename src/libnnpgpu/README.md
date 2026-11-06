@@ -68,6 +68,18 @@ the CPU path in the same test binary (through an internal switch that is not
 visible to users) and against the stored CPU references, with the GPU
 tolerance profile of `test/cpp/tolerance.h`.
 
+### 8. Choices for performance only between equivalent paths
+
+A GPU build may still run part of a ported feature on the CPU when that is
+faster, but only between two implementations of the same calculation (same
+results up to round-off), by a fixed, documented rule, and never in a way
+that depends on user input. Example: the force assembly copies the
+symmetry function derivatives of a structure to the GPU only at the second
+force calculation with the same geometry and only within a memory budget;
+one-off geometries and structures beyond the budget are assembled on the
+CPU, which is faster for them. Such choices are counted (e.g.
+`Mode::getForceAssemblyCounts()`) and listed in the table below.
+
 ## Running with several MPI ranks per GPU
 
 Each MPI rank works on its own structures and sends many small pieces of
@@ -120,6 +132,7 @@ Ranks are spread over the GPUs of a node automatically (rule 3).
 | Kalman filter (`KalmanFilter`, both types) | P on the device; X = P . H and P = scale (P - K . X^T) + q I | `KalmanFilter` constructor (via `GpuKalmanFilter`) | none needed |
 | Atomic neural networks (`NeuralNetwork`, `Mode::calculateAtomicNeuralNetworks()`): 2G, 4G (elec, short), HDNNP_Q | forward pass and derivatives with respect to the inputs, all atoms of an element as one batch; neuron statistics | when the weights of a network type are set up: `Mode::readNeuralNetworkWeights()`, `Training::randomizeNeuralNetworkWeights()` (via `GpuNeuralNetwork`); not in `setupGeneric()`, which tools without network evaluation use too | none needed (any depth, all activation functions, normalized neurons) |
 | Training Jacobians (`Training::update()`): energy and force updates (2G, 4G stage 2), charge updates (4G stage 1) | derivatives with respect to all connections summed (charges: weighted by dError/dChi) over the atoms of an element (`NeuralNetwork::calculateDEdcBatchGpu()`, `calculateDFdcBatchGpu()`) | same as the atomic neural networks (they use the same GPU twins) | not ported yet, warning in the training log: force updates with `N2P2_FULL_SFD_MEMORY` |
+| Force assembly (`Mode::calculateForces()`): short-range forces and the 4G electrostatic dChi/dr sums | sums of weight * dG/dr over all terms of each atom (deterministic, one warp per atom); the topology (`GpuForceTopology`) is kept with its structure (`Structure::gpuData`) for the current geometry (`Structure::geometryStamp`) and freed with the symmetry function derivatives | together with the "short" networks (`Mode::setNeuralNetworkGpuEnabled()`) | performance choice (rule 8): first force calculation of a geometry, or topology beyond the memory budget (half the device memory, shared by the processes using it); the LAMMPS interface has its own force code (not ported yet) |
 
 ## Programs that require a GPU in a GPU build
 

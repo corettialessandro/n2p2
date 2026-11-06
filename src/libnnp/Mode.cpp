@@ -20,6 +20,7 @@
 #include "version.h"
 #ifdef N2P2_GPU
 #include "GpuDevice.h"
+#include "GpuForceAssembly.h"
 #endif
 #include <cmath>
 #ifdef _OPENMP
@@ -54,7 +55,11 @@ Mode::Mode() : nnpType                   (NNPType::HDNNP_2G      ),
                convCharge                (1.0                    ),
                fourPiEps                 (1.0                    ),
                ewaldSetup                {},
-               kspaceGrid                {}
+               kspaceGrid                {},
+               gpuForceAssembly          (false                  ),
+               gpuForceBudget            (0                      ),
+               gpuForceCountGpu          (0                      ),
+               gpuForceCountCpu          (0                      )
 {
 }
 
@@ -1861,7 +1866,11 @@ void Mode::calculateSymmetryFunctions(Structure& structure,
 
     // Remember that symmetry functions of this structure have been calculated.
     structure.hasSymmetryFunctions = true;
-    if (derivatives) structure.hasSymmetryFunctionDerivatives = true;
+    if (derivatives)
+    {
+        structure.hasSymmetryFunctionDerivatives = true;
+        structure.geometryStamp = Structure::newGeometryStamp();
+    }
 
     return;
 }
@@ -1942,7 +1951,11 @@ void Mode::calculateSymmetryFunctionGroups(Structure& structure,
 
     // Remember that symmetry functions of this structure have been calculated.
     structure.hasSymmetryFunctions = true;
-    if (derivatives) structure.hasSymmetryFunctionDerivatives = true;
+    if (derivatives)
+    {
+        structure.hasSymmetryFunctionDerivatives = true;
+        structure.geometryStamp = Structure::newGeometryStamp();
+    }
 
     return;
 }
@@ -2191,6 +2204,169 @@ bool Mode::calculateAtomicNeuralNetworksGpu(Structure&    structure,
     return true;
 }
 
+bool Mode::assembleForcesGpu(Structure&      structure,
+                             VectorXd const& lambdaTotal,
+                             VectorXd const& lambdaElec,
+                             vector<Vec3D>&  shortForces,
+                             vector<Vec3D>&  sumTotal,
+                             vector<Vec3D>&  sumElec) const
+{
+    size_t const numAtoms = structure.atoms.size();
+    bool const is4G = (nnpType == NNPType::HDNNP_4G);
+
+    // Symmetry function values of all atoms, one after the other.
+    vector<int> valueOffset(numAtoms + 1, 0);
+    for (size_t i = 0; i < numAtoms; ++i)
+    {
+        valueOffset.at(i + 1) = valueOffset.at(i)
+                              + structure.atoms.at(i).numSymmetryFunctions;
+    }
+    size_t const numValues = valueOffset.back();
+
+    // Derivatives without stamp (should not happen): new data.
+    if (structure.geometryStamp == 0)
+    {
+        structure.geometryStamp = Structure::newGeometryStamp();
+    }
+    size_t const stamp = structure.geometryStamp;
+    Structure::GpuData& gpu = structure.gpuData;
+    if (gpu.forceTopology == NULL ||
+        gpu.forceTopologyStamp != stamp ||
+        gpu.forceTopologyCutoff != maxCutoffRadius)
+    {
+        // Free an outdated topology, but remember the last geometry.
+        size_t const lastStamp = gpu.lastForceStamp;
+        gpu.clear();
+        gpu.lastForceStamp = stamp;
+        // First calculation with this geometry: the CPU is faster than
+        // building the topology.
+        if (lastStamp != stamp) return false;
+
+        // Terms grouped by the atom i whose position they depend on: the
+        // derivatives of its own symmetry functions and of those of all
+        // atoms j having atom i as neighbor within the symmetry function
+        // cutoff, including periodic images of atom i itself (same
+        // contributions as calculatePairForcesShort() and
+        // calculateDChidrSums()).
+        vector<int> termOffset(numAtoms + 1, 0);
+        for (size_t j = 0; j < numAtoms; ++j)
+        {
+            Atom const& aj = structure.atoms.at(j);
+            termOffset.at(j + 1) += aj.numSymmetryFunctions;
+            size_t const numNeighbors =
+                aj.getStoredMinNumNeighbors(maxCutoffRadius);
+            for (size_t m = 0; m < numNeighbors; ++m)
+            {
+                Atom::Neighbor const& n = aj.neighbors.at(m);
+                termOffset.at(n.index + 1) += n.dGdr.size();
+            }
+        }
+        for (size_t i = 0; i < numAtoms; ++i)
+        {
+            termOffset.at(i + 1) += termOffset.at(i);
+        }
+        size_t const numTerms = termOffset.back();
+        // Topologies exceeding the memory budget stay on the CPU.
+        if (GpuForceTopology::getTotalMemoryUsage()
+            + GpuForceTopology::memoryUsage(numAtoms, numValues, numTerms)
+            > gpuForceBudget)
+        {
+            return false;
+        }
+        vector<int> termValue(numTerms);
+        vector<double> termDGdr(3 * numTerms);
+        vector<int> position(termOffset.begin(), termOffset.end() - 1);
+        auto addTerm = [&](size_t target, int value, Vec3D const& dGdr)
+        {
+            int const t = position.at(target)++;
+            termValue.at(t) = value;
+            termDGdr.at(3 * t + 0) = dGdr[0];
+            termDGdr.at(3 * t + 1) = dGdr[1];
+            termDGdr.at(3 * t + 2) = dGdr[2];
+        };
+        for (size_t j = 0; j < numAtoms; ++j)
+        {
+            Atom const& aj = structure.atoms.at(j);
+            int const offset = valueOffset.at(j);
+            for (size_t k = 0; k < aj.numSymmetryFunctions; ++k)
+            {
+                addTerm(j, offset + k, aj.dGdr.at(k));
+            }
+#ifndef N2P2_FULL_SFD_MEMORY
+            vector<vector<size_t>> const& tableFull
+                = elements.at(aj.element).getSymmetryFunctionTable();
+#endif
+            size_t const numNeighbors =
+                aj.getStoredMinNumNeighbors(maxCutoffRadius);
+            for (size_t m = 0; m < numNeighbors; ++m)
+            {
+                Atom::Neighbor const& n = aj.neighbors.at(m);
+#ifndef N2P2_FULL_SFD_MEMORY
+                vector<size_t> const& table = tableFull.at(n.element);
+#endif
+                for (size_t k = 0; k < n.dGdr.size(); ++k)
+                {
+#ifndef N2P2_FULL_SFD_MEMORY
+                    addTerm(n.index, offset + table.at(k), n.dGdr.at(k));
+#else
+                    addTerm(n.index, offset + k, n.dGdr.at(k));
+#endif
+                }
+            }
+        }
+        gpu.forceTopology = new GpuForceTopology(numValues,
+                                                 termOffset,
+                                                 termValue,
+                                                 termDGdr);
+        gpu.forceTopologyStamp = stamp;
+        gpu.forceTopologyCutoff = maxCutoffRadius;
+    }
+
+    // Weights: dE/dG (short-range forces) and, for 4G, lambda * dChi/dG.
+    size_t const numWeightVectors = is4G ? 3 : 1;
+    vector<double> weights(numWeightVectors * numValues);
+    for (size_t j = 0; j < numAtoms; ++j)
+    {
+        Atom const& aj = structure.atoms.at(j);
+        size_t const offset = valueOffset.at(j);
+        for (size_t k = 0; k < aj.numSymmetryFunctions; ++k)
+        {
+            weights.at(offset + k) = aj.dEdG.at(k);
+            if (!is4G) continue;
+            weights.at(numValues + offset + k) = lambdaTotal(j)
+                                               * aj.dChidG.at(k);
+            weights.at(2 * numValues + offset + k) = lambdaElec(j)
+                                                   * aj.dChidG.at(k);
+        }
+    }
+    vector<double> result(numWeightVectors * 3 * numAtoms);
+    gpu.forceTopology->apply(numWeightVectors, weights.data(), result.data());
+
+    shortForces.resize(numAtoms);
+    for (size_t i = 0; i < numAtoms; ++i)
+    {
+        for (size_t c = 0; c < 3; ++c)
+        {
+            shortForces.at(i)[c] = -result.at(3 * i + c);
+        }
+    }
+    if (is4G)
+    {
+        sumTotal.resize(numAtoms);
+        sumElec.resize(numAtoms);
+        for (size_t i = 0; i < numAtoms; ++i)
+        {
+            for (size_t c = 0; c < 3; ++c)
+            {
+                sumTotal.at(i)[c] = result.at(3 * (numAtoms + i) + c);
+                sumElec.at(i)[c] = result.at(3 * (2 * numAtoms + i) + c);
+            }
+        }
+    }
+
+    return true;
+}
+
 void Mode::propagateAtomsGpu(Structure&            structure,
                              string const&         id,
                              bool                  chargeInput,
@@ -2387,19 +2563,6 @@ void Mode::calculateForces(Structure& structure) const
     bool const committee = (nnpType == NNPType::HDNNP_2G &&
                             committeeMode != CommitteeMode::DISABLED);
 
-    // Short-range force contributions of all neighbors of each atom.
-    vector<Vec3D> pairForces;
-    vector<vector<Vec3D>> pairForcesCom;
-    if (committee)
-    {
-        pairForcesCom.resize(committeeSize);
-        for (size_t c = 0; c < committeeSize; ++c)
-        {
-            calculatePairForcesShort(structure, pairForcesCom.at(c), c);
-        }
-    }
-    else calculatePairForcesShort(structure, pairForces);
-
     // 4G-HDNNP: Lagrange multipliers and the sums over atoms j of
     // lambda_j * dChi_j/dr_i, needed for the electrostatic part below.
     VectorXd lambdaTotal;
@@ -2410,11 +2573,47 @@ void Mode::calculateForces(Structure& structure) const
     {
         lambdaTotal = structure.calculateForceLambdaTotal();
         lambdaElec = structure.calculateForceLambdaElec();
-        calculateDChidrSums(structure,
-                            lambdaTotal,
-                            lambdaElec,
-                            dChidrTotal,
-                            dChidrElec);
+    }
+
+    // Short-range force contributions of all neighbors of each atom (or, on
+    // the GPU, complete short-range forces) and the dChi/dr sums.
+    vector<Vec3D> pairForces;
+    vector<vector<Vec3D>> pairForcesCom;
+    vector<Vec3D> shortForcesGpu;
+    bool forcesGpu = false;
+#ifdef N2P2_GPU
+    // Committees: per-member forces on the CPU.
+    if (gpuForceAssembly && !committee)
+    {
+        forcesGpu = assembleForcesGpu(structure,
+                                      lambdaTotal,
+                                      lambdaElec,
+                                      shortForcesGpu,
+                                      dChidrTotal,
+                                      dChidrElec);
+        if (forcesGpu) gpuForceCountGpu++;
+        else gpuForceCountCpu++;
+    }
+    if (!forcesGpu)
+#endif
+    {
+        if (committee)
+        {
+            pairForcesCom.resize(committeeSize);
+            for (size_t c = 0; c < committeeSize; ++c)
+            {
+                calculatePairForcesShort(structure, pairForcesCom.at(c), c);
+            }
+        }
+        else calculatePairForcesShort(structure, pairForces);
+        if (nnpType == NNPType::HDNNP_4G)
+        {
+            calculateDChidrSums(structure,
+                                lambdaTotal,
+                                lambdaElec,
+                                dChidrTotal,
+                                dChidrElec);
+        }
     }
 
     // Loop over all atoms, center atom i (ai).
@@ -2447,6 +2646,11 @@ void Mode::calculateForces(Structure& structure) const
 
         // Reset forces.
         ai.f = Vec3D{};
+        if (forcesGpu)
+        {
+            ai.f = shortForcesGpu.at(i);
+            continue;
+        }
 
         // First add force contributions from atom i itself (gradient of
         // atomic energy E_i).
@@ -2966,6 +3170,8 @@ void Mode::setNeuralNetworkGpuEnabled(string const& id, bool enabled)
     bool const wasEnabled = elements.front().neuralNetworks.at(id)
                             .isGpuEnabled();
     for (auto& e : elements) e.neuralNetworks.at(id).setGpuEnabled(enabled);
+    // Forces need the derivatives of the short-range networks.
+    if (id == "short") setForceAssemblyGpuEnabled(enabled);
 #ifdef N2P2_GPU
     if (enabled && !wasEnabled)
     {
@@ -2983,6 +3189,50 @@ void Mode::setNeuralNetworkGpuEnabled(string const& id, bool enabled)
 #else
     (void)wasEnabled;
 #endif
+
+    return;
+}
+
+void Mode::setForceAssemblyGpuEnabled(bool enabled)
+{
+#ifdef N2P2_GPU
+    if (enabled && !gpuForceAssembly)
+    {
+        int const device = gpuRequireDevice();
+        gpuForceAssembly = true;
+        gpuForceBudget = gpuDefaultCacheBudget();
+        gpuForceCountGpu = 0;
+        gpuForceCountCpu = 0;
+        log << strpr("Forces assembled on GPU %d (%s) for geometries used "
+                     "repeatedly, up to %.0f MB of topologies.\n",
+                     device,
+                     gpuDeviceName(device).c_str(),
+                     gpuForceBudget / 1048576.0);
+    }
+    else if (!enabled && gpuForceAssembly)
+    {
+        gpuForceAssembly = false;
+        log << "Forces assembled on the CPU.\n";
+    }
+#else
+    if (enabled)
+    {
+        throw runtime_error("ERROR: n2p2 was built without GPU support.\n");
+    }
+#endif
+
+    return;
+}
+
+bool Mode::isForceAssemblyGpuEnabled() const
+{
+    return gpuForceAssembly;
+}
+
+void Mode::getForceAssemblyCounts(size_t& gpu, size_t& cpu) const
+{
+    gpu = gpuForceCountGpu;
+    cpu = gpuForceCountCpu;
 
     return;
 }

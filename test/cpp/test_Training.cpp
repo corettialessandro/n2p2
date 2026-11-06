@@ -843,5 +843,16 @@ BOOST_FIXTURE_TEST_CASE(TrainStage2_4G_GpuNetworks_MatchesCpu,
     requireSameLearningCurve(cpu, gpu);
 }
 
+BOOST_FIXTURE_TEST_CASE(TrainStage2_4G_Memorized_GpuForces_MatchesCpu,
+                        FixtureRepairDir)
+{
+    // With memorized symmetry functions the forces of a structure are
+    // calculated repeatedly with the same geometry, so they are assembled
+    // on the GPU (topologies kept with the structures).
+    vector<double> const gpu = trainStage2OneEpoch4G(true, true);
+    vector<double> const cpu = trainStage2OneEpoch4G(true, false);
+    requireSameLearningCurve(cpu, gpu);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 #endif

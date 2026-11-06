@@ -701,6 +701,10 @@ int Dataset::recvStructure(Structure* const structure, int src)
         }
     }
 
+    // Received derivatives are new data for this process.
+    s->geometryStamp = s->hasSymmetryFunctionDerivatives
+                     ? Structure::newGeometryStamp() : 0;
+
     delete[] buf;
 
     return bs;

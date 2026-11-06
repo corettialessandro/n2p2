@@ -35,6 +35,8 @@
 namespace nnp
 {
 
+class GpuForceTopology;
+
 /// Storage for one atomic configuration.
 struct Structure
 {
@@ -70,6 +72,36 @@ struct Structure
     bool                     hasSymmetryFunctions;
     /// If symmetry function derivatives are saved for each atom.
     bool                     hasSymmetryFunctionDerivatives;
+    /** Identifies the current symmetry function derivatives (geometry and
+     *  units), 0 if there are none.
+     *
+     * Set to a new value from newGeometryStamp() whenever the derivatives
+     * are calculated or converted, so data derived from them (e.g. GPU
+     * force assembly topologies) can be cached under this key. Copies of
+     * the structure keep the value, as they hold the same derivatives.
+     */
+    std::size_t              geometryStamp;
+    /// Data kept on the GPU for this structure (GPU builds). Freed together
+    /// with the symmetry function derivatives; copies start without it.
+    struct GpuData
+    {
+        /// Force assembly topology, NULL if none.
+        GpuForceTopology* forceTopology;
+        /// Geometry stamp the topology was built for.
+        std::size_t       forceTopologyStamp;
+        /// Cutoff radius the topology was built with.
+        double            forceTopologyCutoff;
+        /// Geometry stamp of the last force calculation.
+        std::size_t       lastForceStamp;
+
+        GpuData();
+        GpuData(GpuData const&);
+        GpuData& operator=(GpuData const&);
+        ~GpuData();
+        /// Free all GPU data.
+        void              clear();
+    };
+    GpuData                  gpuData;
     /// Index number of this structure.
     std::size_t              index;
     /// Total number of atoms present in this structure.
@@ -131,6 +163,11 @@ struct Structure
     /** Constructor, initializes to zero.
      */
     Structure();
+    /** A geometry stamp never used before in this process.
+     *
+     * @return New value for #geometryStamp (never 0).
+     */
+    static std::size_t       newGeometryStamp();
     /** Set element map of structure.
      *
      * @param[in] elementMap Reference to a map containing all possible

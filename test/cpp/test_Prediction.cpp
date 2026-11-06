@@ -8,6 +8,7 @@
 #include "ExamplePrediction.h"
 #include "tolerance.h"
 #ifdef N2P2_GPU
+#include "GpuForceAssembly.h"
 #include "gpuTest.h"
 #endif
 
@@ -760,6 +761,124 @@ BOOST_DATA_TEST_CASE_F(FixtureRepairDir,
     }
     requireClose(forcesCpu, forcesGpu, name + " force component");
 
+    bfs::current_path("..");
+    bfs::remove_all("test");
+}
+
+// Forces of the structure in input.data (current directory), calculated by
+// evaluateNNP() (assembled on the CPU: first calculation with this
+// geometry) and once more (assembled on the GPU).
+void requireGpuForceAssemblyMatchesCpu(Prediction& p, string const& what)
+{
+    p.evaluateNNP(p.structure);
+    vector<double> forcesCpu;
+    for (auto const& a : p.structure.atoms)
+    {
+        for (size_t c = 0; c < 3; ++c) forcesCpu.push_back(a.f[c]);
+    }
+    size_t gpuBefore = 0;
+    size_t cpuBefore = 0;
+    p.getForceAssemblyCounts(gpuBefore, cpuBefore);
+    p.calculateForces(p.structure);
+    size_t gpuAfter = 0;
+    size_t cpuAfter = 0;
+    p.getForceAssemblyCounts(gpuAfter, cpuAfter);
+    BOOST_REQUIRE_EQUAL(gpuAfter, gpuBefore + 1);
+    BOOST_REQUIRE_EQUAL(cpuAfter, cpuBefore);
+    vector<double> forcesGpu;
+    for (auto const& a : p.structure.atoms)
+    {
+        for (size_t c = 0; c < 3; ++c) forcesGpu.push_back(a.f[c]);
+    }
+    requireClose(forcesCpu, forcesGpu, what + " force component");
+}
+
+BOOST_DATA_TEST_CASE_F(FixtureRepairDir,
+                       ForceAssembly_Gpu_MatchesCpu,
+                       bdata::make(predictionExamples),
+                       name)
+{
+    BOOST_REQUIRE(copy_directory_recursively("../../examples/nnp-predict/"
+                                             + name, "test"));
+    bfs::current_path("test");
+    Prediction p;
+    p.log.writeToStdout = false;
+    p.setup();
+    BOOST_REQUIRE(p.isForceAssemblyGpuEnabled());
+    p.readStructureFromFile();
+    requireGpuForceAssemblyMatchesCpu(p, name);
+    bfs::current_path("..");
+    bfs::remove_all("test");
+}
+
+BOOST_FIXTURE_TEST_CASE(ForceAssembly_SameIndexOtherGeometry_MatchesCpu,
+                        FixtureRepairDir)
+{
+    // GPU force assembly topologies belong to the structure and its current
+    // geometry, not to the structure index: two geometries read into the
+    // same structure (same index) alternately must each give the CPU
+    // forces.
+    BOOST_REQUIRE(copy_directory_recursively(
+        "../../examples/nnp-predict/H2O_RPBE-D3_4G", "test"));
+    bfs::current_path("test");
+    {
+        // Second geometry: first atom displaced.
+        ifstream in("input.data");
+        ofstream out("displaced.data");
+        string line;
+        bool first = true;
+        while (getline(in, line))
+        {
+            vector<string> t = split(reduce(line));
+            if (first && !t.empty() && t.at(0) == "atom")
+            {
+                t.at(1) = strpr("%.16E", stod(t.at(1)) + 0.3);
+                line = "";
+                for (auto const& w : t) line += w + " ";
+                first = false;
+            }
+            out << line << "\n";
+        }
+    }
+
+    Prediction p;
+    p.log.writeToStdout = false;
+    p.setup();
+    for (string file : {"input.data", "displaced.data",
+                        "input.data", "displaced.data"})
+    {
+        p.readStructureFromFile(file);
+        requireGpuForceAssemblyMatchesCpu(p, file);
+    }
+
+    bfs::current_path("..");
+    bfs::remove_all("test");
+}
+
+BOOST_FIXTURE_TEST_CASE(ForceTopology_FreedWithDerivatives, FixtureRepairDir)
+{
+    // The GPU force assembly topology belongs to the structure: it is
+    // freed together with the symmetry function derivatives.
+    BOOST_REQUIRE(copy_directory_recursively(
+        "../../examples/nnp-predict/H2O_RPBE-D3", "test"));
+    bfs::current_path("test");
+    Prediction p;
+    p.log.writeToStdout = false;
+    p.setup();
+    size_t const before = GpuForceTopology::getTotalMemoryUsage();
+    p.readStructureFromFile();
+    p.evaluateNNP(p.structure);
+    BOOST_REQUIRE_EQUAL(GpuForceTopology::getTotalMemoryUsage(), before);
+    p.calculateForces(p.structure);
+    BOOST_REQUIRE_GT(GpuForceTopology::getTotalMemoryUsage(), before);
+    p.structure.freeAtoms(false, p.getMaxCutoffRadius());
+    BOOST_REQUIRE_EQUAL(GpuForceTopology::getTotalMemoryUsage(), before);
+    p.readStructureFromFile();
+    p.evaluateNNP(p.structure);
+    p.calculateForces(p.structure);
+    BOOST_REQUIRE_GT(GpuForceTopology::getTotalMemoryUsage(), before);
+    p.structure.reset();
+    BOOST_REQUIRE_EQUAL(GpuForceTopology::getTotalMemoryUsage(), before);
     bfs::current_path("..");
     bfs::remove_all("test");
 }
