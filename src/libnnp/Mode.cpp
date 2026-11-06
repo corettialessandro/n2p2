@@ -18,6 +18,9 @@
 #include "NeuralNetwork.h"
 #include "utility.h"
 #include "version.h"
+#ifdef N2P2_GPU
+#include "GpuDevice.h"
+#endif
 #include <cmath>
 #ifdef _OPENMP
 #include <omp.h>
@@ -1950,6 +1953,10 @@ void Mode::calculateAtomicNeuralNetworks(Structure& structure,
 {
     if (id == "") id = nnk.front();
 
+#ifdef N2P2_GPU
+    if (calculateAtomicNeuralNetworksGpu(structure, derivatives, id)) return;
+#endif
+
     if (nnpType == NNPType::HDNNP_2G)
     {
         bool const committee = (committeeMode != CommitteeMode::DISABLED);
@@ -2108,6 +2115,137 @@ void Mode::calculateAtomicNeuralNetworks(Structure& structure,
 
     return;
 }
+
+#ifdef N2P2_GPU
+bool Mode::calculateAtomicNeuralNetworksGpu(Structure&    structure,
+                                            bool const    derivatives,
+                                            string const& id)
+{
+    auto enabled = [this](string const& type)
+    {
+        return elements.front().neuralNetworks.at(type).isGpuEnabled();
+    };
+
+    // Same cases, inputs and outputs as the CPU code path in
+    // calculateAtomicNeuralNetworks().
+    if (nnpType == NNPType::HDNNP_2G)
+    {
+        // Committees are evaluated on the CPU (per-member results).
+        if (!enabled(id) || committeeMode != CommitteeMode::DISABLED)
+        {
+            return false;
+        }
+        propagateAtomsGpu(structure,
+                          id,
+                          false,
+                          &Atom::energy,
+                          derivatives ? &Atom::dEdG : nullptr);
+    }
+    else if (nnpType == NNPType::HDNNP_4G && id == "elec")
+    {
+        if (!enabled(id)) return false;
+        propagateAtomsGpu(structure,
+                          id,
+                          false,
+                          &Atom::chi,
+                          derivatives ? &Atom::dChidG : nullptr);
+        if (normalize)
+        {
+            for (auto& a : structure.atoms)
+            {
+                if (derivatives)
+                {
+                    for (auto& dChidGi : a.dChidG)
+                        dChidGi = normalized("negativity", dChidGi);
+                }
+                a.chi = normalized("negativity", a.chi);
+            }
+        }
+    }
+    else if (nnpType == NNPType::HDNNP_4G && id == "short")
+    {
+        if (!enabled(id)) return false;
+        propagateAtomsGpu(structure,
+                          id,
+                          true,
+                          &Atom::energy,
+                          derivatives ? &Atom::dEdG : nullptr);
+    }
+    else if (nnpType == NNPType::HDNNP_Q)
+    {
+        // Both networks, the charges are inputs of the short-range one.
+        if (!enabled("elec") || !enabled("short")) return false;
+        propagateAtomsGpu(structure,
+                          "elec",
+                          false,
+                          &Atom::charge,
+                          derivatives ? &Atom::dQdG : nullptr);
+        propagateAtomsGpu(structure,
+                          "short",
+                          true,
+                          &Atom::energy,
+                          derivatives ? &Atom::dEdG : nullptr);
+    }
+    else return false;
+
+    return true;
+}
+
+void Mode::propagateAtomsGpu(Structure&            structure,
+                             string const&         id,
+                             bool                  chargeInput,
+                             double Atom::*        output,
+                             vector<double> Atom::* derivative)
+{
+    vector<vector<size_t>> atomsOfElement(numElements);
+    for (size_t i = 0; i < structure.atoms.size(); ++i)
+    {
+        atomsOfElement.at(structure.atoms.at(i).element).push_back(i);
+    }
+
+    vector<double> input;
+    vector<double> values;
+    vector<double> derivatives;
+    for (size_t e = 0; e < numElements; ++e)
+    {
+        vector<size_t> const& indices = atomsOfElement.at(e);
+        if (indices.empty()) continue;
+        size_t const numAtoms = indices.size();
+        size_t const numInputs = structure.atoms.at(indices.front()).G.size()
+                               + (chargeInput ? 1 : 0);
+
+        input.resize(numInputs * numAtoms);
+        for (size_t t = 0; t < numAtoms; ++t)
+        {
+            Atom const& a = structure.atoms.at(indices.at(t));
+            copy(a.G.begin(), a.G.end(), input.begin() + t * numInputs);
+            if (chargeInput) input.at(t * numInputs + a.G.size()) = a.charge;
+        }
+        values.resize(numAtoms);
+        if (derivative != nullptr) derivatives.resize(numInputs * numAtoms);
+
+        elements.at(e).neuralNetworks.at(id).propagateBatchGpu(
+            numAtoms,
+            input.data(),
+            values.data(),
+            derivative != nullptr ? derivatives.data() : nullptr);
+
+        for (size_t t = 0; t < numAtoms; ++t)
+        {
+            Atom& a = structure.atoms.at(indices.at(t));
+            a.*output = values.at(t);
+            if (derivative != nullptr)
+            {
+                copy(derivatives.begin() + t * numInputs,
+                     derivatives.begin() + (t + 1) * numInputs,
+                     (a.*derivative).begin());
+            }
+        }
+    }
+
+    return;
+}
+#endif
 
 // TODO: Make this const?
 void Mode::chargeEquilibration( Structure& structure,
@@ -2804,6 +2942,47 @@ void Mode::readNeuralNetworkWeights(string const& id,
             nn.setConnections(&(weights.front()));
         }
     }
+#ifdef N2P2_GPU
+    if (committeeMode == CommitteeMode::DISABLED)
+    {
+        setNeuralNetworkGpuEnabled(id, true);
+    }
+    else
+    {
+        // Same device check as for a single network (GPU build).
+        int const device = gpuRequireDevice();
+        log << strpr("WARNING: Committees are not implemented on the GPU, "
+                     "the committee is\n"
+                     "         evaluated on the CPU (GPU %d unused).\n",
+                     device);
+    }
+#endif
+
+    return;
+}
+
+void Mode::setNeuralNetworkGpuEnabled(string const& id, bool enabled)
+{
+    bool const wasEnabled = elements.front().neuralNetworks.at(id)
+                            .isGpuEnabled();
+    for (auto& e : elements) e.neuralNetworks.at(id).setGpuEnabled(enabled);
+#ifdef N2P2_GPU
+    if (enabled && !wasEnabled)
+    {
+        int const device = gpuCurrentDevice();
+        log << strpr("Atomic %s neural networks evaluated on GPU %d (%s).\n",
+                     nns.at(id).name.c_str(),
+                     device,
+                     gpuDeviceName(device).c_str());
+    }
+    else if (!enabled && wasEnabled)
+    {
+        log << strpr("Atomic %s neural networks evaluated on the CPU.\n",
+                     nns.at(id).name.c_str());
+    }
+#else
+    (void)wasEnabled;
+#endif
 
     return;
 }

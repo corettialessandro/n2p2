@@ -15,12 +15,16 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include "NeuralNetwork.h"
+#ifdef N2P2_GPU
+#include "GpuNeuralNetwork.h"
+#endif
 #include "utility.h"
 #include <algorithm> // std::min, std::max
 #include <cmath>     // sqrt, pow, tanh
 #include <cstdio>    // fprintf, stderr
 #include <cstdlib>   // exit, EXIT_FAILURE, rand, srand
 #include <limits>    // std::numeric_limits
+#include <stdexcept> // std::runtime_error
 
 #define EXP_LIMIT 35.0
 
@@ -44,6 +48,7 @@ NeuralNetwork(int                              numLayers,
 
     // do not normalize neurons by default
     normalizeNeurons = false;
+    gpu = NULL;
 
     // allocate layers and populate with neurons
     layers = new Layer[numLayers];
@@ -108,11 +113,110 @@ NeuralNetwork::~NeuralNetwork()
     delete[] weightOffset;
     delete[] biasOffset;
     delete[] biasOnlyOffset;
+#ifdef N2P2_GPU
+    delete gpu;
+#endif
+}
+
+void NeuralNetwork::setGpuEnabled(bool enabled)
+{
+#ifdef N2P2_GPU
+    if (enabled && gpu == NULL)
+    {
+        vector<int> numNeurons(numLayers);
+        vector<int> activations(numLayers);
+        for (int i = 0; i < numLayers; i++)
+        {
+            numNeurons.at(i) = layers[i].numNeurons;
+            activations.at(i) = layers[i].activationFunction;
+        }
+        gpu = new GpuNeuralNetwork(numNeurons, activations, normalizeNeurons);
+        updateGpuConnections();
+    }
+    else if (!enabled && gpu != NULL)
+    {
+        delete gpu;
+        gpu = NULL;
+    }
+#else
+    if (enabled)
+    {
+        throw runtime_error("ERROR: n2p2 was built without GPU support.\n");
+    }
+#endif
+
+    return;
+}
+
+bool NeuralNetwork::isGpuEnabled() const
+{
+    return gpu != NULL;
+}
+
+void NeuralNetwork::propagateBatchGpu(size_t        numInputs,
+                                      double const* input,
+                                      double*       output,
+                                      double*       dEdG)
+{
+#ifdef N2P2_GPU
+    if (gpu == NULL)
+    {
+        throw runtime_error("ERROR: GPU not enabled for this neural "
+                            "network.\n");
+    }
+    if (numInputs == 0) return;
+
+    size_t const numNeurons = getNumNeurons();
+    vector<double> statistics(4 * numNeurons);
+    gpu->propagate(numInputs, input, output, dEdG, statistics.data());
+
+    // Neuron statistics as numInputs calls of setInput() and propagate().
+    size_t count = 0;
+    for (int i = 0; i < numLayers; i++)
+    {
+        for (int j = 0; j < layers[i].numNeurons; j++)
+        {
+            Neuron& n = layers[i].neurons[j];
+            n.count += numInputs;
+            n.min  = min(n.min, statistics.at(count));
+            n.max  = max(n.max, statistics.at(numNeurons + count));
+            n.sum  += statistics.at(2 * numNeurons + count);
+            n.sum2 += statistics.at(3 * numNeurons + count);
+            count++;
+        }
+    }
+#else
+    (void)numInputs;
+    (void)input;
+    (void)output;
+    (void)dEdG;
+    throw runtime_error("ERROR: n2p2 was built without GPU support.\n");
+#endif
+
+    return;
+}
+
+void NeuralNetwork::updateGpuConnections() const
+{
+#ifdef N2P2_GPU
+    if (gpu == NULL) return;
+    vector<double> connections(numConnections);
+    getConnections(connections.data());
+    gpu->setConnections(connections.data());
+#endif
+
+    return;
 }
 
 void NeuralNetwork::setNormalizeNeurons(bool normalizeNeurons)
 {
     this->normalizeNeurons = normalizeNeurons;
+    // Recreate the GPU twin with the new setting.
+    if (gpu != NULL)
+    {
+        setGpuEnabled(false);
+        setGpuEnabled(true);
+    }
 
     return;
 }
@@ -164,6 +268,7 @@ void NeuralNetwork::setConnections(double const* const& connections)
             count++;
         }
     }
+    updateGpuConnections();
 
     return;
 }
@@ -314,6 +419,8 @@ void NeuralNetwork::modifyConnections(ModificationScheme modificationScheme)
         exit(EXIT_FAILURE);
     }
 
+    updateGpuConnections();
+
     return;
 }
 
@@ -340,6 +447,8 @@ void NeuralNetwork::modifyConnections(ModificationScheme modificationScheme,
         fprintf(stderr, "ERROR: Incorrect modifyConnections call.\n");
         exit(EXIT_FAILURE);
     }
+
+    updateGpuConnections();
 
     return;
 }

@@ -326,6 +326,21 @@ public:
                                  std::string const& id,
                                  std::string const& fileNameFormat,
                                  std::string const& fileDir = "");
+    /** Switch evaluation of one neural network type on the GPU on or off.
+     *
+     * @param[in] id Neural network type ("short" or "elec").
+     * @param[in] enabled Evaluate on the GPU if true.
+     *
+     * GPU builds switch it on when the weights of a network type are set up
+     * (readNeuralNetworkWeights(), random initialization in training): this
+     * is where the device check happens (see src/libnnpgpu/README.md).
+     * Switching it off is internal, for tests comparing the GPU and CPU
+     * code paths in one binary. Throws std::runtime_error when enabling the
+     * GPU in a CPU build.
+     */
+    void                     setNeuralNetworkGpuEnabled(
+                                 std::string const& id,
+                                 bool               enabled);
     /** Read in atomic hardness of all elements from files (4G-HDNNP).
      *
      * @param[in] fileNameFormat Name format of file containing atomic
@@ -707,6 +722,35 @@ public:
     Log        log;
 
 protected:
+#ifdef N2P2_GPU
+    /** Evaluate the atomic neural networks on the GPU, if enabled.
+     *
+     * Same arguments as calculateAtomicNeuralNetworks().
+     *
+     * @return False if the networks are not evaluated on the GPU.
+     */
+    bool                     calculateAtomicNeuralNetworksGpu(
+                                           Structure&         structure,
+                                           bool const         derivatives,
+                                           std::string const& id);
+    /** Propagate all atoms of a structure through their networks on the
+     * GPU, one batch per element.
+     *
+     * @param[in] structure Input structure.
+     * @param[in] id Neural network type.
+     * @param[in] chargeInput Append the atomic charge to the inputs.
+     * @param[in] output Atom member receiving the network output.
+     * @param[in] derivative Atom member receiving the derivatives with
+     *                       respect to the inputs, not calculated if
+     *                       nullptr.
+     */
+    void                     propagateAtomsGpu(
+                                   Structure&                structure,
+                                   std::string const&        id,
+                                   bool                      chargeInput,
+                                   double Atom::*            output,
+                                   std::vector<double> Atom::* derivative);
+#endif
     /// Setup data for one neural network.
     struct NNSetup
     {

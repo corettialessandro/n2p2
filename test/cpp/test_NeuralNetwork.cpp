@@ -5,12 +5,18 @@
 #include <boost/test/data/monomorphic.hpp>
 #include <boost/filesystem.hpp>
 #include "fileHelpers.h"
+#include "tolerance.h"
+#ifdef N2P2_GPU
+#include "gpuTest.h"
+#endif
 
 #include "NeuralNetwork.h"
-#include <cmath>     // std::sqrt, std::pow, std::tanh
+#include <algorithm> // std::max
+#include <cmath>     // std::sqrt, std::pow, std::tanh, std::fabs
 #include <cstddef>   // std::size_t
 #include <fstream>   // std::ofstream, std::ifstream
 #include <limits>    // std::numeric_limits
+#include <memory>    // std::unique_ptr
 #include <stdexcept> // std::runtime_error
 #include <string>    // std::string
 #include <vector>    // std::vector
@@ -734,4 +740,252 @@ BOOST_FIXTURE_TEST_CASE(WriteConnections_ProducesNonEmptyFile, FixtureRepairDir)
     bfs::remove_all("test");
 }
 
+#ifndef N2P2_GPU
+BOOST_AUTO_TEST_CASE(Gpu_CpuBuild_NotAvailable)
+{
+    int const numNeuronsPerLayer[3] = {2, 3, 1};
+    NeuralNetwork::ActivationFunction const af[3] =
+        {NeuralNetwork::AF_IDENTITY,
+         NeuralNetwork::AF_TANH,
+         NeuralNetwork::AF_IDENTITY};
+    NeuralNetwork nn(3, numNeuronsPerLayer, af);
+    BOOST_REQUIRE(!nn.isGpuEnabled());
+    BOOST_REQUIRE_NO_THROW(nn.setGpuEnabled(false));
+    BOOST_REQUIRE_THROW(nn.setGpuEnabled(true), runtime_error);
+    double input[2] = {0.1, 0.2};
+    double output = 0.0;
+    BOOST_REQUIRE_THROW(nn.propagateBatchGpu(1, input, &output, nullptr),
+                        runtime_error);
+}
+#endif
+
 BOOST_AUTO_TEST_SUITE_END()
+
+#ifdef N2P2_GPU
+// Tests of the GPU twin of NeuralNetwork against the CPU implementation, in
+// the same binary.
+
+// Network architecture for the GPU tests.
+struct Architecture
+{
+    vector<int>                               numNeurons;
+    vector<NeuralNetwork::ActivationFunction> activations;
+    bool                                      normalize;
+};
+
+ostream& operator<<(ostream& os, Architecture const& a)
+{
+    for (size_t l = 0; l < a.numNeurons.size(); ++l)
+    {
+        os << a.numNeurons.at(l) << "(" << a.activations.at(l) << ") ";
+    }
+    return os << (a.normalize ? "normalized" : "");
+}
+
+// Small, medium and deep networks, every activation function in a hidden
+// layer and as output activation, with and without normalized neurons.
+vector<Architecture> gpuArchitectures()
+{
+    typedef NeuralNetwork NN;
+    vector<Architecture> v;
+    v.push_back({{5, 8, 1}, {NN::AF_IDENTITY, NN::AF_TANH, NN::AF_IDENTITY},
+                 false});
+    for (int f = NN::AF_IDENTITY; f <= NN::AF_HARMONIC; ++f)
+    {
+        NN::ActivationFunction const af = static_cast<NN::ActivationFunction>(f);
+        v.push_back({{6, 10, 7, 1},
+                     {NN::AF_IDENTITY, af, NN::AF_TANH, NN::AF_IDENTITY},
+                     false});
+        v.push_back({{6, 9, 1}, {NN::AF_IDENTITY, NN::AF_SOFTPLUS, af},
+                     true});
+    }
+    v.push_back({{4, 6, 5, 3, 1},
+                 {NN::AF_IDENTITY, NN::AF_TANH, NN::AF_LOGISTIC,
+                  NN::AF_SOFTPLUS, NN::AF_IDENTITY},
+                 true});
+    return v;
+}
+
+// Network with deterministic, irregular connections.
+unique_ptr<NeuralNetwork> makeNetwork(Architecture const& a)
+{
+    unique_ptr<NeuralNetwork> nn(new NeuralNetwork(a.numNeurons.size(),
+                                                   a.numNeurons.data(),
+                                                   a.activations.data()));
+    nn->setNormalizeNeurons(a.normalize);
+    vector<double> c(nn->getNumConnections());
+    for (size_t i = 0; i < c.size(); ++i) c.at(i) = 0.8 * sin(1.3 * i + 0.4);
+    nn->setConnections(c.data());
+    return nn;
+}
+
+// Inputs (numIn x numInputs), one input scaled up to reach the overflow
+// branches of the exponential activation functions.
+vector<double> makeInputs(size_t numIn, size_t numInputs, size_t seed)
+{
+    vector<double> in(numIn * numInputs);
+    for (size_t i = 0; i < in.size(); ++i)
+    {
+        in.at(i) = 1.5 * sin(0.7 * i + 0.3 * seed);
+    }
+    for (size_t k = 0; k < numIn; ++k) in.at(k) *= 40.0;
+    return in;
+}
+
+// Propagates the inputs through cpu (one by one) and gpu (as a batch) and
+// requires the same outputs and derivatives. Round-off scales with the
+// largest magnitude of an input's results, so the absolute tolerance does
+// too (near-zero derivatives are differences of large terms).
+void requireSamePropagation(NeuralNetwork& cpu,
+                            NeuralNetwork& gpu,
+                            size_t         numIn,
+                            size_t         numInputs,
+                            size_t         seed)
+{
+    vector<double> const in = makeInputs(numIn, numInputs, seed);
+    vector<double> outGpu(numInputs);
+    vector<double> dEdGGpu(numIn * numInputs);
+    gpu.propagateBatchGpu(numInputs, in.data(), outGpu.data(), dEdGGpu.data());
+    vector<double> dEdG(numIn);
+    for (size_t t = 0; t < numInputs; ++t)
+    {
+        double out = 0.0;
+        cpu.setInput(&(in.at(t * numIn)));
+        cpu.propagate();
+        cpu.getOutput(&out);
+        cpu.calculateDEdG(dEdG.data());
+        double scale = max(1.0, fabs(out));
+        for (double d : dEdG) scale = max(scale, fabs(d));
+        Tolerance const tolerance(gpuRelativeEvaluation * scale,
+                                  gpuRelativeEvaluation);
+        BOOST_TEST_INFO("input " << t);
+        REQUIRE_CLOSE_TO_REFERENCE(out, outGpu.at(t), tolerance);
+        for (size_t k = 0; k < numIn; ++k)
+        {
+            BOOST_TEST_INFO("input " << t << ", dEdG " << k);
+            REQUIRE_CLOSE_TO_REFERENCE(dEdG.at(k),
+                                       dEdGGpu.at(t * numIn + k),
+                                       tolerance);
+        }
+    }
+}
+
+// Requires the same neuron statistics of both networks.
+void requireSameStatistics(NeuralNetwork const& cpu, NeuralNetwork const& gpu)
+{
+    size_t const n = cpu.getNumNeurons();
+    vector<long> countCpu(n), countGpu(n);
+    vector<double> minCpu(n), maxCpu(n), sumCpu(n), sum2Cpu(n);
+    vector<double> minGpu(n), maxGpu(n), sumGpu(n), sum2Gpu(n);
+    cpu.getNeuronStatistics(countCpu.data(), minCpu.data(), maxCpu.data(),
+                            sumCpu.data(), sum2Cpu.data());
+    gpu.getNeuronStatistics(countGpu.data(), minGpu.data(), maxGpu.data(),
+                            sumGpu.data(), sum2Gpu.data());
+    for (size_t i = 0; i < n; ++i)
+    {
+        // The sum can cancel: round-off scales with count * largest value.
+        double const scale = max(1.0, max(fabs(minCpu.at(i)),
+                                          fabs(maxCpu.at(i))));
+        Tolerance const tolerance(gpuRelativeEvaluation * scale,
+                                  gpuRelativeEvaluation);
+        Tolerance const toleranceSum(gpuRelativeEvaluation * scale
+                                     * max(1L, countCpu.at(i)),
+                                     gpuRelativeEvaluation);
+        BOOST_TEST_INFO("neuron " << i);
+        BOOST_REQUIRE_EQUAL(countCpu.at(i), countGpu.at(i));
+        REQUIRE_CLOSE_TO_REFERENCE(minCpu.at(i), minGpu.at(i), tolerance);
+        REQUIRE_CLOSE_TO_REFERENCE(maxCpu.at(i), maxGpu.at(i), tolerance);
+        REQUIRE_CLOSE_TO_REFERENCE(sumCpu.at(i), sumGpu.at(i), toleranceSum);
+        REQUIRE_CLOSE_TO_REFERENCE(sum2Cpu.at(i), sum2Gpu.at(i), tolerance);
+    }
+}
+
+BOOST_AUTO_TEST_SUITE(GpuTests)
+
+BOOST_DATA_TEST_CASE(PropagateBatch_Architectures_MatchesCpu,
+                     bdata::make(gpuArchitectures()),
+                     architecture)
+{
+    unique_ptr<NeuralNetwork> cpu = makeNetwork(architecture);
+    unique_ptr<NeuralNetwork> gpu = makeNetwork(architecture);
+    gpu->setGpuEnabled(true);
+    BOOST_REQUIRE(gpu->isGpuEnabled());
+    size_t const numIn = architecture.numNeurons.front();
+    // Growing and shrinking batches reuse and grow the device buffers.
+    size_t seed = 0;
+    for (size_t numInputs : {3, 40, 1, 97})
+    {
+        BOOST_TEST_INFO("batch of " << numInputs);
+        requireSamePropagation(*cpu, *gpu, numIn, numInputs, seed++);
+    }
+    requireSameStatistics(*cpu, *gpu);
+}
+
+BOOST_AUTO_TEST_CASE(PropagateBatch_ConnectionsChanged_FollowsCpu)
+{
+    // The GPU twin must follow every change of the connections.
+    Architecture const a = gpuArchitectures().front();
+    unique_ptr<NeuralNetwork> cpu = makeNetwork(a);
+    unique_ptr<NeuralNetwork> gpu = makeNetwork(a);
+    gpu->setGpuEnabled(true);
+    size_t const numIn = a.numNeurons.front();
+
+    vector<double> c(cpu->getNumConnections());
+    for (size_t i = 0; i < c.size(); ++i) c.at(i) = 0.5 * cos(0.9 * i);
+    cpu->setConnections(c.data());
+    gpu->setConnections(c.data());
+    requireSamePropagation(*cpu, *gpu, numIn, 10, 1);
+
+    cpu->modifyConnections(NeuralNetwork::MS_ZEROBIAS);
+    gpu->modifyConnections(NeuralNetwork::MS_ZEROBIAS);
+    requireSamePropagation(*cpu, *gpu, numIn, 10, 2);
+
+    cpu->modifyConnections(NeuralNetwork::MS_PRECONDITIONOUTPUT, 0.3, 2.0);
+    gpu->modifyConnections(NeuralNetwork::MS_PRECONDITIONOUTPUT, 0.3, 2.0);
+    requireSamePropagation(*cpu, *gpu, numIn, 10, 3);
+
+    cpu->setNormalizeNeurons(true);
+    gpu->setNormalizeNeurons(true);
+    BOOST_REQUIRE(gpu->isGpuEnabled());
+    requireSamePropagation(*cpu, *gpu, numIn, 10, 4);
+}
+
+BOOST_AUTO_TEST_CASE(PropagateBatch_NoInputs_NothingChanges)
+{
+    Architecture const a = gpuArchitectures().front();
+    unique_ptr<NeuralNetwork> cpu = makeNetwork(a);
+    unique_ptr<NeuralNetwork> gpu = makeNetwork(a);
+    gpu->setGpuEnabled(true);
+    BOOST_REQUIRE_NO_THROW(gpu->propagateBatchGpu(0, nullptr, nullptr,
+                                                  nullptr));
+    requireSameStatistics(*cpu, *gpu);
+}
+
+BOOST_AUTO_TEST_CASE(PropagateBatch_GpuNotEnabled_Throws)
+{
+    unique_ptr<NeuralNetwork> nn = makeNetwork(gpuArchitectures().front());
+    double input[5] = {0.1, 0.2, 0.3, 0.4, 0.5};
+    double output = 0.0;
+    BOOST_REQUIRE_THROW(nn->propagateBatchGpu(1, input, &output, nullptr),
+                        runtime_error);
+}
+
+BOOST_AUTO_TEST_CASE(SetGpuEnabled_NoVisibleDevice_Throws)
+{
+    BOOST_REQUIRE_EQUAL(runWithoutGpu("WithoutGpu"), 0);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// Run only by runWithoutGpu() above, in a process without visible devices.
+BOOST_AUTO_TEST_SUITE(WithoutGpu, *boost::unit_test::disabled())
+
+BOOST_AUTO_TEST_CASE(SetGpuEnabled_NoVisibleDevice_Throws)
+{
+    unique_ptr<NeuralNetwork> nn = makeNetwork(gpuArchitectures().front());
+    BOOST_REQUIRE_THROW(nn->setGpuEnabled(true), runtime_error);
+    BOOST_REQUIRE(!nn->isGpuEnabled());
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+#endif

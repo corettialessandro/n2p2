@@ -3806,6 +3806,9 @@ void Training::randomizeNeuralNetworkWeights(string const& id)
             nn.modifyConnections(NeuralNetwork::MS_ZEROBIAS);
         }
     }
+#ifdef N2P2_GPU
+    setNeuralNetworkGpuEnabled(id, true);
+#endif
 
     return;
 }
