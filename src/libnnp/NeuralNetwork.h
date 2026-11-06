@@ -17,12 +17,15 @@
 #ifndef NEURALNETWORK_H
 #define NEURALNETWORK_H
 
+#include <cstddef>   // std::size_t
 #include <fstream>   // std::ofstream
 #include <string>    // std::string
 #include <vector>    // std::vector
 
 namespace nnp
 {
+
+class GpuNeuralNetwork;
 
 /// This class implements a feed-forward neural network.
 class NeuralNetwork
@@ -126,6 +129,37 @@ public:
                 int const* const&                numNeuronsPerLayer,
                 ActivationFunction const* const& activationFunctionsPerLayer);
     ~NeuralNetwork();
+    /** Switch the GPU twin of this network on or off.
+     *
+     * @param[in] enabled Create the GPU twin if true, delete it if false.
+     *
+     * Required for #propagateBatchGpu(). Mode switches it on when the
+     * weights are set up (GPU builds only). Throws std::runtime_error when
+     * enabling the GPU in a CPU build.
+     */
+    void                     setGpuEnabled(bool enabled);
+    /** Check if the GPU twin of this network exists.
+     */
+    bool                     isGpuEnabled() const;
+    /** Propagate a batch of inputs on the GPU.
+     *
+     * @param[in] numInputs Number of input vectors.
+     * @param[in] input Input vectors, one after the other.
+     * @param[out] output Output neuron value for each input vector.
+     * @param[out] dEdG Derivatives of the output with respect to the
+     *                  inputs, same layout as input. Not calculated if
+     *                  nullptr.
+     *
+     * Gives the same results as #setInput(), #propagate(), #getOutput() and
+     * #calculateDEdG() for each input vector, up to round-off, and updates
+     * the neuron statistics the same way. Does not change the neuron values
+     * of this object. Throws std::runtime_error if the GPU twin does not
+     * exist.
+     */
+    void                     propagateBatchGpu(std::size_t   numInputs,
+                                               double const* input,
+                                               double*       output,
+                                               double*       dEdG);
     // Prevent copying.
     //NeuralNetwork(const NeuralNetwork&) = delete;
     //NeuralNetwork(NeuralNetwork&&) = delete;
@@ -427,6 +461,11 @@ private:
     Layer* outputLayer;
     /// Neural network layers.
     Layer* layers;
+    /// GPU twin of this network, nullptr if not enabled.
+    GpuNeuralNetwork* gpu;
+
+    /// Copy the connections to the GPU twin, if enabled.
+    void   updateGpuConnections() const;
 
     /** Calculate derivative of output neuron with respect to biases.
      *

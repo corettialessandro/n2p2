@@ -7,6 +7,9 @@
 #include "fileHelpers.h"
 #include "ExamplePrediction.h"
 #include "tolerance.h"
+#ifdef N2P2_GPU
+#include "gpuTest.h"
+#endif
 
 #include "Atom.h"
 #include "Structure.h"
@@ -16,6 +19,8 @@
 #include <cmath>   // std::fabs
 #include <cstddef> // std::size_t
 #include <fstream> // std::ifstream, std::ofstream
+#include <map>     // std::map
+#include <stdexcept> // std::runtime_error
 #include <limits> // std::numeric_limits
 #include <string> // std::string, std::string::find_last_of
 #include <vector> // std::vector
@@ -664,3 +669,132 @@ BOOST_FIXTURE_TEST_CASE(CommitteeMembers_OnlyWeights_Accepted,
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+#ifdef N2P2_GPU
+// Tests of the neural networks on the GPU against the CPU, in the same
+// binary, with all prediction examples (2G and 4G).
+
+vector<string> const predictionExamples = {"AlAuMgO_4G",
+                                           "Anisole_SCAN",
+                                           "Carbon_chain_4G",
+                                           "Cu2S_PBE",
+                                           "DMABN_SCAN",
+                                           "Ethylbenzene_SCAN",
+                                           "H2O_RPBE-D3",
+                                           "H2O_RPBE-D3_4G"};
+
+// Results of one prediction.
+struct GpuPredictionResult
+{
+    double         energy;
+    vector<double> atomEnergies;
+    vector<double> charges;
+    vector<Vec3D>  forces;
+};
+
+GpuPredictionResult predictOnce(Prediction& p)
+{
+    p.readStructureFromFile();
+    p.predict();
+    GpuPredictionResult r;
+    r.energy = p.structure.energy;
+    for (auto const& a : p.structure.atoms)
+    {
+        r.atomEnergies.push_back(a.energy);
+        r.charges.push_back(a.charge);
+        r.forces.push_back(a.f);
+    }
+    return r;
+}
+
+// Requires equal vectors, with round-off scaled by their largest entry.
+void requireClose(vector<double> const& cpu,
+                  vector<double> const& gpu,
+                  string const&         what)
+{
+    BOOST_REQUIRE_EQUAL(cpu.size(), gpu.size());
+    double scale = 1.0;
+    for (double v : cpu) scale = max(scale, fabs(v));
+    Tolerance const tolerance(gpuRelativeEvaluation * scale,
+                              gpuRelativeEvaluation);
+    for (size_t i = 0; i < cpu.size(); ++i)
+    {
+        BOOST_TEST_INFO(what << " " << i);
+        REQUIRE_CLOSE_TO_REFERENCE(cpu.at(i), gpu.at(i), tolerance);
+    }
+}
+
+BOOST_AUTO_TEST_SUITE(GpuTests)
+
+BOOST_DATA_TEST_CASE_F(FixtureRepairDir,
+                       Predict_Gpu_MatchesCpu,
+                       bdata::make(predictionExamples),
+                       name)
+{
+    BOOST_REQUIRE(copy_directory_recursively("../../examples/nnp-predict/"
+                                             + name, "test"));
+    bfs::current_path("test");
+
+    Prediction p;
+    p.log.writeToStdout = false;
+    p.setup();
+    GpuPredictionResult const gpu = predictOnce(p);
+    vector<string> ids = {"short"};
+    if (p.getNnpType() != Mode::NNPType::HDNNP_2G) ids.push_back("elec");
+    for (auto const& id : ids) p.setNeuralNetworkGpuEnabled(id, false);
+    GpuPredictionResult const cpu = predictOnce(p);
+
+    BOOST_TEST_INFO(name);
+    requireClose({cpu.energy}, {gpu.energy}, name + " energy");
+    requireClose(cpu.atomEnergies, gpu.atomEnergies, name + " atom energy");
+    requireClose(cpu.charges, gpu.charges, name + " charge");
+    vector<double> forcesCpu;
+    vector<double> forcesGpu;
+    for (size_t i = 0; i < cpu.forces.size(); ++i)
+    {
+        for (size_t k = 0; k < 3; ++k)
+        {
+            forcesCpu.push_back(cpu.forces.at(i)[k]);
+            forcesGpu.push_back(gpu.forces.at(i)[k]);
+        }
+    }
+    requireClose(forcesCpu, forcesGpu, name + " force component");
+
+    bfs::current_path("..");
+    bfs::remove_all("test");
+}
+
+BOOST_AUTO_TEST_CASE(SetupWeights_NoVisibleDevice_Throws)
+{
+    // The device check belongs to setting up the weights: setupGeneric()
+    // alone (used by tools not evaluating networks) runs without a GPU.
+    BOOST_REQUIRE_EQUAL(runWithoutGpu("WithoutGpu"), 0);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// Run only by runWithoutGpu() above, in a process without visible devices.
+BOOST_AUTO_TEST_SUITE(WithoutGpu, *boost::unit_test::disabled())
+
+BOOST_FIXTURE_TEST_CASE(SetupWeights_NoVisibleDevice_Throws,
+                        FixtureRepairDir)
+{
+    BOOST_REQUIRE(copy_directory_recursively(
+        "../../examples/nnp-predict/H2O_RPBE-D3", "nogpu"));
+    bfs::current_path("nogpu");
+
+    Prediction p;
+    p.log.writeToStdout = false;
+    p.initialize();
+    p.loadSettingsFile("input.nn");
+    BOOST_REQUIRE_NO_THROW(p.setupGeneric());
+    p.setupSymmetryFunctionScaling("scaling.data");
+    map<string, string> const formats {{"short", "weights.%03zu.data"}};
+    BOOST_REQUIRE_THROW(p.setupNeuralNetworkWeights(formats), runtime_error);
+
+    bfs::current_path("..");
+    bfs::remove_all("nogpu");
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+#endif

@@ -89,9 +89,17 @@ tolerance profile of `test/cpp/tolerance.h`.
 | Feature | GPU part | Device check | Fallback to CPU |
 |---|---|---|---|
 | Kalman filter (`KalmanFilter`, both types) | P on the device; X = P . H and P = scale (P - K . X^T) + q I | `KalmanFilter` constructor (via `GpuKalmanFilter`) | none needed |
+| Atomic neural networks (`NeuralNetwork`, `Mode::calculateAtomicNeuralNetworks()`): 2G, 4G (elec, short), HDNNP_Q | forward pass and derivatives with respect to the inputs, all atoms of an element as one batch; neuron statistics | when the weights of a network type are set up: `Mode::readNeuralNetworkWeights()`, `Training::randomizeNeuralNetworkWeights()` (via `GpuNeuralNetwork`); not in `setupGeneric()`, which tools without network evaluation use too | none needed (any depth, all activation functions, normalized neurons) |
 
 ## Programs that require a GPU in a GPU build
 
-- `nnp-train` with the Kalman filter updater (`updater_type 1`): the
-  updaters are created in `Training::setupTraining()`, before the first
-  epoch.
+- All programs evaluating neural networks, from the moment they read or
+  initialize the weights: `nnp-train`, `nnp-norm2`, `nnp-predict`,
+  `nnp-checkf`, `nnp-checkdw`, `nnp-comp2`, `nnp-dataset` (when predicting
+  with weights) and the LAMMPS pair styles (`InterfaceLammps`).
+- `nnp-train` with the Kalman filter updater (`updater_type 1`) also for the
+  updaters, created in `Training::setupTraining()`.
+
+Programs that never set up weights run without a GPU: `nnp-scaling`,
+`nnp-atomenv`, `nnp-convert`, `nnp-cutoff`, `nnp-dist`, `nnp-norm`,
+`nnp-prune`, `nnp-select`, `nnp-symfunc`, `nnp-dataset` without weights.
