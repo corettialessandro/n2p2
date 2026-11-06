@@ -38,6 +38,9 @@ namespace
  * are slower (the geometry of each pair is computed once per chunk).
  */
 int const maxMembers = 4;
+/// Pairs of neighbors per batch of an angular work item (see angularItem()).
+/// A constant: the results depend on it.
+int const pairCapacity = 512;
 int const threadsPerBlock = 128;
 int const warpsPerBlock = threadsPerBlock / 32;
 /* calculateKernel launch: 64 threads per atom (8 blocks per SM, i.e. at
@@ -225,32 +228,39 @@ __device__ double powInt(double x, int n)
     return result;
 }
 
-/* Contributions of neighbor w (local index among the neighbors of the chunk's
- * elements: those of e1, then those of e2) to the symmetry functions of the
- * chunk, added to g, and the derivatives with respect to its position, which
- * only this call writes. Angular terms of each pair of neighbors are computed
- * twice (once for each neighbor), values are halved later. cache: cutoff
- * function and derivative of the chunk's cutoff for each neighbor j.
+/// Squared distance of neighbors j and k (distance vectors dj, dk), rounded
+/// the same way wherever it decides whether a pair is within the cutoff.
+__device__ __forceinline__ double distance2(double const* dj, double const* dk)
+{
+    double const dx = __dsub_rn(dk[0], dj[0]);
+    double const dy = __dsub_rn(dk[1], dj[1]);
+    double const dz = __dsub_rn(dk[2], dj[2]);
+    return __dadd_rn(__dadd_rn(__dmul_rn(dx, dx), __dmul_rn(dy, dy)),
+                     __dmul_rn(dz, dz));
+}
+
+/* Radial chunk: contributions of neighbor w (local index among the neighbors
+ * of the chunk's elements: those of e1, then those of e2) to the symmetry
+ * functions of the chunk, added to g, and the derivatives with respect to its
+ * position, which only this call writes. cache: cutoff function and
+ * derivative of the chunk's cutoff for each neighbor j.
  */
-__device__ __forceinline__ void neighborTerms(Chunk const&  ch,
-                                              int           w,
-                                              int           n1,
-                                              int           b1,
-                                              int           b2,
-                                              int const*    order,
-                                              int const*    elementOffset,
-                                              int const*    elements,
-                                              double const* geometry,
-                                              double const* cache,
-                                              int           n0,
-                                              int const*    derivOffset,
-                                              bool          derivatives,
-                                              double*       deriv,
-                                              double        (&g)[maxMembers])
+__device__ __forceinline__ void radialTerms(Chunk const&  ch,
+                                            int           w,
+                                            int           n1,
+                                            int           b1,
+                                            int           b2,
+                                            int const*    order,
+                                            double const* geometry,
+                                            double const* cache,
+                                            int           n0,
+                                            int const*    derivOffset,
+                                            bool          derivatives,
+                                            double*       deriv,
+                                            double        (&g)[maxMembers])
 {
     double const rc = ch.cutoff.rc;
     int const j = order[w < n1 ? b1 + w : b2 + w - n1];
-    int const ej = elements[j];
     double const rij = geometry[4 * j];
     if (!(rij < rc)) return;
     double const* drij = geometry + 4 * j + 1;
@@ -259,139 +269,306 @@ __device__ __forceinline__ void neighborTerms(Chunk const&  ch,
     double* dj = derivatives
                ? deriv + 3 * static_cast<size_t>(derivOffset[n0 + j])
                : nullptr;
-    if (ch.kind == RADIAL)
-    {
-        #pragma unroll
-        for (int m = 0; m < maxMembers; ++m)
-        {
-            if (m >= ch.numMembers) continue;
-            double const rijs = rij - ch.rs[m];
-            double const pexp = exp(-ch.eta[m] * rijs * rijs);
-            g[m] += pexp * pfcij;
-            if (!derivatives) continue;
-            double const p1 = ch.scaleFactor[m]
-                            * (pdfcij - 2.0 * ch.eta[m] * rijs
-                               * pfcij) * pexp / rij;
-            double* d = dj + 3 * ch.deriv1[m];
-            d[0] = -p1 * drij[0];
-            d[1] = -p1 * drij[1];
-            d[2] = -p1 * drij[2];
-        }
-        return;
-    }
-
-    bool const narrow = (ch.kind == ANGULAR_NARROW);
-    double const r2ij = rij * rij;
-    double dg[maxMembers][3];
-    for (int m = 0; m < maxMembers; ++m)
-    {
-        dg[m][0] = 0.0;
-        dg[m][1] = 0.0;
-        dg[m][2] = 0.0;
-    }
-    // Neighbors of the partner element.
-    int const ep = (ej == ch.e1) ? ch.e2 : ch.e1;
-    for (int q = elementOffset[ep]; q < elementOffset[ep + 1]; ++q)
-    {
-        int const k = order[q];
-        if (k == j) continue;
-        double const rik = geometry[4 * k];
-        if (!(rik < rc)) continue;
-        double const* drik = geometry + 4 * k + 1;
-        double const drjk[3] = {drik[0] - drij[0],
-                                drik[1] - drij[1],
-                                drik[2] - drij[2]};
-        double rjk = 0.0;
-        double pfcjk = 1.0;
-        double pdfcjk = 0.0;
-        if (narrow)
-        {
-            double const r2jk = drjk[0] * drjk[0]
-                              + drjk[1] * drjk[1]
-                              + drjk[2] * drjk[2];
-            if (!(r2jk < rc * rc)) continue;
-            rjk = sqrt(r2jk);
-            cutoffFunction(ch.cutoff, rjk, pfcjk, pdfcjk);
-        }
-        double const pfcik = cache[2 * k];
-        double const rinvijik = 1.0 / rij / rik;
-        double const costijk = (drij[0] * drik[0] +
-                                drij[1] * drik[1] +
-                                drij[2] * drik[2]) * rinvijik;
-        double const pfc = narrow ? pfcij * pfcik * pfcjk
-                                  : pfcij * pfcik;
-        double rijs = 0.0;
-        double riks = 0.0;
-        double rjks = 0.0;
-        double pexp = 0.0;
-        #pragma unroll
-        for (int m = 0; m < maxMembers; ++m)
-        {
-            if (m >= ch.numMembers) continue;
-            if (ch.newExp[m])
-            {
-                rijs = rij - ch.rs[m];
-                riks = rik - ch.rs[m];
-                if (narrow)
-                {
-                    rjks = rjk - ch.rs[m];
-                    pexp = exp(-ch.eta[m] * (rijs * rijs +
-                                             riks * riks +
-                                             rjks * rjks));
-                }
-                else
-                {
-                    pexp = exp(-ch.eta[m] * (rijs * rijs +
-                                             riks * riks));
-                }
-            }
-            double const plambda = 1.0 + ch.lambda[m] * costijk;
-            double fg = pexp;
-            if (plambda <= 0.0) fg = 0.0;
-            else if (ch.useIntegerPow[m])
-            {
-                fg *= powInt(plambda, ch.zetaInt[m] - 1);
-            }
-            else fg *= pow(plambda, ch.zeta[m] - 1.0);
-            g[m] += fg * plambda * pfc;
-            if (!derivatives) continue;
-            fg *= ch.pnorm[m];
-            double const rinv = rinvijik * ch.pzl[m];
-            double const cost = costijk * ch.pzl[m];
-            double const p2etapl = 2.0 * ch.eta[m] * plambda;
-            double p1;
-            double p3;
-            if (narrow)
-            {
-                p1 = fg * (pfc * (rinv - cost / r2ij
-                                  - p2etapl * rijs / rij)
-                           + pfcik * pfcjk * pdfcij * plambda / rij);
-                p3 = fg * (pfc * (rinv + p2etapl * rjks / rjk)
-                           - pfcij * pfcik * pdfcjk * plambda / rjk);
-            }
-            else
-            {
-                p1 = fg * (pfc * (rinv - cost / r2ij
-                                  - p2etapl * rijs / rij)
-                           + pfcik * pdfcij * plambda / rij);
-                p3 = fg * pfc * rinv;
-            }
-            dg[m][0] -= p1 * drij[0] + p3 * drjk[0];
-            dg[m][1] -= p1 * drij[1] + p3 * drjk[1];
-            dg[m][2] -= p1 * drij[2] + p3 * drjk[2];
-        }
-    }
-    if (!derivatives) return;
     #pragma unroll
     for (int m = 0; m < maxMembers; ++m)
     {
         if (m >= ch.numMembers) continue;
-        int const index = (ej == ch.e1) ? ch.deriv1[m] : ch.deriv2[m];
-        double* d = dj + 3 * index;
-        d[0] = dg[m][0] * ch.scaleFactor[m];
-        d[1] = dg[m][1] * ch.scaleFactor[m];
-        d[2] = dg[m][2] * ch.scaleFactor[m];
+        double const rijs = rij - ch.rs[m];
+        double const pexp = exp(-ch.eta[m] * rijs * rijs);
+        g[m] += pexp * pfcij;
+        if (!derivatives) continue;
+        double const p1 = ch.scaleFactor[m]
+                        * (pdfcij - 2.0 * ch.eta[m] * rijs
+                           * pfcij) * pexp / rij;
+        double* d = dj + 3 * ch.deriv1[m];
+        d[0] = -p1 * drij[0];
+        d[1] = -p1 * drij[1];
+        d[2] = -p1 * drij[2];
     }
+}
+
+/* Angular chunk: contributions of the pair of neighbors j and k (both within
+ * the cutoff, k a neighbor of the other element of the chunk) to the
+ * symmetry functions, added to g, and to their derivatives with respect to
+ * the position of j, added to dg (not yet scaled). Each pair is done twice
+ * (as (j, k) and as (k, j)), values are halved later.
+ */
+__device__ __forceinline__ void pairTerms(Chunk const&  ch,
+                                          int           j,
+                                          int           k,
+                                          double const* geometry,
+                                          double const* cache,
+                                          bool          derivatives,
+                                          double        (&g)[maxMembers],
+                                          double        (&dg)[maxMembers][3])
+{
+    bool const narrow = (ch.kind == ANGULAR_NARROW);
+    double const rc = ch.cutoff.rc;
+    double const rij = geometry[4 * j];
+    double const* drij = geometry + 4 * j + 1;
+    double const pfcij = cache[2 * j];
+    double const pdfcij = cache[2 * j + 1];
+    double const r2ij = rij * rij;
+    double const rik = geometry[4 * k];
+    double const* drik = geometry + 4 * k + 1;
+    double const drjk[3] = {drik[0] - drij[0],
+                            drik[1] - drij[1],
+                            drik[2] - drij[2]};
+    double rjk = 0.0;
+    double pfcjk = 1.0;
+    double pdfcjk = 0.0;
+    if (narrow)
+    {
+        double const r2jk = distance2(drij, drik);
+        if (!(r2jk < rc * rc)) return;
+        rjk = sqrt(r2jk);
+        cutoffFunction(ch.cutoff, rjk, pfcjk, pdfcjk);
+    }
+    double const pfcik = cache[2 * k];
+    double const rinvijik = 1.0 / rij / rik;
+    double const costijk = (drij[0] * drik[0] +
+                            drij[1] * drik[1] +
+                            drij[2] * drik[2]) * rinvijik;
+    double const pfc = narrow ? pfcij * pfcik * pfcjk
+                              : pfcij * pfcik;
+    double rijs = 0.0;
+    double riks = 0.0;
+    double rjks = 0.0;
+    double pexp = 0.0;
+    #pragma unroll
+    for (int m = 0; m < maxMembers; ++m)
+    {
+        if (m >= ch.numMembers) continue;
+        if (ch.newExp[m])
+        {
+            rijs = rij - ch.rs[m];
+            riks = rik - ch.rs[m];
+            if (narrow)
+            {
+                rjks = rjk - ch.rs[m];
+                pexp = exp(-ch.eta[m] * (rijs * rijs +
+                                         riks * riks +
+                                         rjks * rjks));
+            }
+            else
+            {
+                pexp = exp(-ch.eta[m] * (rijs * rijs +
+                                         riks * riks));
+            }
+        }
+        double const plambda = 1.0 + ch.lambda[m] * costijk;
+        double fg = pexp;
+        if (plambda <= 0.0) fg = 0.0;
+        else if (ch.useIntegerPow[m])
+        {
+            fg *= powInt(plambda, ch.zetaInt[m] - 1);
+        }
+        else fg *= pow(plambda, ch.zeta[m] - 1.0);
+        g[m] += fg * plambda * pfc;
+        if (!derivatives) continue;
+        fg *= ch.pnorm[m];
+        double const rinv = rinvijik * ch.pzl[m];
+        double const cost = costijk * ch.pzl[m];
+        double const p2etapl = 2.0 * ch.eta[m] * plambda;
+        double p1;
+        double p3;
+        if (narrow)
+        {
+            p1 = fg * (pfc * (rinv - cost / r2ij
+                              - p2etapl * rijs / rij)
+                       + pfcik * pfcjk * pdfcij * plambda / rij);
+            p3 = fg * (pfc * (rinv + p2etapl * rjks / rjk)
+                       - pfcij * pfcik * pdfcjk * plambda / rjk);
+        }
+        else
+        {
+            p1 = fg * (pfc * (rinv - cost / r2ij
+                              - p2etapl * rijs / rij)
+                       + pfcik * pdfcij * plambda / rij);
+            p3 = fg * pfc * rinv;
+        }
+        dg[m][0] -= p1 * drij[0] + p3 * drjk[0];
+        dg[m][1] -= p1 * drij[1] + p3 * drjk[1];
+        dg[m][2] -= p1 * drij[2] + p3 * drjk[2];
+    }
+}
+
+/* Angular chunk, one work item (slice s of 32 neighbors j of the chunk's
+ * elements), done by the whole warp on the pairs (j, k) instead of one lane
+ * per j: the partners k of a neighbor j that contribute (within the cutoff,
+ * for the narrow type also within the cutoff of j) differ in number from j to
+ * j, so with one lane per j most lanes would wait for the one with the most
+ * partners. Each lane counts the valid partners of its j, the pairs are
+ * listed in lane order (j by j, partners in their order) in batches of at
+ * most pairCapacity, and each lane takes an equal, contiguous share of a
+ * batch.
+ *
+ * Values: each lane adds its pairs to g (summed over the warp afterwards).
+ * Derivatives with respect to the position of j: the pairs of a j form one
+ * contiguous range, which may be split between consecutive lanes. A lane
+ * goes through its share backwards, summing the pairs of each j in dg: the
+ * sums of ranges that end in this lane's share (j contained in it, or
+ * continued by the next lanes) are added to the sum of j (acc) right away,
+ * by the only lane with such a range of j; the first range, if j started in
+ * an earlier lane, is added afterwards in lane order (one round per lane
+ * sharing j). Everything is summed in a fixed order: the results depend
+ * only on the structure and pairCapacity, a constant.
+ *
+ * Shared memory of the warp: pairs (pairCapacity ints: j's lane << 16 | k),
+ * acc (32 * 3 * maxMembers doubles), info (first pair, number of pairs and
+ * neighbor index of each lane's j: 96 ints).
+ */
+__device__ void angularItem(Chunk const&  ch,
+                            int           s,
+                            int           n,
+                            int           n1,
+                            int           b1,
+                            int           b2,
+                            int const*    order,
+                            int const*    elementOffset,
+                            int const*    elements,
+                            double const* geometry,
+                            double const* cache,
+                            int           n0,
+                            int const*    derivOffset,
+                            bool          derivatives,
+                            double*       deriv,
+                            int*          pairs,
+                            double*       acc,
+                            int*          info,
+                            double        (&g)[maxMembers])
+{
+    unsigned const all = 0xffffffff;
+    int const lane = threadIdx.x % 32;
+    bool const narrow = (ch.kind == ANGULAR_NARROW);
+    double const rc = ch.cutoff.rc;
+    int const w = 32 * s + lane;
+    int j = -1;
+    if (w < n)
+    {
+        j = order[w < n1 ? b1 + w : b2 + w - n1];
+        if (!(geometry[4 * j] < rc)) j = -1;
+    }
+    // Partners: neighbors of the other element of the chunk.
+    int qBegin = 0;
+    int qEnd = 0;
+    if (j >= 0)
+    {
+        int const ep = (elements[j] == ch.e1) ? ch.e2 : ch.e1;
+        qBegin = elementOffset[ep];
+        qEnd = elementOffset[ep + 1];
+    }
+    double const* drij = geometry + 4 * (j >= 0 ? j : 0) + 1;
+    auto valid = [&](int k)
+    {
+        if (k == j || !(geometry[4 * k] < rc)) return false;
+        return !narrow || distance2(drij, geometry + 4 * k + 1) < rc * rc;
+    };
+    int count = 0;
+    for (int q = qBegin; q < qEnd; ++q)
+    {
+        if (valid(order[q])) ++count;
+    }
+    // First pair of each lane's j (lane order).
+    int last = count;
+    for (int o = 1; o < 32; o *= 2)
+    {
+        int const t = __shfl_up_sync(all, last, o);
+        if (lane >= o) last += t;
+    }
+    int const first = last - count;
+    int const total = __shfl_sync(all, last, 31);
+    info[lane] = first;
+    info[32 + lane] = count;
+    info[64 + lane] = j;
+    double* accLane = acc + lane * 3 * maxMembers;
+    for (int i = 0; i < 3 * maxMembers; ++i) accLane[i] = 0.0;
+    __syncwarp();
+
+    double dg[maxMembers][3];
+    // Add dg to the sum of the j of lane jl.
+    auto flush = [&](int jl)
+    {
+        double* a = acc + jl * 3 * maxMembers;
+        #pragma unroll
+        for (int m = 0; m < maxMembers; ++m)
+        {
+            a[3 * m + 0] += dg[m][0];
+            a[3 * m + 1] += dg[m][1];
+            a[3 * m + 2] += dg[m][2];
+        }
+    };
+    for (int batch = 0; batch < total; batch += pairCapacity)
+    {
+        int const batchEnd = min(total, batch + pairCapacity);
+        if (count > 0 && first < batchEnd && first + count > batch)
+        {
+            int index = first;
+            for (int q = qBegin; q < qEnd && index < batchEnd; ++q)
+            {
+                int const k = order[q];
+                if (!valid(k)) continue;
+                if (index >= batch) pairs[index - batch] = (lane << 16) | k;
+                ++index;
+            }
+        }
+        __syncwarp();
+        int const numPairs = batchEnd - batch;
+        int const share = (numPairs + 31) / 32;
+        int const p0 = min(lane * share, numPairs);
+        int const p1 = min(p0 + share, numPairs);
+        int current = -1;
+        for (int p = p1 - 1; p >= p0; --p)
+        {
+            int const jl = pairs[p] >> 16;
+            if (jl != current)
+            {
+                // The range of the previous j ends in this share.
+                if (current >= 0 && derivatives) flush(current);
+                current = jl;
+                for (int m = 0; m < maxMembers; ++m)
+                {
+                    dg[m][0] = 0.0;
+                    dg[m][1] = 0.0;
+                    dg[m][2] = 0.0;
+                }
+            }
+            pairTerms(ch, info[64 + jl], pairs[p] & 0xffff, geometry, cache,
+                      derivatives, g, dg);
+        }
+        // First range of the share: right away if j starts in it, else in
+        // lane order after the lanes before.
+        int rank = -1;
+        if (current >= 0 && derivatives)
+        {
+            int const start = max(info[current], batch) - batch;
+            if (start >= p0) flush(current);
+            else rank = lane - start / share - 1;
+        }
+        __syncwarp();
+        for (int r = 0; __any_sync(all, rank >= r); ++r)
+        {
+            if (rank == r) flush(current);
+            __syncwarp();
+        }
+    }
+    if (j >= 0 && derivatives && count > 0)
+    {
+        int const ej = elements[j];
+        double* dj = deriv + 3 * static_cast<size_t>(derivOffset[n0 + j]);
+        #pragma unroll
+        for (int m = 0; m < maxMembers; ++m)
+        {
+            if (m >= ch.numMembers) continue;
+            int const index = (ej == ch.e1) ? ch.deriv1[m] : ch.deriv2[m];
+            double* d = dj + 3 * index;
+            d[0] = accLane[3 * m + 0] * ch.scaleFactor[m];
+            d[1] = accLane[3 * m + 1] * ch.scaleFactor[m];
+            d[2] = accLane[3 * m + 2] * ch.scaleFactor[m];
+        }
+    }
+    // acc, info and pairs are reused by the next item of the warp.
+    __syncwarp();
 }
 
 /* One block per atom. Work items: slices of 32 neighbors of a chunk (the
@@ -400,8 +577,9 @@ __device__ __forceinline__ void neighborTerms(Chunk const&  ch,
  * items of all chunks of the atom one after the other, whichever warp is
  * free next, so items of different chunks run in parallel: many small chunks
  * (e.g. rare element pairs) do not leave most threads idle, and no block-wide
- * synchronization is needed per chunk. Each neighbor of an item is done by
- * one lane (neighborTerms()), which writes its derivatives; the derivatives
+ * synchronization is needed per chunk. Radial items: one lane per neighbor
+ * (radialTerms()); angular items: the warp shares the pairs of neighbors
+ * (angularItem()). The derivatives
  * with respect to the position of the atom itself follow from translation
  * invariance (see contract()). The cutoff function of each neighbor is
  * calculated once per atom for each distinct cutoff of the element.
@@ -415,8 +593,10 @@ __device__ __forceinline__ void neighborTerms(Chunk const&  ch,
  * Dynamic shared memory: cutoff function and derivative of each neighbor for
  * each distinct cutoff (maxCutoffs * 2 * neighborStride doubles), item sums
  * (capacity * maxMembers doubles), chunk sums (maxChunks * maxMembers
- * doubles), neighbors grouped by element (neighborStride ints), first item of
- * each chunk (maxChunks + 1 ints).
+ * doubles), per warp the derivative sums of an angular item (32 * 3 *
+ * maxMembers doubles), neighbors grouped by element (neighborStride ints),
+ * first item of each chunk (maxChunks + 1 ints), per warp the pairs and
+ * neighbor information of an angular item (pairCapacity + 96 ints).
  */
 template<int threads, int minBlocks>
 __global__ void __launch_bounds__(threads, minBlocks)
@@ -459,10 +639,17 @@ calculateKernel(Chunk const*  chunks,
     double* cache = shared;
     double* partial = cache + stride * maxCutoffs;
     double* accum = partial + static_cast<size_t>(capacity) * maxMembers;
+    int const numWarps = blockDim.x / 32;
+    double* warpAcc = accum + static_cast<size_t>(maxChunks) * maxMembers
+                    + warp * 32 * 3 * maxMembers;
     int* order = reinterpret_cast<int*>(accum
                                         + static_cast<size_t>(maxChunks)
-                                        * maxMembers);
+                                        * maxMembers
+                                        + numWarps * 32 * 3 * maxMembers);
     int* itemOffset = order + neighborStride;
+    int* warpPairs = itemOffset + maxChunks + 1
+                   + warp * (pairCapacity + 96);
+    int* warpInfo = warpPairs + pairCapacity;
     Chunk const* chunksElement = chunks + chunkOffset[element];
     int const numChunks = chunkOffset[element + 1] - chunkOffset[element];
     Cutoff const* cutoffsElement = cutoffs + cutoffOffset[element];
@@ -548,12 +735,22 @@ calculateKernel(Chunk const*  chunks,
             int const w = 32 * (item - itemOffset[c]) + lane;
             double g[maxMembers];
             for (int m = 0; m < maxMembers; ++m) g[m] = 0.0;
-            if (w < n)
+            double const* cacheChunk = cache + stride * ch.cutoffSlot;
+            if (ch.kind == RADIAL)
             {
-                neighborTerms(ch, w, n1, b1, b2, order, elementOffset,
-                              elements, geometry,
-                              cache + stride * ch.cutoffSlot, n0,
-                              derivOffset, derivatives, deriv, g);
+                if (w < n)
+                {
+                    radialTerms(ch, w, n1, b1, b2, order, geometry,
+                                cacheChunk, n0, derivOffset, derivatives,
+                                deriv, g);
+                }
+            }
+            else
+            {
+                angularItem(ch, item - itemOffset[c], n, n1, b1, b2, order,
+                            elementOffset, elements, geometry, cacheChunk, n0,
+                            derivOffset, derivatives, deriv, warpPairs,
+                            warpAcc, warpInfo, g);
             }
             for (int m = 0; m < maxMembers; ++m)
             {
@@ -1370,10 +1567,13 @@ void GpuSymmetryFunctionData::calculate(GpuSymmetryFunctionSet const& set,
         // (capacity items). Results do not depend on the capacity: as many
         // items as all chunks can have, within sharedBudget per block.
         size_t const stride = maxNeighborsStructure;
+        size_t const warps = threads / 32;
         size_t const fixed = s.maxCutoffs * 2 * stride * sizeof(double)
                            + s.maxChunks * maxMembers * sizeof(double)
+                           + warps * 32 * 3 * maxMembers * sizeof(double)
                            + stride * sizeof(int)
-                           + (s.maxChunks + 1) * sizeof(int);
+                           + (s.maxChunks + 1) * sizeof(int)
+                           + warps * (pairCapacity + 96) * sizeof(int);
         size_t const perItem = maxMembers * sizeof(double);
         size_t const maxItems = s.maxChunks * ((stride + 31) / 32);
         size_t const used = fixed + staticShared(kernel);
