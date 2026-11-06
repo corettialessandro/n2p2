@@ -22,24 +22,31 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import sys
 import time
 
 
 def start_mps(workdir):
-    """Start an MPS daemon for this run, return its environment."""
+    """Start an MPS daemon for this run, return its environment.
+
+    The pipe directory holds the daemon's Unix sockets, whose paths are
+    limited to about 100 characters: it goes to the temporary directory
+    (TMPDIR or /tmp), not to the (possibly long) work directory, which keeps
+    the log directory.
+    """
     env = dict(os.environ)
     tag = "%d_%d" % (os.getpid(), int(time.time()))
-    env["CUDA_MPS_PIPE_DIRECTORY"] = os.path.join(workdir, "mps_pipe_" + tag)
+    env["CUDA_MPS_PIPE_DIRECTORY"] = tempfile.mkdtemp(prefix="n2p2_mps_")
     env["CUDA_MPS_LOG_DIRECTORY"] = os.path.join(workdir, "mps_log_" + tag)
-    for key in ("CUDA_MPS_PIPE_DIRECTORY", "CUDA_MPS_LOG_DIRECTORY"):
-        os.makedirs(env[key], exist_ok=True)
+    os.makedirs(env["CUDA_MPS_LOG_DIRECTORY"], exist_ok=True)
     subprocess.run(["nvidia-cuda-mps-control", "-d"], env=env, check=True)
     return env
 
 
 def stop_mps(env):
     subprocess.run(["nvidia-cuda-mps-control"], input=b"quit\n", env=env)
+    shutil.rmtree(env["CUDA_MPS_PIPE_DIRECTORY"], ignore_errors=True)
 
 
 def launch(args, ranks, command, rundir, env):
