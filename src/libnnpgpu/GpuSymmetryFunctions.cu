@@ -43,16 +43,16 @@ int const maxMembers = 4;
 int const pairCapacity = 512;
 int const threadsPerBlock = 128;
 int const warpsPerBlock = threadsPerBlock / 32;
-/* calculateKernel launch: 64 threads per atom (8 blocks per SM, i.e. at
- * most 65536 / (64 * 8) = 128 registers per thread) from largeLaunchAtoms
- * atoms per launch on, else 128 threads (4 blocks per SM, same register
- * limit). The results do not
+/* calculateKernel launch: 128 threads per atom (4 blocks per SM, i.e. at
+ * most 65536 / (128 * 4) = 128 registers per thread). The results do not
  * depend on the block size (see calculateKernel), so this is a pure
- * performance choice. Measured on A100 with 2G water (6.4 A cutoff, 32 ranks
- * on 4 GPUs with MPS): 128 threads for 270 atoms per launch 25% faster than
- * 64 in MD; 64 threads slightly faster from about 2000 atoms per launch on.
+ * performance choice. Measured on A100 (2G water, 1080 and 8640 atoms per
+ * launch, two oxides): faster than 64 threads for all launch sizes, also
+ * than 64 threads with 8 blocks per SM for large launches. Several atoms per
+ * block (warps continuing with the next atom) were slower except for the
+ * largest launch (8640 atoms, 4%), as fewer blocks fill the device less.
  */
-int const largeLaunchAtoms = 1024;
+int const threadsPerAtom = 128;
 /// Shared memory per block of calculateKernel in the normal case (up to 4
 /// blocks per SM on A100).
 size_t const sharedBudget = 40 * 1024;
@@ -842,14 +842,6 @@ typedef void (*CalculateKernel)(Chunk const*, int const*, Cutoff const*,
                                 int const*, double const*, int const*, bool,
                                 double*, double*);
 
-// calculateKernel for a block size (64 or 128 threads), both limited to
-// 128 registers per thread.
-CalculateKernel calculateKernelFor(int threads)
-{
-    if (threads == 64) return calculateKernel<64, 8>;
-    return calculateKernel<128, 4>;
-}
-
 // Static shared memory of a kernel.
 size_t staticShared(CalculateKernel kernel)
 {
@@ -1601,10 +1593,8 @@ void GpuSymmetryFunctionData::calculate(GpuSymmetryFunctionSet const& set,
                                                 neighborOffset[i + 1]
                                                 - neighborOffset[i]);
         }
-        // See largeLaunchAtoms.
-        int threads = 128;
-        if (numAtoms >= static_cast<size_t>(largeLaunchAtoms)) threads = 64;
-        CalculateKernel kernel = calculateKernelFor(threads);
+        int const threads = threadsPerAtom;
+        CalculateKernel kernel = calculateKernel<threadsPerAtom, 4>;
         // Shared memory: fixed part, plus the item sums of one wave
         // (capacity items). Results do not depend on the capacity: as many
         // items as all chunks can have, within sharedBudget per block.
