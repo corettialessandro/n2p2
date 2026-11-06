@@ -398,8 +398,9 @@ __device__ __forceinline__ void pairTerms(Chunk const&  ch,
  * per j: the partners k of a neighbor j that contribute (within the cutoff,
  * for the narrow type also within the cutoff of j) differ in number from j to
  * j, so with one lane per j most lanes would wait for the one with the most
- * partners. Each lane counts the valid partners of its j, the pairs are
- * listed in lane order (j by j, partners in their order) in batches of at
+ * partners. The pairs are listed in lane order (j by j, partners in their
+ * order; the lanes test 32 consecutive candidates of the concatenated
+ * partner lists at a time, warp votes place the valid ones) in batches of at
  * most pairCapacity, and each lane takes an equal, contiguous share of a
  * batch.
  *
@@ -415,8 +416,8 @@ __device__ __forceinline__ void pairTerms(Chunk const&  ch,
  * only on the structure and pairCapacity, a constant.
  *
  * Shared memory of the warp: pairs (pairCapacity ints: j's lane << 16 | k),
- * acc (32 * 3 * maxMembers doubles), info (first pair, number of pairs and
- * neighbor index of each lane's j: 96 ints).
+ * acc (32 * 3 * maxMembers doubles), info (for each lane's j: first pair,
+ * first candidate, neighbor index and first partner in order: 128 ints).
  */
 __device__ void angularItem(Chunk const&  ch,
                             int           s,
@@ -458,29 +459,32 @@ __device__ void angularItem(Chunk const&  ch,
         qBegin = elementOffset[ep];
         qEnd = elementOffset[ep + 1];
     }
-    double const* drij = geometry + 4 * (j >= 0 ? j : 0) + 1;
-    auto valid = [&](int k)
+    // Pair (jj, k) contributes: k within the cutoff and not jj, for the
+    // narrow type also within the cutoff of jj.
+    auto valid = [&](int jj, int k)
     {
-        if (k == j || !(geometry[4 * k] < rc)) return false;
-        return !narrow || distance2(drij, geometry + 4 * k + 1) < rc * rc;
+        if (k == jj || !(geometry[4 * k] < rc)) return false;
+        return !narrow || distance2(geometry + 4 * jj + 1,
+                                    geometry + 4 * k + 1) < rc * rc;
     };
-    int count = 0;
-    for (int q = qBegin; q < qEnd; ++q)
-    {
-        if (valid(order[q])) ++count;
-    }
-    // First pair of each lane's j (lane order).
-    int last = count;
+    // Candidates: the partners of all lanes' j one after the other (lane
+    // order), candStart = first candidate of each lane's j.
+    int const numCand = (j >= 0) ? qEnd - qBegin : 0;
+    int candEnd = numCand;
     for (int o = 1; o < 32; o *= 2)
     {
-        int const t = __shfl_up_sync(all, last, o);
-        if (lane >= o) last += t;
+        int const t = __shfl_up_sync(all, candEnd, o);
+        if (lane >= o) candEnd += t;
     }
-    int const first = last - count;
-    int const total = __shfl_sync(all, last, 31);
-    info[lane] = first;
-    info[32 + lane] = count;
-    info[64 + lane] = j;
+    int const totalCand = __shfl_sync(all, candEnd, 31);
+    int* const firstPair = info;
+    int* const candStart = info + 32;
+    int* const jOf = info + 64;
+    int* const qBeginOf = info + 96;
+    firstPair[lane] = 0;
+    candStart[lane] = candEnd - numCand;
+    jOf[lane] = j;
+    qBeginOf[lane] = qBegin;
     double* accLane = acc + lane * 3 * maxMembers;
     for (int i = 0; i < 3 * maxMembers; ++i) accLane[i] = 0.0;
     __syncwarp();
@@ -498,34 +502,71 @@ __device__ void angularItem(Chunk const&  ch,
             a[3 * m + 2] += dg[m][2];
         }
     };
-    for (int batch = 0; batch < total; batch += pairCapacity)
+    // Listing: each lane tests one candidate, 32 consecutive candidates at a
+    // time, and the valid ones are appended in candidate order (warp vote),
+    // until the batch is full.
+    int cand = 0;
+    int listed = 0;
+    for (int batch = 0; true; batch = listed)
     {
-        int const batchEnd = min(total, batch + pairCapacity);
-        if (count > 0 && first < batchEnd && first + count > batch)
+        while (cand < totalCand && listed - batch < pairCapacity)
         {
-            int index = first;
-            for (int q = qBegin; q < qEnd && index < batchEnd; ++q)
+            int const i = cand + lane;
+            int jl = 0;
+            int k = -1;
+            bool ok = false;
+            if (i < totalCand)
             {
-                int const k = order[q];
-                if (!valid(k)) continue;
-                if (index >= batch) pairs[index - batch] = (lane << 16) | k;
-                ++index;
+                // Last lane whose candidates start at or before i.
+                int lo = 0;
+                int hi = 31;
+                while (lo < hi)
+                {
+                    int const mid = (lo + hi + 1) / 2;
+                    if (candStart[mid] <= i) lo = mid;
+                    else hi = mid - 1;
+                }
+                jl = lo;
+                k = order[qBeginOf[jl] + i - candStart[jl]];
+                ok = valid(jOf[jl], k);
             }
+            unsigned const mask = __ballot_sync(all, ok);
+            int const before = __popc(mask & ((1u << lane) - 1));
+            int const room = pairCapacity - (listed - batch);
+            int const taken = min(__popc(mask), room);
+            // Candidates of this round used: all, or (batch full) those
+            // before the first valid one not taken.
+            int used = 32;
+            if (taken < __popc(mask))
+            {
+                used = __ffs(__ballot_sync(all, ok && before == taken)) - 1;
+            }
+            if (ok && before < taken)
+            {
+                pairs[listed - batch + before] = (jl << 16) | k;
+            }
+            if (i < totalCand && lane < used && i == candStart[jl])
+            {
+                firstPair[jl] = listed + before;
+            }
+            cand += used;
+            listed += taken;
         }
+        if (listed == batch) break;
         __syncwarp();
-        int const numPairs = batchEnd - batch;
+        int const numPairs = listed - batch;
         int const share = (numPairs + 31) / 32;
         int const p0 = min(lane * share, numPairs);
         int const p1 = min(p0 + share, numPairs);
         int current = -1;
         for (int p = p1 - 1; p >= p0; --p)
         {
-            int const jl = pairs[p] >> 16;
-            if (jl != current)
+            int const pl = pairs[p] >> 16;
+            if (pl != current)
             {
                 // The range of the previous j ends in this share.
                 if (current >= 0 && derivatives) flush(current);
-                current = jl;
+                current = pl;
                 for (int m = 0; m < maxMembers; ++m)
                 {
                     dg[m][0] = 0.0;
@@ -533,7 +574,7 @@ __device__ void angularItem(Chunk const&  ch,
                     dg[m][2] = 0.0;
                 }
             }
-            pairTerms(ch, info[64 + jl], pairs[p] & 0xffff, geometry, cache,
+            pairTerms(ch, jOf[pl], pairs[p] & 0xffff, geometry, cache,
                       derivatives, g, dg);
         }
         // First range of the share: right away if j starts in it, else in
@@ -541,7 +582,7 @@ __device__ void angularItem(Chunk const&  ch,
         int rank = -1;
         if (current >= 0 && derivatives)
         {
-            int const start = max(info[current], batch) - batch;
+            int const start = max(firstPair[current], batch) - batch;
             if (start >= p0) flush(current);
             else rank = lane - start / share - 1;
         }
@@ -552,7 +593,8 @@ __device__ void angularItem(Chunk const&  ch,
             __syncwarp();
         }
     }
-    if (j >= 0 && derivatives && count > 0)
+    __syncwarp();
+    if (j >= 0 && derivatives)
     {
         int const ej = elements[j];
         double* dj = deriv + 3 * static_cast<size_t>(derivOffset[n0 + j]);
@@ -596,7 +638,7 @@ __device__ void angularItem(Chunk const&  ch,
  * doubles), per warp the derivative sums of an angular item (32 * 3 *
  * maxMembers doubles), neighbors grouped by element (neighborStride ints),
  * first item of each chunk (maxChunks + 1 ints), per warp the pairs and
- * neighbor information of an angular item (pairCapacity + 96 ints).
+ * neighbor information of an angular item (pairCapacity + 128 ints).
  */
 template<int threads, int minBlocks>
 __global__ void __launch_bounds__(threads, minBlocks)
@@ -648,7 +690,7 @@ calculateKernel(Chunk const*  chunks,
                                         + numWarps * 32 * 3 * maxMembers);
     int* itemOffset = order + neighborStride;
     int* warpPairs = itemOffset + maxChunks + 1
-                   + warp * (pairCapacity + 96);
+                   + warp * (pairCapacity + 128);
     int* warpInfo = warpPairs + pairCapacity;
     Chunk const* chunksElement = chunks + chunkOffset[element];
     int const numChunks = chunkOffset[element + 1] - chunkOffset[element];
@@ -1573,7 +1615,7 @@ void GpuSymmetryFunctionData::calculate(GpuSymmetryFunctionSet const& set,
                            + warps * 32 * 3 * maxMembers * sizeof(double)
                            + stride * sizeof(int)
                            + (s.maxChunks + 1) * sizeof(int)
-                           + warps * (pairCapacity + 96) * sizeof(int);
+                           + warps * (pairCapacity + 128) * sizeof(int);
         size_t const perItem = maxMembers * sizeof(double);
         size_t const maxItems = s.maxChunks * ((stride + 31) / 32);
         size_t const used = fixed + staticShared(kernel);
