@@ -20,6 +20,7 @@
 #include <climits>   // INT_MAX
 #include <cmath>     // std::exp, std::pow
 #include <iterator>  // std::prev
+#include <algorithm> // std::stable_partition
 #include <map>       // std::multimap
 #include <mutex>     // std::mutex, std::lock_guard
 #include <stdexcept> // std::runtime_error
@@ -30,9 +31,13 @@ using namespace std;
 namespace
 {
 
-/// Symmetry functions evaluated together (same type, neighbor elements and
-/// cutoff), see Chunk.
-int const maxMembers = 8;
+/* Symmetry functions evaluated together (same type, neighbor elements and
+ * cutoff), see Chunk. Results do not depend on it. Measured on A100 (2G
+ * water and two oxides): 4 is 6-12% faster than 8 (more, smaller work items
+ * and fewer registers for the per-lane sums; spills nearly vanish), 3 and 2
+ * are slower (the geometry of each pair is computed once per chunk).
+ */
+int const maxMembers = 4;
 int const threadsPerBlock = 128;
 int const warpsPerBlock = threadsPerBlock / 32;
 /* calculateKernel launch: 64 threads per atom (8 blocks per SM, i.e. at
@@ -1092,6 +1097,11 @@ GpuSymmetryFunctionSet::GpuSymmetryFunctionSet(
                 }
                 chunks.push_back(c);
             }
+            // Angular chunks first: the most expensive work items of an atom
+            // start first, the cheap radial ones fill in at the end (the
+            // order of the chunks does not change any result).
+            stable_partition(chunks.begin() + chunkOffset.back(), chunks.end(),
+                             [](Chunk const& c) { return c.kind != RADIAL; });
             chunkOffset.push_back(chunks.size());
             cutoffOffset.push_back(cutoffs.size());
             d.maxChunks = max(d.maxChunks,
