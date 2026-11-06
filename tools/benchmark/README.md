@@ -38,8 +38,10 @@ the `TIMING` lines of the training log and their mean.
 
 GPU builds select the device of each rank automatically (see
 `src/libnnpgpu/README.md`). With several ranks per GPU add `--mps`: the
-script starts an NVIDIA MPS daemon for each benchmark (pipe and log
-directories in the work directory) and forwards its variables with
+script starts an NVIDIA MPS daemon for each benchmark (pipe directory in
+the temporary directory, `TMPDIR` or `/tmp`, as the daemon's socket paths
+are limited to about 100 characters; log directory in the work directory)
+and forwards its variables with
 OpenMPI's `-x`; with another launcher make sure the variables
 `CUDA_MPS_PIPE_DIRECTORY` and `CUDA_MPS_LOG_DIRECTORY` reach the ranks.
 
