@@ -33,7 +33,7 @@ PairStyle(hdnnp/4g,PairHDNNP4G)
 #include <gsl/gsl_vector.h>
 #include <cmath>
 
-namespace nnp { class GpuChargeEquilibration; }
+namespace nnp { class GpuChargeEquilibration; class GpuEwaldOperator; }
 
 namespace LAMMPS_NS {
 
@@ -205,9 +205,21 @@ protected:
                                      bool factorize);
     // Direct solver: 0 not decided yet, 1 on the GPU, -1 iterative solvers.
     int gpuQeqMode;
+    // Largest structure solved directly (see solveChargeEquilibrationGpu()).
+    static int const directMaxAtoms = 3000;
     // Factorized matrix on rank 0 (GPU builds) and its time step.
     nnp::GpuChargeEquilibration* gpuQeq;
     bigint gpuQeqStep;
+    // Iterative solvers with the matrix applied on the GPU of each process
+    // (GPU builds, Ewald summation), see the definitions.
+    bool setupEwaldGpu();
+    void gradientEwaldGpu(const gsl_vector *v, double const *bLocal,
+                          double *gradLocal, double *gradAll, gsl_vector *g);
+    // 0 not decided yet, 1 matrix applied on the GPU, -1 on the CPU.
+    int gpuEwaldMode;
+    // Matrix rows of the local atoms on the GPU and their time step.
+    nnp::GpuEwaldOperator* gpuEwald;
+    bigint gpuEwaldStep;
     void calculateElecDerivatives(double*,double**);
     void calculateElecForce(double**);
     void calculate_kspace_terms();

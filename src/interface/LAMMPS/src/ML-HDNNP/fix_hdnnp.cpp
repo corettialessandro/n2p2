@@ -789,6 +789,19 @@ void FixHDNNP::calculate_QEqCharges()
         gsl_vector_set(Q, i, gsl_vector_get(Q, i) - (qsum - qRef) / nsize);
     }
     double norm = 0.0;
+#ifdef N2P2_GPU
+    // Matrix applied on the GPU of each process (also used for the force
+    // Lagrange multipliers by the pair style in this time step).
+    if (periodic && hdnnp->setupEwaldGpu())
+    {
+        projectedConjugateGradient(
+            [this](const gsl_vector *v, gsl_vector *g)
+            {
+                hdnnp->gradientEwaldGpu(v, hdnnp->chi, dEdQ_loc, dEdQ_all, g);
+            },
+            Q, hdnnp->grad_tol, hdnnp->maxit, &norm);
+    } else
+#endif
     projectedConjugateGradient(
         [this](const gsl_vector *v, gsl_vector *g)
         {

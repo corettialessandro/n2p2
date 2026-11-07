@@ -41,6 +41,7 @@
 #include "kspace_hdnnp.h"
 #ifdef N2P2_GPU
 #include "GpuChargeEquilibration.h"
+#include "GpuEwaldOperator.h"
 #include "GpuDevice.h"
 #include <exception>
 #endif
@@ -110,6 +111,9 @@ PairHDNNP4G::PairHDNNP4G(LAMMPS *lmp) : Pair(lmp),
     gpuQeqMode                     (0      ),
     gpuQeq                         (nullptr),
     gpuQeqStep                     (-1     ),
+    gpuEwaldMode                   (0      ),
+    gpuEwald                       (nullptr),
+    gpuEwaldStep                   (-1     ),
     screening_info                 (nullptr)
 {
 
@@ -125,6 +129,7 @@ PairHDNNP4G::~PairHDNNP4G()
 {
 #ifdef N2P2_GPU
   delete gpuQeq;
+  delete gpuEwald;
 #endif
 }
 
@@ -905,6 +910,17 @@ void PairHDNNP4G::calculateForceLambda()
         gsl_vector_set(x, i, gsl_vector_get(x, i) - lsum / nsize);
     }
     double norm = 0.0;
+#ifdef N2P2_GPU
+    // Matrix rows set up by fix hdnnp in this time step.
+    if (gpuEwaldMode > 0 && gpuEwaldStep == update->ntimestep) {
+        projectedConjugateGradient(
+            [this](const gsl_vector *v, gsl_vector *g)
+            {
+                gradientEwaldGpu(v, dEdQ, dEdLambda_loc, dEdLambda_all, g);
+            },
+            x, grad_tol, maxit, &norm);
+    } else
+#endif
     projectedConjugateGradient(
         [this](const gsl_vector *v, gsl_vector *g)
         {
@@ -988,7 +1004,15 @@ void PairHDNNP4G::calculate_kspace_terms()
    all atoms by tag - 1, on all ranks. factorize: build and factorize the
    matrix for the current positions (otherwise the factorization of this
    time step is reused). Returns false if the iterative solvers are used:
-   PPPM, triclinic box or a matrix exceeding the memory budget.
+   PPPM, triclinic box, more than directMaxAtoms atoms or a matrix exceeding
+   the memory budget. The conjugate gradients with the matrix applied on the
+   GPUs (setupEwaldGpu()) cost less from a few thousand atoms on: measured
+   on A100 (SPC/Fw water, Ewald 1e-3, s/step direct vs iterative), 4 GPUs:
+   1260 atoms 0.0147 vs 0.0153, 2520 0.0364 vs 0.0353, 3780 0.0678 vs 0.0601,
+   7560 0.306 vs 0.217; 1 GPU: 2520 0.058 vs 0.059, 3780 0.116 vs 0.116,
+   7560 0.51 vs 0.48. The direct solution scales with the cube of the number
+   of atoms (and its matrix with the square), the iterative one about
+   linearly per iteration.
 ------------------------------------------------------------------------- */
 
 bool PairHDNNP4G::solveChargeEquilibrationGpu(double const* rhsLocal,
@@ -1014,6 +1038,9 @@ bool PairHDNNP4G::solveChargeEquilibrationGpu(double const* rhsLocal,
     } else if (periodic && domain->triclinic) {
       mode = -1;
       reason = "triclinic box";
+    } else if (natoms > directMaxAtoms) {
+      mode = -1;
+      reason = "more than " + std::to_string(directMaxAtoms) + " atoms";
     } else if (me == 0 && nnp::GpuChargeEquilibration::memoryUsage(natoms, numK)
                > nnp::gpuDefaultCacheBudget()) {
       mode = -1;
@@ -1030,8 +1057,8 @@ bool PairHDNNP4G::solveChargeEquilibrationGpu(double const* rhsLocal,
                        nnp::GpuChargeEquilibration::memoryUsage(natoms, numK)
                        / 1048576.0);
       } else {
-        utils::logmesg(lmp, "Charge equilibration solved iteratively on the "
-                       "CPU ({}).\n", reason);
+        utils::logmesg(lmp, "Charge equilibration not solved directly on "
+                       "the GPU ({}): iterative solvers.\n", reason);
       }
     }
   }
@@ -1106,6 +1133,146 @@ bool PairHDNNP4G::solveChargeEquilibrationGpu(double const* rhsLocal,
   (void)solutionAll;
   (void)factorize;
   return false;
+#endif
+}
+
+/* ----------------------------------------------------------------------
+   matrix of the iterative solvers on the GPU (GPU builds)
+
+   When the direct solution is not used (matrix beyond the memory budget),
+   the conjugate gradient solvers of the charges (fix hdnnp) and of the force
+   Lagrange multipliers spend their time applying the matrix to vectors
+   (FixHDNNP::QEq_df(), forceLambda_df()): reciprocal-space sums over all
+   vectors k for every local atom. setupEwaldGpu() copies the matrix rows of
+   the local atoms to the GPU of this process (tables exp(i k r) of
+   KSpaceHDNNP::ewald_sfexp(), diagonal, real-space terms erfc_val of the
+   electrostatic neighbor list) once per time step, called by fix hdnnp after
+   ewald_sfexp() and the real-space terms; gradientEwaldGpu() then evaluates
+   the projected gradient P (A v + b) like QEq_df() and forceLambda_df(),
+   with one sum of the structure factors over all processes. Returns false if
+   the matrix is applied on the CPU (Ewald summation only; memory budget).
+------------------------------------------------------------------------- */
+
+bool PairHDNNP4G::setupEwaldGpu()
+{
+#ifdef N2P2_GPU
+  if (periodic && kspacehdnnp == nullptr) {
+    kspacehdnnp = (KSpaceHDNNP *) force->kspace_match("^hdnnp", 0);
+  }
+  if (!periodic || kspacehdnnp == nullptr || !kspacehdnnp->ewaldflag) {
+    gpuEwaldMode = -1;
+    return false;
+  }
+  int const nlocal = atom->nlocal;
+  int const natoms = atom->natoms;
+  int const numK = kspacehdnnp->kcount;
+  int const *tag = atom->tag;
+  int const *type = atom->type;
+
+  // Real-space terms of the electrostatic neighbor list (as in QEq_df()).
+  std::vector<int> rowOffset(nlocal + 1, 0);
+  std::vector<int> column;
+  std::vector<double> value;
+  for (int i = 0; i < nlocal; i++) {
+    for (int jj = 0; jj < elecList->numneigh[i]; ++jj) {
+      double const val = erfc_val[i][jj];
+      if (val == 0.0) continue;
+      int const j = elecList->firstneigh[i][jj] & NEIGHMASK;
+      column.push_back(tag[j] - 1);
+      value.push_back(val);
+    }
+    rowOffset[i + 1] = column.size();
+  }
+
+  if (gpuEwaldMode == 0) {
+    // Decided once, the same on all processes.
+    int fits = nnp::GpuEwaldOperator::memoryUsage(numK, nlocal, natoms,
+                                                  column.size())
+               <= nnp::gpuDefaultCacheBudget() ? 1 : 0;
+    int all = 0;
+    MPI_Allreduce(&fits, &all, 1, MPI_INT, MPI_MIN, world);
+    gpuEwaldMode = all ? 1 : -1;
+    if (me == 0) {
+      if (all) {
+        utils::logmesg(lmp, "Charge equilibration and force Lagrange "
+                       "multipliers solved by conjugate gradients with the "
+                       "matrix applied on the GPU of each process ({} "
+                       "reciprocal vectors).\n", numK);
+      } else {
+        utils::logmesg(lmp, "Charge equilibration and force Lagrange "
+                       "multipliers solved by conjugate gradients on the CPU "
+                       "(matrix rows exceed the GPU memory budget).\n");
+      }
+    }
+  }
+  if (gpuEwaldMode < 0) return false;
+
+  double const eta = 1.0 / kspacehdnnp->g_ewald;
+  std::vector<int> localIndex(nlocal);
+  std::vector<double> diagonal(nlocal);
+  for (int i = 0; i < nlocal; i++) {
+    int const t = type[i] - 1;
+    localIndex[i] = tag[i] - 1;
+    diagonal[i] = hardness[t] + 1.0 / sigmaSqrtPi[t]
+                - 2.0 / (eta * sqrt(2.0 * M_PI));
+  }
+  try {
+    if (gpuEwald == nullptr) gpuEwald = new nnp::GpuEwaldOperator();
+    double const *cosTable = numK > 0 ? &kspacehdnnp->sfexp_rl[0][0] : nullptr;
+    double const *sinTable = numK > 0 ? &kspacehdnnp->sfexp_im[0][0] : nullptr;
+    gpuEwald->setup(numK, nlocal, natoms, cosTable, sinTable, natoms,
+                    kspacehdnnp->kcoeff, localIndex, diagonal, rowOffset,
+                    column, value);
+  } catch (std::exception const& e) {
+    error->one(FLERR, e.what());
+  }
+  gpuEwaldStep = update->ntimestep;
+  return true;
+#else
+  return false;
+#endif
+}
+
+void PairHDNNP4G::gradientEwaldGpu(const gsl_vector *v, double const *bLocal,
+                                   double *gradLocal, double *gradAll,
+                                   gsl_vector *g)
+{
+#ifdef N2P2_GPU
+  int const nlocal = atom->nlocal;
+  int const natoms = atom->natoms;
+  int const numK = kspacehdnnp->kcount;
+  int const *tag = atom->tag;
+  std::vector<double> vAll(natoms);
+  for (int i = 0; i < natoms; i++) vAll[i] = gsl_vector_get(v, i);
+  std::vector<double> sLocal(2 * numK, 0.0);
+  std::vector<double> s(2 * numK, 0.0);
+  std::vector<double> result(nlocal, 0.0);
+  try {
+    gpuEwald->structureFactors(vAll.data(), sLocal.data());
+    MPI_Allreduce(sLocal.data(), s.data(), 2 * numK, MPI_DOUBLE, MPI_SUM,
+                  world);
+    gpuEwald->apply(s.data(), result.data());
+  } catch (std::exception const& e) {
+    error->one(FLERR, e.what());
+  }
+  double sumLocal = 0.0;
+  for (int i = 0; i < nlocal; i++) {
+    double const grad = result[i] + bLocal[i];
+    sumLocal += grad;
+    gradLocal[tag[i] - 1] = grad;
+  }
+  double sum = 0.0;
+  MPI_Allreduce(gradLocal, gradAll, natoms, MPI_DOUBLE, MPI_SUM, world);
+  MPI_Allreduce(&sumLocal, &sum, 1, MPI_DOUBLE, MPI_SUM, world);
+  for (int i = 0; i < natoms; i++) {
+    gsl_vector_set(g, i, gradAll[i] - sum / natoms);
+  }
+#else
+  (void)v;
+  (void)bLocal;
+  (void)gradLocal;
+  (void)gradAll;
+  (void)g;
 #endif
 }
 
