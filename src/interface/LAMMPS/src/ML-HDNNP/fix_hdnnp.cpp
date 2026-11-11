@@ -689,6 +689,34 @@ void FixHDNNP::calculate_QEqCharges()
     nsize = atom->natoms; // total number of atoms
     nlocal = atom->nlocal; // total number of atoms
 
+    // Global position/type arrays of nonperiodic systems, needed by QEq_f()
+    // in the GPU branch below as well (filled here, before the early return).
+    if (!periodic) // we need global position arrays in nonperiodic systems
+    {
+        // Initialize global arrays
+        for (int i = 0; i < atom->natoms; i++){
+            type_loc[i] = 0;
+            xx_loc[i] = 0.0;
+            xy_loc[i] = 0.0;
+            xz_loc[i] = 0.0;
+            xx[i] = 0.0;
+            xy[i] = 0.0;
+            xz[i] = 0.0;
+        }
+
+        // Create global sparse arrays here
+        for (int i = 0; i < atom->nlocal; i++){
+            xx_loc[tag[i]-1] = atom->x[i][0];
+            xy_loc[tag[i]-1] = atom->x[i][1];
+            xz_loc[tag[i]-1] = atom->x[i][2];
+            type_loc[tag[i]-1] = atom->type[i];
+        }
+        MPI_Allreduce(xx_loc,xx,atom->natoms,MPI_DOUBLE,MPI_SUM,world);
+        MPI_Allreduce(xy_loc,xy,atom->natoms,MPI_DOUBLE,MPI_SUM,world);
+        MPI_Allreduce(xz_loc,xz,atom->natoms,MPI_DOUBLE,MPI_SUM,world);
+        MPI_Allreduce(type_loc,type_all,atom->natoms,MPI_INT,MPI_SUM,world);
+    }
+
 #ifdef N2P2_GPU
     {
         // Direct solution on the GPU: A q + mu = -chi, sum q = qRef, then
@@ -732,31 +760,6 @@ void FixHDNNP::calculate_QEqCharges()
 
     MPI_Allreduce(qall_loc,qall,atom->natoms,MPI_DOUBLE,MPI_SUM,world);
 
-    if (!periodic) // we need global position arrays in nonperiodic systems
-    {
-        // Initialize global arrays
-        for (int i = 0; i < atom->natoms; i++){
-            type_loc[i] = 0;
-            xx_loc[i] = 0.0;
-            xy_loc[i] = 0.0;
-            xz_loc[i] = 0.0;
-            xx[i] = 0.0;
-            xy[i] = 0.0;
-            xz[i] = 0.0;
-        }
-
-        // Create global sparse arrays here
-        for (int i = 0; i < atom->nlocal; i++){
-            xx_loc[tag[i]-1] = atom->x[i][0];
-            xy_loc[tag[i]-1] = atom->x[i][1];
-            xz_loc[tag[i]-1] = atom->x[i][2];
-            type_loc[tag[i]-1] = atom->type[i];
-        }
-        MPI_Allreduce(xx_loc,xx,atom->natoms,MPI_DOUBLE,MPI_SUM,world);
-        MPI_Allreduce(xy_loc,xy,atom->natoms,MPI_DOUBLE,MPI_SUM,world);
-        MPI_Allreduce(xz_loc,xz,atom->natoms,MPI_DOUBLE,MPI_SUM,world);
-        MPI_Allreduce(type_loc,type_all,atom->natoms,MPI_INT,MPI_SUM,world);
-    }
 
 
     // Set the initial guess vector 
