@@ -113,6 +113,17 @@ GPU:
      - 1.46
      - 1.91
 
+Process placement
+^^^^^^^^^^^^^^^^^
+
+Placing the processes next to their GPU makes no measurable difference. On
+nodes with several NUMA domains, spreading the processes of a GPU over the node
+was faster than packing them onto neighboring cores: on a node with 2 A100 and
+2 AMD EPYC 7713, 8 processes on one GPU ran 2G MD about 25 % faster with Open
+MPI's default placement (one process per NUMA domain) than bound to 8
+neighboring cores, probably because neighboring cores share their cache. Avoid
+binding options that pack the processes onto adjacent cores.
+
 Start-up time
 ^^^^^^^^^^^^^
 
