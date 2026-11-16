@@ -176,6 +176,7 @@ list of keywords is provided :ref:`here <keywords>`.
    topics/units
    topics/changes_4g
    topics/validation
+   topics/gpu
 
 .. toctree::
    :hidden:
